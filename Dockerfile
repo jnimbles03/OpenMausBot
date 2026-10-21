@@ -156,8 +156,8 @@ RUN export HOME=/tmp/omb-build-home \
  && if [ -n "$untrusted" ]; then echo "not root's, or writable by others:" >&2; echo "$untrusted" >&2; exit 1; fi \
  && rm -rf /tmp/omb-build-home
 ENV HOME=/data
-VOLUME ["/data"]
-EXPOSE 8080
+# VOLUME ["/data"]
+# EXPOSE 8080
 # Fly uses the checks in fly.toml; this one serves a plain `docker run`.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
   CMD curl -sf http://127.0.0.1:8080/api/health | grep -q openmausbot || exit 1
@@ -177,8 +177,8 @@ COPY --from=build --chown=maus:maus /src/dist-native/duckdb/linux-x64 ./duckdb
 COPY --from=build --chown=maus:maus /src/dist-server ./dist-server
 COPY --from=build --chown=maus:maus /src/dist ./dist
 ENV HOME=/data
-VOLUME ["/data"]
-USER maus
+# VOLUME ["/data"]
+# USER maus
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -sf http://127.0.0.1:8799/api/health | grep -q openmausbot || exit 1
 # The launcher runs dist-server/index.js and starts it again when it asks to
