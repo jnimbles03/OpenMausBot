@@ -39,7 +39,7 @@ ipcRenderer.on("app:open-settings", (_event, section) => {
 const localOrigin = process.argv.find((arg) => arg.startsWith("--omb-local-origin="))?.slice("--omb-local-origin=".length) ?? null;
 const isLocalPage = !localOrigin || location.origin === localOrigin;
 const savedServer = id => isLocalPage && typeof id === "string" && /^[\w-]{1,64}$/.test(id) ? [id] : [];
-const REMOTE_SAFE = new Set(["platform", "getCapabilities", "onCapabilitiesChanged", "applySkin", "setUnreadCount", "permStatus", "workspaces", "cloudMove", "cloudLending", "cloudPlan", "cloudSendPage", "desktopNotices", "desktopAnalytics"]);
+const REMOTE_SAFE = new Set(["platform", "getCapabilities", "onCapabilitiesChanged", "applySkin", "setUnreadCount", "permStatus", "workspaces", "cloudMove", "cloudLending", "cloudPlan", "cloudSendPage", "desktopNotices", "desktopAnalytics", "windowControls"]);
 function updaterOffered() {
   try { return ipcRenderer.sendSync("update:offered") === true; } catch { return false; }
 }
@@ -340,13 +340,18 @@ const bridge = {
   } : undefined,
   cloudLending: process.argv.includes("--omb-company-desktop=1") ? {
     open: () => ipcRenderer.invoke("cloud-lending:open"),
+    state: () => ipcRenderer.invoke("cloud-lending:state"),
+    set: on => on !== true || isLocalPage || navigator.userActivation?.isActive === true
+      ? ipcRenderer.invoke("cloud-lending:set", on === true) : Promise.reject(new Error("Turn on the switch to lend this computer.")),
+    screen: on => on !== true || isLocalPage || navigator.userActivation?.isActive === true
+      ? ipcRenderer.invoke("cloud-lending:screen", on === true) : Promise.reject(new Error("Tick Apps and screen to lend them.")),
   } : undefined,
   // This computer's Settings only (never a remote page): what of Logins My Cloud has, and Also use on My Cloud.
   cloudLogins: process.argv.includes("--omb-company-desktop=1") && isLocalPage ? {
     state: () => ipcRenderer.invoke("cloud-logins:state"),
     send: what => ipcRenderer.invoke("cloud-logins:send", what?.kind === "login" ? { kind: "login", id: String(what.id) } : { kind: "1password" }),
   } : undefined,
-  // This computer's Settings → MausBot Cloud: the comparison, Send everything and the switches.
+  // This computer's Settings → MausBot Cloud: the comparison and Send everything.
   cloudSend: process.argv.includes("--omb-company-desktop=1") && isLocalPage ? {
     state: () => ipcRenderer.invoke("cloud-send:state"),
     refresh: () => ipcRenderer.invoke("cloud-send:refresh"),
@@ -354,7 +359,6 @@ const bridge = {
       keys: Array.isArray(options?.keys) ? options.keys.map(String) : undefined,
       force: Array.isArray(options?.force) ? options.force.map(String) : undefined,
     }),
-    setAuto: on => ipcRenderer.invoke("cloud-send:auto", on === true),
     setItem: (key, on) => ipcRenderer.invoke("cloud-send:item", String(key), on === true),
     onState: cb => {
       const handler = (_event, state) => cb(state);
@@ -368,6 +372,8 @@ const bridge = {
     send: () => isLocalPage || navigator.userActivation?.isActive === true
       ? ipcRenderer.invoke("cloud-send:page-send") : Promise.reject(new Error("Choose Bring them over to send.")),
     dismiss: signature => ipcRenderer.invoke("cloud-send:dismiss", String(signature)),
+    moveRetry: () => isLocalPage || navigator.userActivation?.isActive === true
+      ? ipcRenderer.invoke("cloud-send:move-retry") : Promise.reject(new Error("Choose Try again to move.")),
     onNotice: cb => {
       const handler = (_event, notice) => cb(notice);
       ipcRenderer.on("cloud-send:notice-changed", handler);

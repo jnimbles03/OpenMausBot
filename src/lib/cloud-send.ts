@@ -1,14 +1,9 @@
 // What Settings → MausBot Cloud and My Cloud's strip say about Send to My Cloud (electron/cloud-send.mjs), in words.
-import type { PlanRow, RowState, SendKind } from "../../electron/cloud-send-parts.mjs";
-import type { CloudSendNotice, CloudSendOutcome, CloudSendSnapshot } from "../../electron/cloud-send.mjs";
+import { failedSummary, pendingRows } from "../../electron/cloud-send-parts.mjs";
+import type { CloudSendCounts, CloudSendFailure, CloudSendNotice, CloudSendOutcome, CloudSendSnapshot } from "../../electron/cloud-send.mjs";
+import type { OneHomeCounts, OneHomeView } from "../../electron/one-home.mjs";
 import type { LocaleKey } from "@/locales";
 import { activeLocale, t } from "@/lib/i18n";
-
-export type SideKind = "bots" | "skills" | "logins" | "settings";
-export const SIDE_KINDS: readonly SideKind[] = ["bots", "skills", "logins", "settings"];
-
-const KIND_OF: Record<SendKind, SideKind> = { bot: "bots", skill: "skills", login: "logins", "1password": "logins", setting: "settings" };
-const ON_CLOUD = new Set<RowState>(["on-both", "to-update", "differs"]);
 
 const counted = (count: number, one: LocaleKey, many: LocaleKey) => t(count === 1 ? one : many, { count });
 
@@ -20,75 +15,92 @@ export function names(labels: string[], shown = 2): string {
   return listOf([...labels.slice(0, shown), t("cloudSend.more", { count: labels.length - shown })]);
 }
 
-export const rowName = (row: { kind: SendKind; label: string; detail?: string }) =>
-  row.kind === "setting" ? t(row.label === "profile" ? "cloudSend.row.profile" : "cloudSend.row.language")
-    : row.kind === "login" && row.detail ? `${row.detail} · ${row.label}` : row.label;
+/** More than three bots are counted, not named. */
+const botsNamed = (bots: string[]) => bots.length > 3 ? [t("cloudSend.list.bots", { count: bots.length })] : bots;
 
-/** Bots by name ("Miso and 9 more"), skills by name while few, logins by count with 1Password named. */
-function whatOf(kind: SideKind, rows: ReadonlyArray<{ kind: SendKind; label: string; detail?: string }>): string {
-  if (kind === "bots") return names(rows.map(rowName), 1);
-  if (kind === "skills") return rows.length <= 2 ? listOf(rows.map(rowName)) : counted(rows.length, "cloudSend.list.skillOne", "cloudSend.list.skills");
-  const logins = rows.filter((row) => row.kind === "login").length;
-  return listOf([...(logins ? [counted(logins, "cloudSend.list.loginOne", "cloudSend.list.logins")] : []), ...(rows.some((row) => row.kind === "1password") ? [t("cloudSend.list.onePassword")] : [])]);
-}
-
-export interface SideLine {
-  kind: SideKind;
-  here: number;
-  cloud: number;
-  /** One plain phrase on how the two differ, or "Same on both". */
-  difference: string;
-  /** Something here is waiting to go. */
-  waiting: boolean;
-}
-
-/** Counts per kind on each side, and the difference in words ("Ember only here", "1Password only here"). */
-export function sideLines(snapshot: Pick<CloudSendSnapshot, "rows" | "cloudOnly">): SideLine[] {
-  return SIDE_KINDS.map((kind) => {
-    const rows = snapshot.rows.filter((row) => KIND_OF[row.kind] === kind);
-    const theirs = snapshot.cloudOnly.filter((row) => KIND_OF[row.kind] === kind);
-    const onlyHere = rows.filter((row) => row.state === "only-here");
-    const newer = rows.filter((row) => row.state === "to-update");
-    const differs = rows.filter((row) => row.state === "differs");
-    const here = kind === "settings" ? rows.filter((row) => row.state !== "off").length : rows.length;
-    const cloud = rows.filter((row) => ON_CLOUD.has(row.state)).length + theirs.length;
-    const phrases: string[] = [];
-    if (onlyHere.length) phrases.push(t("cloudSend.diff.onlyHere", { names: whatOf(kind, onlyHere) }));
-    if (newer.length) phrases.push(t("cloudSend.diff.changed", { names: kind === "settings" ? listOf(newer.map(rowName)) : whatOf(kind, newer) }));
-    if (differs.length) phrases.push(t("cloudSend.diff.differs", { count: differs.length }));
-    if (theirs.length && kind !== "settings") phrases.push(t("cloudSend.diff.onlyThere", { names: whatOf(kind, theirs) }));
-    return { kind, here, cloud: kind === "settings" ? Math.min(cloud, here) : cloud, difference: phrases.length ? phrases.join(" · ") : t("cloudSend.diff.same"),
-      waiting: onlyHere.length + newer.length > 0 };
-  });
-}
-
-/** "Ember, 2 skills, 3 logins and 1Password". */
+/** "Ember, 2 skills, 3 logins, 1Password and 48 chats". */
 export function sentList(result: CloudSendOutcome["result"]): string[] {
+  const chats = result.chats;
   return [
-    ...result.bots,
+    ...botsNamed(result.bots),
     ...(result.updatedBots.length ? [t("cloudSend.list.changesTo", { names: names(result.updatedBots) })] : []),
     ...(result.skills ? [counted(result.skills, "cloudSend.list.skillOne", "cloudSend.list.skills")] : []),
     ...(result.logins ? [counted(result.logins, "cloudSend.list.loginOne", "cloudSend.list.logins")] : []),
     ...(result.onePassword ? [t("cloudSend.list.onePassword")] : []),
     ...(result.settings.length ? [t("cloudSend.list.settings")] : []),
+    ...(result.connections ? [counted(result.connections, "cloudSend.list.connectionOne", "cloudSend.list.connections")] : []),
+    ...(chats?.conversations ? [counted(chats.conversations, "cloudSend.list.chatOne", "cloudSend.list.chats")]
+      : chats?.messages ? [counted(chats.messages, "cloudSend.list.messageOne", "cloudSend.list.messages")] : []),
   ];
+}
+
+/** The words main threw, without Electron's "Error invoking remote method" wrapper; null when there are none. */
+export function ipcErrorText(cause: unknown): string | null {
+  return cause instanceof Error && cause.message ? cause.message.replace(/^Error invoking remote method '[^']*':\s*(?:\w*Error:\s*)?/u, "") : null;
+}
+
+/** "2 logins couldn't be sent: <why>. 1Password couldn't be sent: <why>.", or why a send stopped; null when nothing failed. */
+export function failedLine(failure: CloudSendFailure): string | null {
+  const lines = (failure.reasons ?? []).map(({ what, error }) => {
+    const list = [
+      ...botsNamed(what.bots),
+      ...(what.skills ? [counted(what.skills, "cloudSend.list.skillOne", "cloudSend.list.skills")] : []),
+      ...(what.logins ? [counted(what.logins, "cloudSend.list.loginOne", "cloudSend.list.logins")] : []),
+      ...(what.onePassword ? [t("cloudSend.list.onePassword")] : []),
+      ...(what.settings ? [t("cloudSend.list.settings")] : []),
+      ...(what.connections ? [counted(what.connections, "cloudSend.list.connectionOne", "cloudSend.list.connections")] : []),
+      ...(what.chats ? [t("cloudSend.list.theChats")] : []),
+    ];
+    const line = t("cloudSend.failedWhat", { list: listOf(list), error });
+    return line.charAt(0).toLocaleUpperCase(activeLocale()) + line.slice(1);
+  });
+  if (failure.error) lines.push(t("cloudSend.failedSend", { error: failure.error }));
+  return lines.length ? lines.join(" ") : null;
 }
 
 /** One sentence for what a send did, then a line for each thing worth knowing. */
 export function resultLines(outcome: CloudSendOutcome): { text: string; failed: boolean; notes: string[] } {
   const { result } = outcome;
   const sent = sentList(result);
-  const first = result.failed[0];
+  const failure = failedLine(failedSummary(outcome));
   const text = [
-    sent.length ? t("cloudSend.result.sent", { list: listOf(sent) }) : result.failed.length ? "" : t("cloudSend.result.none"),
-    first ? t(result.failed.length === 1 ? "cloudSend.result.failedOne" : "cloudSend.result.failed", { count: result.failed.length, name: first.label, error: first.error }) : "",
+    sent.length ? t("cloudSend.result.sent", { list: listOf(sent) }) : failure ? "" : t("cloudSend.result.none"),
+    failure ?? "",
   ].filter(Boolean).join(" ");
   const notes = [...new Set(result.notes.map((note) =>
     note.kind === "model" ? t("cloudSend.result.model", { bot: note.bot ?? "" })
       : note.kind === "settings" ? t("cloudSend.result.settings", { bot: note.bot ?? "" })
         : note.kind === "memory" ? t("cloudSend.result.memory", { bot: note.bot ?? "" })
-          : t("cloudSend.result.narrowed")))];
-  return { text, failed: result.failed.length > 0, notes };
+          : note.kind === "held" ? t("cloudSend.result.held", { key: note.connection ?? "" })
+            : t("cloudSend.result.narrowed")))];
+  return { text, failed: Boolean(failure), notes };
+}
+
+/** Every failure in this send is one trying again can't fix (1Password refused the token), so there is no Try again. */
+export function finalFailure(outcome: CloudSendOutcome | null): boolean {
+  return Boolean(outcome && !outcome.error && outcome.result.failed.length && outcome.result.failed.every((entry) => entry.final === true));
+}
+
+/** What of this computer's My Cloud lacks, from the last comparison: "2 bots, 1 login and 12 chats". */
+export function waitingList(snapshot: Pick<CloudSendSnapshot, "rows" | "chats">): string[] {
+  const rows = pendingRows({ rows: snapshot.rows });
+  const count = (kind: string) => rows.filter((row) => row.kind === kind).length;
+  return countedList({ bots: rows.filter((row) => row.kind === "bot" && row.state === "only-here").length, updatedBots: rows.filter((row) => row.kind === "bot" && row.state === "to-update").length,
+    skills: count("skill"), logins: count("login"), onePassword: count("1password") > 0, settings: count("setting"),
+    chats: snapshot.chats?.waiting ? { conversations: snapshot.chats.waiting, messages: 0 } : null });
+}
+
+/** Settings' one line on where things stand: sending, what couldn't go, what is not on My Cloud yet, or that all is. */
+export function sendStateLine(snapshot: CloudSendSnapshot, last: CloudSendOutcome | null): { kind: "sending" | "failed" | "waiting" | "done"; text: string } {
+  const running = snapshot.running;
+  if (running) {
+    const key = running.phase === "chats" ? "cloudSend.sendingChats" : "cloudSend.sending";
+    return { kind: "sending", text: running.progress ? `${t(key)} ${t("cloudSend.progress", running.progress)}` : t(key) };
+  }
+  const failure = last ? failedLine(failedSummary(last)) : null;
+  if (failure) return { kind: "failed", text: failure };
+  const waiting = waitingList(snapshot);
+  return waiting.length ? { kind: "waiting", text: t("cloudSend.state.waiting", { list: listOf(waiting) }) } : { kind: "done", text: t("cloudSend.state.done") };
 }
 
 /** The status line at the top: online and its version, or why it can't compare now. */
@@ -114,31 +126,74 @@ function olderVersion(a: string, b: string): boolean {
   return false;
 }
 
-/** My Cloud's strip: "Ember, 2 skills and 1Password are on This computer but not here." Null when nothing waits. */
-export function noticeLine(notice: CloudSendNotice): { text: string; one: boolean } | null {
-  const missing = [
-    ...notice.bots,
-    ...(notice.skills ? [counted(notice.skills, "cloudSend.list.skillOne", "cloudSend.list.skills")] : []),
-    ...(notice.logins ? [counted(notice.logins, "cloudSend.list.loginOne", "cloudSend.list.logins")] : []),
-    ...(notice.onePassword ? [t("cloudSend.list.onePassword")] : []),
+/** "12 bots, 3 skills, 2 logins, 1Password and 48 chats", from counts only. */
+export function countedList(sent: CloudSendCounts): string[] {
+  const chats = sent.chats;
+  return [
+    ...(sent.bots ? [counted(sent.bots, "cloudSend.list.botOne", "cloudSend.list.bots")] : []),
+    ...(sent.updatedBots ? [counted(sent.updatedBots, "cloudSend.list.changedBotOne", "cloudSend.list.changedBots")] : []),
+    ...(sent.skills ? [counted(sent.skills, "cloudSend.list.skillOne", "cloudSend.list.skills")] : []),
+    ...(sent.logins ? [counted(sent.logins, "cloudSend.list.loginOne", "cloudSend.list.logins")] : []),
+    ...(sent.onePassword ? [t("cloudSend.list.onePassword")] : []),
+    ...(sent.settings ? [t("cloudSend.list.settings")] : []),
+    ...(chats?.conversations ? [counted(chats.conversations, "cloudSend.list.chatOne", "cloudSend.list.chats")]
+      : chats?.messages ? [counted(chats.messages, "cloudSend.list.messageOne", "cloudSend.list.messages")] : []),
   ];
-  const newer = [
-    ...(notice.updatedBots.length ? [t("cloudSend.list.changesTo", { names: names(notice.updatedBots) })] : []),
-    ...(notice.settings ? [t("cloudSend.list.settings")] : []),
-  ];
-  if (missing.length) {
-    const one = notice.bots.length + notice.skills + notice.logins + (notice.onePassword ? 1 : 0) === 1 && !newer.length;
-    return { text: t(one ? "cloudSend.strip.missingOne" : "cloudSend.strip.missing", { list: listOf([...missing, ...newer]) }), one };
-  }
-  if (newer.length) return { text: t("cloudSend.strip.newer", { list: listOf(newer) }), one: false };
-  return null;
 }
 
-/** The rows the details list shows, grouped: bots with their skills under them, then logins, then settings. */
-export function detailRows(rows: PlanRow[]): PlanRow[] {
-  const order: Record<SendKind, number> = { bot: 0, skill: 0, login: 1, "1password": 1, setting: 2 };
-  const bots = new Map(rows.filter((row) => row.kind === "bot").map((row, index) => [row.id ?? row.key, index]));
-  return [...rows].sort((a, b) => order[a.kind] - order[b.kind]
-    || (bots.get(a.kind === "bot" ? a.id ?? a.key : a.bot ?? "") ?? 0) - (bots.get(b.kind === "bot" ? b.id ?? b.key : b.bot ?? "") ?? 0)
-    || (a.kind === "bot" ? -1 : 0) - (b.kind === "bot" ? -1 : 0));
+/** The move, or an older desktop's first send by itself: the strip shows it arriving and what it brought. */
+const ARRIVING = new Set(["move", "first"]);
+
+/** My Cloud's strip, or null when all is well: this computer's things on their way (the move, or Try again), what the
+ * move brought, or what couldn't come and why. */
+export function stripLine(notice: CloudSendNotice, sending: boolean, unanswered: string | null): { kind: "sending" | "failed" | "done"; text: string } | null {
+  if (sending || (notice.running && ARRIVING.has(notice.runningReason ?? ""))) {
+    const progress = notice.progress;
+    const key = notice.phase === "chats" ? "cloudSend.strip.bringingChats" : "cloudSend.strip.bringing";
+    return { kind: "sending", text: progress ? `${t(key)} ${t("cloudSend.progress", progress)}` : t(key) };
+  }
+  if (unanswered !== null) return { kind: "failed", text: t("cloudSend.failedSend", { error: unanswered }) };
+  const last = notice.last;
+  if (!last || last.seen) return null;
+  const failure = failedLine(last);
+  if (failure) return { kind: "failed", text: failure };
+  if (!ARRIVING.has(last.reason)) return null;
+  const list = countedList(last.sent);
+  return { kind: "done", text: list.length ? t("cloudSend.strip.arrived", { list: listOf(list) }) : t("cloudSend.strip.allHere") };
+}
+
+/** "4 bots, 2 skills, 2 logins, 1Password, 148 chats and 2 routines": what the move checked on both sides. */
+export function arrivedList(counts: OneHomeCounts): string[] {
+  return [
+    ...(counts.bots ? [counted(counts.bots, "cloudSend.list.botOne", "cloudSend.list.bots")] : []),
+    ...(counts.skills ? [counted(counts.skills, "cloudSend.list.skillOne", "cloudSend.list.skills")] : []),
+    ...(counts.logins ? [counted(counts.logins, "cloudSend.list.loginOne", "cloudSend.list.logins")] : []),
+    ...(counts.onePassword ? [t("cloudSend.list.onePassword")] : []),
+    ...(counts.chats ? [counted(counts.chats, "cloudSend.list.chatOne", "cloudSend.list.chats")] : []),
+    ...(counts.routines ? [counted(counts.routines, "cloudSend.list.routineOne", "cloudSend.list.routines")] : []),
+  ];
+}
+
+/** The one-time move's line on either page: on its way (with progress, or who it waits for), almost done, failing for a
+ * day (with Try again), what arrived (on My Cloud's page, once), or coming home. `page`: which page shows it. */
+export function moveLine(move: OneHomeView, page: "local" | "cloud"): { kind: "sending" | "failed" | "done"; text: string; extra: string[]; phone?: true; retry?: true } | null {
+  if (move.phase === "done") {
+    if (page !== "cloud") return null;
+    const list = move.counts ? arrivedList(move.counts) : [];
+    return { kind: "done", text: list.length ? t("cloudSend.move.done", { list: listOf(list) }) : t("cloudSend.move.doneAll"),
+      extra: move.held.map((key) => t("cloudSend.result.held", { key })), ...(move.phone ? { phone: true as const } : {}) };
+  }
+  if (move.phase === "home-again" || move.phase === "back") {
+    if (page !== "local") return null;
+    return { kind: "done", text: t(move.phase === "home-again" ? "cloudSend.move.homeAgain" : move.lost ? "cloudSend.move.backLost" : "cloudSend.move.back"), extra: [] };
+  }
+  const failing = "failing" in move ? move.failing : undefined;
+  if (failing) return { kind: "failed", text: failing.error ? t("cloudSend.move.failing", { error: failing.error }) : t("cloudSend.move.failingPlain"), extra: [], retry: true };
+  if (move.phase === "finishing") return { kind: "sending", text: t("cloudSend.move.finishing"), extra: [] };
+  if (move.phase === "wait") {
+    return { kind: "sending", text: move.waitingFor ? t("cloudSend.move.waiting", { name: move.waitingFor }) : t("cloudSend.move.waitingAny"), extra: [] };
+  }
+  const chats = move.phase === "copy" ? move.chats : undefined;
+  const key = page === "cloud" ? (chats ? "cloudSend.move.bringingChats" : "cloudSend.move.bringing") : (chats ? "cloudSend.move.copyChats" : "cloudSend.move.copy");
+  return { kind: "sending", text: t(key, chats ? { done: chats.done, total: chats.total } : {}), extra: [] };
 }

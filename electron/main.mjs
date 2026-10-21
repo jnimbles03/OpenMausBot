@@ -90,11 +90,12 @@ import { cloudLinkOpensSheet, colorDotIcons, createCloudLook, createCloudReadyNo
 import { createTrialNotices } from "./cloud-trial-notice.mjs";
 import { DESKTOP_PORTS, jsonFile, registerDesktopPrefs } from "./desktop-prefs.mjs";
 import { createDesktopIncludedX } from "./included-x.mjs";
-import { cloudHomeConnectUrl, cloudPlanDisk, cloudUnreachableText, createCloudPowerGate, isCloudHomeEntry, myCloudOrigin, openSleepingCloud, rememberedCloudHome, savedCloudHomeOrigin, signInCloudSession, withCloudHome } from "./cloud-home.mjs";
+import { CLOUD_HOME_NAME, cloudHomeConnectUrl, cloudPlanDisk, cloudUnreachableText, createCloudPowerGate, isCloudHomeEntry, myCloudOrigin, openSleepingCloud, rememberedCloudHome, savedCloudHomeOrigin, signInCloudSession, withCloudHome } from "./cloud-home.mjs";
 import { installCloudFiles } from "./cloud-sync-main.mjs";
 import { createCloudEntry } from "./cloud-entry.mjs";
+import { createLendingTarget, installCloudLending, usualFolderPaths, usualFolders } from "./cloud-lending-ipc.mjs"; import { createOpenAtLogin } from "./open-at-login.mjs";
 import { cloudPageSenderAllowed, createCloudMove, mintOwnerCode, moveBlocked, moveFit, moveRefusal, moveSenderDestination, parseCloudMoveStatus } from "./cloud-move.mjs";
-import { installCloudSend } from "./cloud-send-main.mjs";
+import { installOneHome } from "./one-home-main.mjs";
 import { cloudMoveChoices } from "./cloud-move-choices.mjs";
 import { createOrgLibrary } from "./org-library.mjs";
 import { createCompanyBackups } from "./company-backups.mjs";
@@ -871,7 +872,7 @@ function ensureCloudAccount() {
       rememberCloudHome(state);
       rememberedHome = rememberedCloudHome(rememberedHome, state);
       sendUpdaterState();
-      cloudPower.changed(); computerSharing?.cloudChanged();
+      cloudPower.changed(); computerSharing?.cloudChanged(); try { void oneHome.kick(); } catch {}
       void includedX.onState(state);
       refreshCloudMenus();
       announceCloudReady(state);
@@ -1217,7 +1218,7 @@ async function startServerOn(port, dataDir = runningDataDir ?? startupEnvironmen
       if (trustedApprovalMode.receive(proc, message)) return;
       if (managedDesktopRelay.receive(proc, message)) return;
       if (orgLibrary?.receive(message)) return;
-      if (receivePhoneSecretSave(proc, message) || cloudLogins.receive(proc, message)) return;
+      if (receivePhoneSecretSave(proc, message) || oneHome.receive(proc, message)) return;
     } catch (error) {
       slog(`desktop private sync rejected: ${error?.message ?? error}`);
     }
@@ -1534,8 +1535,9 @@ function sharingController() {
     fetch: (...args) => session.defaultSession.fetch(...args),
     environments: () => environmentsState.environments,
     enabled: refreshSharedComputersAllowed,
-    cloud: cloudLendingSnapshot, power: cloudPower, reconnect: origin => signInCloudSession({ origin, mine: myCloud(), pair: () => ensureCloudAccount().pairHome(), fetch: (...args) => session.defaultSession.fetch(...args) }),
-    onChange: summary => lendingIndicator().update({ lending: summary.lending.length > 0, busy: Boolean(summary.busy && summary.lending.includes(summary.busy.env)) }),
+    cloud: lendingTarget.cloud, power: cloudPower, reconnect: origin => signInCloudSession({ origin, mine: myCloud(), pair: () => ensureCloudAccount().pairHome(), fetch: (...args) => session.defaultSession.fetch(...args) }),
+    linkHeaders: async env => ({ cookie: (await session.defaultSession.cookies.get({ url: env.origin })).map(cookie => `${cookie.name}=${cookie.value}`).join("; ") }),
+    onChange: summary => { lendingIndicator().update({ lending: summary.lending.length > 0, busy: Boolean(summary.busy && summary.lending.includes(summary.busy.env)) }); loginItem.follow(summary.lending.length > 0); },
     cuaConnection: () => cuaReady, screenLocked: () => powerMonitor.getSystemIdleState(1) === "locked",
     hostControl: async (id, signal) => {
       const lease = async action => {
@@ -1554,22 +1556,9 @@ function sharingController() {
   return computerSharing;
 }
 
-let lastCloudHome = null;
-function cloudLendingSnapshot() {
-  if (!cloudAccount) return null;
-  const state = cloudAccount.state();
-  const accountId = state.account?.id ?? null;
-  const origin = state.status === "connected" ? (state.machine?.origin ?? null) : null;
-  if (origin && accountId) lastCloudHome = { accountId, origin };
-  else if (!accountId || lastCloudHome?.accountId !== accountId) lastCloudHome = null;
-  return { status: state.status === "signed-out" && state.message === "restoring" ? "restoring" : state.status, accountId, origin };
-}
-
-function cloudLendingEnvironment() {
-  const snapshot = cloudLendingSnapshot();
-  const origin = snapshot?.origin ?? (lastCloudHome?.accountId === snapshot?.accountId ? lastCloudHome?.origin : null);
-  return origin ? environmentsState.environments.find(entry => entry.origin === origin) ?? null : null;
-}
+const lendingTarget = createLendingTarget({ account: () => cloudAccount, environments: () => environmentsState.environments });
+const loginItem = createOpenAtLogin({ app, file: path.join(app.getPath("userData"), "open-at-login.json"), home: os.homedir() });
+let hiddenStart = false;
 
 function stopLending() {
   for (const env of environmentsState.environments) if (computerSharing?.cloudState(env).enabled) computerSharing.revoke(env);
@@ -2126,7 +2115,7 @@ function createWindow({ deferNavigation = false } = {}) {
         ...(app.isPackaged && !desktopRemoteAccess ? ["--omb-company-desktop=1"] : [])],
     },
   });
-  mainWindow = win;
+  mainWindow = win; hiddenStart = false;
   win.on("show", () => desktopTray?.windowShown(win));
   win.on("focus", () => { if (cloudAccount?.checkoutPending()) void cloudAccount.refresh().catch(() => {}); });
   win.on("close", (event) => {
@@ -2892,7 +2881,7 @@ const savedWorkspace = id => {
 const cloudLook = createCloudLook({ store: lookFile(() => path.join(app.getPath("userData"), cloudTarget(process.env).look), fs), accountId: () => cloudAccount?.state().account?.id ?? null,
   homeEntry: cloudHomeEntry, saveEntry: (origin, look) => persistEnvironments(withEnvironmentLook(environmentsState, origin, look)) });
 const cloudBuy = installCloudBuy({ ipcMain, guard: localWorkspaceOnly, client: ensureCloudAccount, offersReady: cloudOffersReady, clipboard, look: cloudLook });
-const cloudLogins = installCloudSend({ ipcMain, localOnly, cloudPage: cloudPageAsking, server: () => serverProc, cookieFetch: (...args) => session.defaultSession.fetch(...args), home: () => (myCloud() && cloudAccount ? { origin: myCloud(), grant: () => cloudAccount.pairHome() } : null), power: cloudPower, file: () => path.join(app.getPath("userData"), "cloud-send.json"), local: route => (serverProc && serverReady ? fetch(`http://127.0.0.1:${SERVER_PORT}${route}`, { redirect: "error", credentials: "omit", signal: AbortSignal.timeout(30_000), headers: { [DESKTOP_MUTATION_HEADER]: desktopMutationToken } }) : Promise.reject(new Error("not running"))), reconnect: origin => signInCloudSession({ origin, mine: myCloud(), pair: () => ensureCloudAccount().pairHome(), fetch: (...args) => session.defaultSession.fetch(...args) }), window: () => (desktopRemoteAccess ? null : mainWindow), localOrigin: rendererOrigin, openSettings: () => void openLendingSettings() });
+const oneHome = installOneHome({ ipcMain, localOnly, cloudPage: cloudPageAsking, server: () => serverProc, cookieFetch: (...args) => session.defaultSession.fetch(...args), home: () => (myCloud() && cloudAccount ? { origin: myCloud(), grant: () => cloudAccount.pairHome() } : null), power: cloudPower, file: () => path.join(app.getPath("userData"), "cloud-send.json"), localRequest: (route, init = {}) => (serverProc && serverReady ? fetch(`http://127.0.0.1:${SERVER_PORT}${route}`, { ...init, redirect: "error", credentials: "omit", headers: { ...init.headers, [DESKTOP_MUTATION_HEADER]: desktopMutationToken } }) : Promise.reject(new Error("not running"))), space: { disk: () => cloudPlanDisk(ensureCloudAccount().state()), grow: sizeGb => ensureCloudAccount().growDisk(sizeGb) }, reconnect: origin => signInCloudSession({ origin, mine: myCloud(), pair: () => ensureCloudAccount().pairHome(), fetch: (...args) => session.defaultSession.fetch(...args) }), window: () => (desktopRemoteAccess ? null : mainWindow), localOrigin: rendererOrigin, openSettings: () => void openLendingSettings(), bringChats: app.isPackaged ? () => ensureCloudMove().bring(destinationFor(cloudHomeEntry() ?? { id: null, name: CLOUD_HOME_NAME, origin: myCloud(), cloud: true })) : null, account: () => cloudAccount, journalFile: () => path.join(app.getPath("userData"), "one-home.json"), tempRoot: () => path.join(app.getPath("temp"), "openmaus-one-home"), lend: projects => useMyMac.lendByDefault({ projects }), phone: { paired: () => companionEnabledAtRest(), stop: () => stopDesktopCompanion({ remember: false }).then(() => {}), start: () => startDesktopCompanion({ waitForHosted: false, remember: false }).then(() => {}) }, openHome: () => void connectCloudHome().catch(() => {}), openLocal: () => void switchEnvironment(LOCAL_ID).catch(() => {}), restart: () => relaunchAfterDesktopRemoteChange(), version: app.getVersion(), log: slog });
 ipcMain.handle("sharing:state", localWorkspaceOnly("sharing:state", async (_event, id) => {
   await requireSharedComputers();
   return sharingController().state(savedWorkspace(id).id);
@@ -2932,35 +2921,23 @@ ipcMain.handle("sharing:save", localWorkspaceOnly("sharing:save", async (_event,
 
 // Decided from the verified Cloud sign-in alone: the renderer names no server, account or origin.
 async function lendingSnapshot() {
-  const env = cloudLendingEnvironment();
+  const env = lendingTarget.environment();
   const connection = await cuaReady.catch(() => null);
-  return {
-    available: Boolean(env),
-    screenAvailable: Boolean(connection?.mcpCommand),
-    ...(env ? { state: sharingController().cloudState(env), activity: sharingController().activity(env.id, 30) } : {}),
-  };
+  return { available: Boolean(env), screenAvailable: Boolean(connection?.mcpCommand), ...(env ? { state: sharingController().cloudState(env), activity: sharingController().activity(env.id, 30) } : {}) };
 }
-const lendingEnv = () => {
-  const env = cloudLendingEnvironment();
-  if (!env) throw new Error("Open My Cloud first.");
-  return env;
-};
-ipcMain.handle("lending:state", localWorkspaceOnly("lending:state", () => lendingSnapshot()));
-ipcMain.handle("lending:folder", localWorkspaceOnly("lending:folder", async () => {
-  lendingEnv();
-  const picked = await dialog.showOpenDialog(mainWindow, { title: "Choose a folder My Cloud can use", properties: ["openDirectory"] });
-  if (picked.canceled || !picked.filePaths[0]) return null;
-  return (await validateSharedFolders([{ id: randomUUID(), path: picked.filePaths[0], write: false }]))[0];
-}));
-ipcMain.handle("lending:save", localWorkspaceOnly("lending:save", async (_event, input) => {
-  await sharingController().saveCloud(lendingEnv(), { folders: input?.folders, screen: input?.screen === true });
-  return lendingSnapshot();
-}));
-ipcMain.handle("lending:stop", localWorkspaceOnly("lending:stop", async () => {
-  sharingController();
-  stopLending();
-  return lendingSnapshot();
-}));
+const useMyMac = installCloudLending({ ipcMain, localOnly: localWorkspaceOnly, snapshot: lendingSnapshot, environment: lendingTarget.environment, save: (env, choice) => sharingController().saveCloud(env, choice), stop: () => { sharingController(); stopLending(); },
+  cloudPage: (channel, handler) => (event, ...args) => { if (!cloudPageAsking(event)) throw new Error(`${channel} is only available in this app's window`); return handler(event, ...args); },
+  chooseFolder: async () => { const picked = await dialog.showOpenDialog(mainWindow, { title: "Choose a folder My Cloud can use", properties: ["openDirectory"] }); return picked.canceled || !picked.filePaths[0] ? null : (await validateSharedFolders([{ id: randomUUID(), path: picked.filePaths[0], write: false }]))[0]; },
+  defaults: () => usualFolders(usualFolderPaths(name => app.getPath(name), os.homedir()), validateSharedFolders), validate: validateSharedFolders,
+  confirmScreen: async () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return false;
+    const { response } = await dialog.showMessageBox(mainWindow, {
+      type: "warning", message: "Let your bots on My Cloud use your apps and screen?",
+      detail: "In your own conversations and routines, they can see your screen, click and type in your apps as you, while this computer is awake with OpenMausBot open. That reaches anything those apps can reach. You can turn it off at any time on My Cloud's page or in Settings → MausBot Cloud.",
+      buttons: ["Lend apps and screen", "Cancel"], defaultId: 1, cancelId: 1,
+    });
+    return response === 0;
+  } });
 const cloudSync = installCloudFiles({
   app, ipcMain, dialog, shell, powerMonitor, localWorkspaceOnly, localDataDir: desktopDataDir(),
   fetch: (...args) => session.defaultSession.fetch(...args),
@@ -3017,7 +2994,7 @@ ipcMain.handle("workspaces:menu", workspaceOnly(async (_event, from) => {
       onConnect: () => void workspaceMenuAction(openWorkspaceSettings),
       onForget: (id) => void workspaceMenuAction(() => forgetEnvironment(id)),
       ...cloudMenuOptions(from === "howto" ? "app_howto" : "app_menu"),
-      ...(await placesMenuOptions({ cloud: cloudHomeEntry(), activeId: environmentsState.activeId, platform: process.platform, port: SERVER_PORT, send: cloudLogins.menu() })),
+      ...(await placesMenuOptions({ cloud: cloudHomeEntry(), activeId: environmentsState.activeId, platform: process.platform, port: SERVER_PORT, send: oneHome.menu() })),
     }));
     await new Promise((resolve) => menu.popup({ window: mainWindow, callback: resolve }));
   } finally {
@@ -3119,14 +3096,15 @@ app.whenReady().then(async () => {
     try {
       desktopTray = createSystemTray({
         Tray, Menu, nativeImage, iconPath: APP_ICON,
-        getWindow: () => startupScreen?.window ?? mainWindow,
+        getWindow: () => startupScreen?.window ?? mainWindow ?? (openWindowForLink?.(), mainWindow),
         onQuit: () => app.quit(),
       });
     } catch (error) {
       slog(`system tray unavailable: ${error?.message ?? error}`);
     }
   }
-  startupScreen = createStartupScreen({
+  hiddenStart = loginItem.startedHidden();
+  startupScreen = hiddenStart ? null : createStartupScreen({
     BrowserWindow, iconPath: APP_ICON, isQuitting: () => desktopShutdownStarted,
     onQuit: () => app.quit(),
     onHide: desktopTray ? (win) => desktopTray.hide(win) : undefined,
@@ -3134,7 +3112,7 @@ app.whenReady().then(async () => {
     onShow: (win) => desktopTray?.windowShown(win),
     onFinished: () => { startupScreen = null; },
   });
-  await startupScreen.ready;
+  await startupScreen?.ready;
   if (desktopShutdownStarted) return;
   session.defaultSession.on("will-download", (_event, item) => {
     item.setSavePath(collisionFreeDownloadPath(app.getPath("downloads"), item.getFilename()));
@@ -3320,8 +3298,8 @@ app.whenReady().then(async () => {
     cloudAccountRestoring = true;
     cloudAccountStarted = ensureCloudAccount().start().catch(() => {}).finally(() => { cloudAccountRestoring = false; });
   }
-  void cloudAccountStarted.then(() => { cloudSignInRestored = true; });
-  if (!desktopRemoteAccess && serverReady && companionEnabledAtRest()) {
+  void cloudAccountStarted.then(() => { cloudSignInRestored = true; void oneHome.kick(); });
+  if (!desktopRemoteAccess && serverReady && companionEnabledAtRest() && !oneHome.away()) {
     // Wait until a saved organisation policy is known: it may turn remote access off.
     void (managedDesktop?.whenRestored() ?? Promise.resolve())
       .then(() => startDesktopCompanion({ waitForHosted: false, remember: false }))
@@ -3351,7 +3329,7 @@ app.whenReady().then(async () => {
   // A cold-start action owns its first navigation; a default load started first would be aborted by it.
   const deliveredOrganizationEntry = await deliverOrganizationEntry();
   const deliveredCloudEntry = await cloudEntry.ready();
-  if (!restoredOrganizationEntry && !deliveredOrganizationEntry && !deliveredCloudEntry && (!mainWindow || mainWindow.isDestroyed())) createWindow();
+  if (!hiddenStart && !restoredOrganizationEntry && !deliveredOrganizationEntry && !deliveredCloudEntry && (!mainWindow || mainWindow.isDestroyed())) createWindow();
   // Reconcile incomplete setup and resume interrupted sign-out only once the local app is usable.
   if (hostedAccount) void hostedAccount.restore().catch(() => {});
   // Registering from an unreadable store would mint a second installation identity.
@@ -3382,7 +3360,7 @@ app.whenReady().then(async () => {
 
 const allWindowsClosedQuit = createAllWindowsClosedQuit({
   app,
-  allWindows: () => BrowserWindow.getAllWindows(),
+  allWindows: () => BrowserWindow.getAllWindows(), stayOpen: () => hiddenStart,
 });
 
 // The embedded CUA daemon's async cleanup cannot run after the host exits, so the first quit waits for it (capped).
@@ -3406,7 +3384,7 @@ app.on("before-quit", (e) => {
   companyBackupSchedule?.close();
   orgLibrary?.close();
   managedDesktop?.close();
-  cloudAccount?.close();
+  cloudAccount?.close(); oneHome.close();
   void cloudMove?.close();
   companyBackupController?.abort();
   computerSharing?.close();

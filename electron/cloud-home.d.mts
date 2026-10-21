@@ -16,10 +16,16 @@ export interface CloudMachine {
   unreachable?: { cause: CloudUnreachableCause; since: number };
   /** Only for a plan that sleeps when idle: whether it is awake now, as the Admin says. */
   power?: import("./cloud-power.mjs").CloudPower;
+  /** The Admin lets this account's computer move to it now (its `moves` gate). */
+  moves?: true;
+  /** It ended (a trial not paid, a plan cancelled) and the Admin still holds it until it is deleted. */
+  hold?: { until: number };
 }
 /** A payment received but not yet linked to this account: nobody pays twice. */
 export interface CloudPurchase { state: "confirming" | "held"; tier?: string; paidAt?: number }
 export type CloudTrialState = "active" | "ending" | "processing" | "late" | "ended";
+/** The plans this app knows by name. */
+export type CloudPlanTier = "starter" | "personal" | "pro" | "max";
 /** The free trial on the account's Cloud, as the Admin says: display only, never an entitlement. */
 export interface CloudTrial {
   state: CloudTrialState;
@@ -40,20 +46,30 @@ export interface CloudTrial {
    * billing portal (`portal`: turn renewal back on, update the card) or a new
    * subscription (`checkout`, once it has ended). */
   keep: "none" | "portal" | "checkout";
-  /** While it runs on a plan above Personal: Personal's price before tax, in US cents. */
+  /** While it runs on a plan above Personal and Personal is the way down: Personal's price before tax, in US cents. An
+   * older Admin's only word for the way down; `switchTo` wins over it. */
   personalAmount?: number;
+  /** The plan this trial can switch to from its Plan page, and its price before tax in US cents, only while a switch is
+   * the way down. */
+  switchTo?: { tier: CloudPlanTier; amount: number };
 }
 /** The trial's AI credit, in US dollars. */
 export interface CloudCredit { grantedUsd: number; remainingUsd: number; state: "active" | "used_up" }
 /** What a plan includes, as the Admin's catalog says. */
 export interface CloudPlanAllowances {
   cpus: number; memoryMb: number;
+  /** The kind of CPUs, when the Admin says. */
+  cpuKind?: "shared" | "performance";
   /** The disk it starts with, and the most it grows to (the same when it doesn't grow). */
   diskGb: number; maxDiskGb: number;
   /** Cloud computers at once, and cloud computer hours and voice characters a month. */
   computers: number; computerHours: number; voiceCharacters: number;
   /** It sleeps when idle and wakes when someone or a schedule needs it. */
   sleeps?: true;
+  /** Swap on its machine, when the Admin says and it has some. */
+  swapMb?: number;
+  /** How many days its daily backups are kept, when the Admin says. */
+  snapshotDays?: number;
 }
 /** One plan OpenMausBot Cloud sells: its monthly price before tax in US cents,
  * and its free trial's days when it comes with one. */

@@ -7,8 +7,8 @@ export interface CloudAccountState {
   expiresAt?: number;
   /** Only a current server-verified session can include an entitlement
    * (verified within the last few minutes; a failed re-check keeps it).
-   * `plan` "pro" means any paid plan; `tier` names it ("personal", "pro",
-   * "max", or one newer than this app) when the Admin sends one. */
+   * `plan` "pro" means any paid plan; `tier` names it ("starter", "personal",
+   * "pro", "max", or one newer than this app) when the Admin sends one. */
   entitlement?: { plan: "free" | "pro"; tier?: string; status: "active" | "inactive"; expiresAt: number | null; version: number };
   verifiedAt?: number;
   verifiedUntil?: number;
@@ -92,7 +92,7 @@ export interface CloudAccountBridge {
   /** The same, opening the Cloud's Settings on its phone pairing. */
   connectHomeForPhone(): Promise<CloudAccountState>;
   onState(callback: (state: CloudAccountState) => void): () => void;
-  /** "Let My Cloud use this computer" (docs/cloud-pro.md). */
+  /** "Let my bots use this Mac" (docs/cloud-pro.md). */
   lending?: import("./computer-sharing.mjs").CloudLendingBridge;
   files?: import("./cloud-sync.mjs").CloudFilesBridge;
 }
@@ -172,6 +172,8 @@ export interface CloudAccountClient {
   wakeHome(): Promise<"awake" | "waking" | null>;
   setWaking(on: boolean): void;
   pairHome(): Promise<import("./cloud-home.mjs").CloudHomeGrant>;
+  /** A Cloud that ended and that the Admin still holds, started for its owner's export only. */
+  exportHome(): Promise<{ starting: true } | { notHeld: true } | { deleted: true } | { grant: import("./cloud-home.mjs").CloudHomeGrant }>;
   growDisk(sizeGb: number): Promise<{ supported: false } | { supported: true; refused: true } | { supported: true; disk: { gb: number; maxGb: number } }>;
   /** This sign-in's own X research relay access while its plan is paid; null without one. */
   xResearchAccess(): Promise<{ url: string; token: string } | null>;

@@ -380,7 +380,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "create_bot",
     description:
-      "Create a specialist bot in your section. Chief of Staff only. It is created immediately and the person can undo it. instructions become its soul. Omit modelSelection to use the workspace default, or choose exact IDs from list_team_setup. Connected apps start disabled and the bot runs at the workspace's default access level. Assign work through coordinate_bots. Maximum four new bots per turn.",
+      "Chief of Staff only: add a specialist to your section now; the person can undo it. instructions become its soul. Omit modelSelection for the workspace default, or use exact IDs from list_team_setup. It starts with connected apps off, at the default access level. Assign work with coordinate_bots. At most four per turn.",
     inputSchema: {
       type: "object",
       properties: {
@@ -396,7 +396,6 @@ const TOOL_DEFINITIONS = [
           maxLength: 1024,
           description: "Absolute path of the folder this specialist's tools read and write in (for example /Users/me/Projects/site). It must already exist. Leave it out for the specialist's private workspace.",
         },
-        suggestion: { type: "boolean", description: "True if the user did not ask for this bot." },
       },
       required: ["name", "role", "instructions"],
     },
@@ -404,6 +403,11 @@ const TOOL_DEFINITIONS = [
   {
     name: "list_team_setup",
     description: "Chief of Staff only: list authorized teams, teammate IDs, and exact engine/model choices for team setup. Call before proposing configuration; never invent model IDs. Existing thread models are independent of bot defaults.",
+    inputSchema: { type: "object", additionalProperties: false, properties: {} },
+  },
+  {
+    name: "list_team_library",
+    description: "Chief of Staff only: ready-made teams, each with a summary and roles (lead = the team's Chief). Create roles with create_bot.",
     inputSchema: { type: "object", additionalProperties: false, properties: {} },
   },
   {
@@ -515,7 +519,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "request_sign_in",
     description:
-      "Ask the person to sign in to a website themselves, in the browser or on the computer you are using now. Use it when a page needs a login you do not have, or a one-time code, CAPTCHA or other step only they can do. They get a card and a notification, sign in where you work, and press Done. Never ask for a password or code in chat. After calling it, end your turn; OpenMausBot resumes you when they finish or decline, and then check you are signed in.",
+      "Ask the person to sign in to a website themselves, in the browser or on the computer you are using now. Use it when a page needs a login you do not have, or a CAPTCHA, passkey or other step only they can do, or a one-time code you cannot read. A code the site sends to the person's own email or messages for a sign-in they asked for is not one: read it there and type it in yourself. They get a card and a notification, sign in where you work, and press Done. Never ask for a password or code in chat. After calling it, end your turn; OpenMausBot resumes you when they finish or decline, and then check you are signed in.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -529,7 +533,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "fill_login",
     description:
-      "Sign in with a login the person saved in OpenMausBot. Call it on the login page open in your browser: OpenMausBot types the username, password and any one-time code itself, submits each step, and says where the page went; you never see the password. A login fills on its own site, such as any page of example.com. With no saved login for the site, call request_sign_in.",
+      "Sign in with a login the person saved in OpenMausBot. Call it on the login page open in your browser: OpenMausBot types the username, password and any one-time code itself, submits each step, and says where the page went; you never see the password. A login fills on its own site, such as any page of example.com. With no saved login for the site, sign in another way the person allowed (a code sent to their own email, which you read and type in, is one), or call request_sign_in.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -645,12 +649,13 @@ const TOOL_DEFINITIONS = [
   {
     name: "list_triggers",
     description:
-      "List this bot's triggers, its routines (schedules), app events and webhooks: ids, when they fire, on or paused, next run or last fire, problems. trigger_id: one trigger with its last 10 fires. Includes the computer's authoritative current time and timezone.",
+      "List this bot's triggers, its routines (schedules), app events and webhooks: ids, when they fire, on or paused, next run or last fire, problems. trigger_id: one trigger with its last 10 fires; with include_address, a webhook's private address, to paste into the setup of the app that sends to it. Includes the computer's authoritative current time and timezone.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
       properties: {
         trigger_id: { type: "string", description: "Optional: one trigger's details and recent fires." },
+        include_address: { type: "boolean", description: "With a webhook's trigger_id: also its private address. For the bot that owns it, or a Chief of Staff." },
         for_bot_id: { type: "string", description: "Only for ANOTHER bot in your section, from list_bots: list that bot's triggers." },
       },
     },
@@ -671,7 +676,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "create_trigger",
     description:
-      "Set up work that happens on its own: when <something happens>, a bot does <instructions>. Call it in this turn whenever the person describes recurring or event-based work (\"every morning send me…\", \"whenever I get an email from…\", \"when another app calls…\"); never ask for confirmation first. It applies at once and the person sees a card with Edit, Pause and Undo. when=schedule runs on a time rule (call list_triggers first for relative dates: it has the authoritative time and timezone); when=app_event runs when something happens in a connected app (list_trigger_events first; prefer it to a schedule that keeps checking); when=webhook gives an address another app sends to (the person copies it from the card; you never see its secret). when=limit_reset runs when an AI's usage limit resets (\"run this when my limit resets\", or to finish work your own limit stopped). To the person these are automations: write name and instructions as they would say them. Something to do once, now, is not a trigger. for_bot_id: a trigger for ANOTHER bot in your section, which keeps that bot's engine and permissions.",
+      "Set up work that happens on its own: when <something happens>, a bot does <instructions>. Call it in this turn whenever the person describes recurring or event-based work (\"every morning send me…\", \"whenever I get an email from…\", \"when another app calls…\"); never ask for confirmation first. It applies at once and the person sees a card with Edit, Pause and Undo. when=schedule runs on a time rule (call list_triggers first for relative dates: it has the authoritative time and timezone); when=app_event runs when something happens in a connected app (list_trigger_events first; prefer it to a schedule that keeps checking); when=webhook gives an address another app sends to: the result carries its private address, so you can paste it into that app's setup yourself (never anywhere else). when=limit_reset runs when an AI's usage limit resets (\"run this when my limit resets\", or to finish work your own limit stopped). To the person these are automations: write name and instructions as they would say them. Something to do once, now, is not a trigger. for_bot_id: a trigger for ANOTHER bot in your section, which keeps that bot's engine and permissions.",
     inputSchema: {
       type: "object",
       additionalProperties: false,
@@ -941,7 +946,7 @@ const SKILL_TOOL_NAMES = new Set(["skills_list", "skill_manage"]);
 export const SHARED_COMPUTER_TOOL_NAMES = new Set(["list_shared_computers", "shared_computer"]);
 const VOICE_TOOL_NAMES = new Set(["send_voice_note"]);
 const CHIEF_ONLY_TOOL_NAMES = new Set([
-  "create_bot", "list_team_setup", "propose_team_setup", "propose_bot_deletion", "create_room", "manage_room", "retry_thread",
+  "create_bot", "list_team_setup", "list_team_library", "propose_team_setup", "propose_bot_deletion", "create_room", "manage_room", "retry_thread",
 ]);
 const CHIEF_TARGET_TOOL_NAMES = new Set(["propose_profile", "propose_model"]);
 const WATCHER_TOOL_NAMES = new Set(["create_options_card"]);
