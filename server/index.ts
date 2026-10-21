@@ -10166,7 +10166,7 @@ let webhookIngress: WebhookIngress | null = null;
 let webhookIngressError: string | null = null;
 try {
   webhookIngress = await listenWebhookIngress(webhooks, {
-    port: WEBHOOK_PORT, publicBaseUrl: WEBHOOK_PUBLIC_URL,
+    host: process.env.OMB_BIND_HOST?.trim() || "127.0.0.1", port: WEBHOOK_PORT, publicBaseUrl: WEBHOOK_PUBLIC_URL,
     claimRequest: () => workspaceMaintenance.request(),
   });
   const advertised = WEBHOOK_PUBLIC_URL ? ` (advertised as ${webhookIngress.baseUrl})` : "";
@@ -17092,9 +17092,10 @@ if (CLOUD_HOME) registerCloudPower(cloudPower = createCloudPower({ dataDir: DATA
   liveCall: () => liveCalls.current() !== null, computer: () => cloudComputerPower.awake() || boatLifecycleBusyBots.size > 0, nextDueAt: () => routines?.nextDueAt() ?? null,
   maintenance: () => workspaceMaintenance.active || providerFleetReloading || providerAuthSessions.active || browserEngineInstall !== null } }));
 
-server.listen(PORT, "127.0.0.1", async () => {
+const BIND_HOST = process.env.OMB_BIND_HOST?.trim() || "127.0.0.1";
+server.listen(PORT, BIND_HOST, async () => {
   companyRuntimeReady();
-  console.log(`openmausbot server on http://127.0.0.1:${PORT}`);
+  console.log(`openmausbot server on http://${BIND_HOST}:${PORT}`);
   browserSweep.start(); appTriggers.start(); startCloudHomeConnectedApps({ cloudHome: CLOUD_HOME !== null, dataDir: DATA_DIR, cloudGrant: CLOUD_ENV.OMB_CLOUD_CONNECTED_APPS_GRANT, apply: (access) => { composio.setManagedBrokerAccess(access); broadcast({ kind: "config", ...configStatus() }); } });
   if (builtInBrowserEnabled(cfg)) chromeLauncher.start();
   followupsReady = true;
