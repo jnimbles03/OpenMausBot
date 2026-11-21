@@ -151,7 +151,10 @@ describe("container images", () => {
     const last = (steps: Step[], op: string) => steps.filter(step => step.op === op).at(-1)?.args;
     const server = chain("server");
     expect(last(server, "USER")).toBe("maus");
-    expect(last(server, "VOLUME")).toBe('["/data"]');
+    // Railway rejects any Dockerfile containing a VOLUME instruction ("docker
+    // VOLUME at Line N is not supported, use Railway Volumes") and mounts /data
+    // itself, so the image declares no volume and `last` is undefined.
+    expect(last(server, "VOLUME")).toBeUndefined();
     expect(last(server, "CMD")).toBe('["node", "dist-server/server-launcher.js"]');
     // A container platform runs the image with no --init: the image is its own.
     expect(last(server, "ENTRYPOINT")).toBe('["/usr/bin/tini", "-s", "--"]');
@@ -159,7 +162,8 @@ describe("container images", () => {
     expect(last(server, "HEALTHCHECK")).toContain("http://127.0.0.1:8799/api/health");
     const home = chain("cloud-home");
     expect(last(home, "USER")).toBe("root");
-    expect(last(home, "VOLUME")).toBe('["/data"]');
+    // No VOLUME either, for the same Railway reason as the server stage.
+    expect(last(home, "VOLUME")).toBeUndefined();
     expect(last(home, "EXPOSE")).toBe("8080");
     expect(last(home, "CMD")).toBe('["node", "/app/dist-server/cloud-home-start.js"]');
     // A host that starts a Cloud home with a plain `docker run` gives it no init either.
