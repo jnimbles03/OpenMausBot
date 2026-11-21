@@ -70,10 +70,25 @@ jobs:
           grep -q 'enterprise layer disabled: OMB_LICENSE_KEY signature does not match' <<<"$edition"
           docker exec omb-ent test -f /app/dist-server/enterprise/LICENSE
           docker rm -f omb-ent >/dev/null
-      - name: Prove the non-root user can browse with the baked-in Chrome
+      - name: Prove the image's declared user can browse with the baked-in Chrome
         run: |
           set -euo pipefail
-          test "$(docker exec omb id -un)" = maus
+          # The image says who it runs as; the smoke test runs as that user, not as
+          # root by accident. Upstream declares `USER maus` and asserts non-root.
+          # This fork's server image runs as root by design: Railway mounts its
+          # volume at /data root-owned, and a fresh volume cannot be handed to
+          # `maus` from inside the image. Asserting the declared user keeps the
+          # check truthful for both: it fails if the image's user drifts from what
+          # the Dockerfile says, and the browser steps below still have to work as
+          # that user.
+          declared="$(docker image inspect --format '{{.Config.User}}' openmausbot:ci)"
+          expected=0
+          if [ -n "$declared" ]; then
+            expected="$(docker run --rm --entrypoint id openmausbot:ci -u "$declared")"
+          fi
+          actual="$(docker exec omb id -u)"
+          echo "declared user: '${declared:-root}' (uid $expected), container uid: $actual"
+          test "$actual" = "$expected"
           timeout 45 docker exec omb agent-browser --session ci-browser open 'data:text/html,<title>OMB browser smoke</title><h1>Browser ready</h1>'
           timeout 15 docker exec omb agent-browser --session ci-browser get title | grep -Fx 'OMB browser smoke'
           # Chrome for Testing's page is 1280x577 until sized; the harness sizes
@@ -514,7 +529,15 @@ jobs:
           done
           docker exec omb curl -sf http://127.0.0.1:8799/ | grep -qi "<html" || { docker logs omb; echo "UI not served"; exit 1; }
           docker exec -w /app/duckdb omb node --input-type=module -e "const { DuckDBInstance } = await import('@duckdb/node-api'); const c = await (await DuckDBInstance.create()).connect(); const r = await c.runAndReadAll('select 42 as x'); if (Number(r.getRows()[0][0]) !== 42) process.exit(1)"
-          test "$(docker exec omb id -un)" = maus
+          # Same invariant as the amd64 job: run as whoever the image declares.
+          declared="$(docker image inspect --format '{{.Config.User}}' openmausbot:arm64)"
+          expected=0
+          if [ -n "$declared" ]; then
+            expected="$(docker run --rm --entrypoint id openmausbot:arm64 -u "$declared")"
+          fi
+          actual="$(docker exec omb id -u)"
+          echo "declared user: '${declared:-root}' (uid $expected), container uid: $actual"
+          test "$actual" = "$expected"
           timeout 90 docker exec omb agent-browser --session ci-browser open 'data:text/html,<title>OMB browser smoke</title><h1>Browser ready</h1>'
           timeout 15 docker exec omb agent-browser --session ci-browser get title | grep -Fx 'OMB browser smoke'
           timeout 15 docker exec omb agent-browser --session ci-browser close

@@ -47,7 +47,7 @@ export const BOX_ENV_PREFIXES: readonly string[] = [
  * operator set on the server would otherwise pass under the engines' OPENMAUSBOT_ prefix. */
 export const BOX_ENV_NEVER: ReadonlySet<string> = new Set([
   "OMB_LICENSE_KEY", "OMB_INSTALLATION_CREDENTIAL", "OMB_LOOPBACK_TRUST", "OMB_CLOUD_SECRETS_FD",
-  "OMB_DATA_DIR", "OMB_STATIC_DIR", "OMB_DUCKDB_DIR", "OMB_PORT", "OMB_WEBHOOK_PORT",
+  "OMB_DATA_DIR", "OMB_STATIC_DIR", "OMB_DUCKDB_DIR", "OMB_PORT", "OMB_WEBHOOK_PORT", "OMB_BIND_HOST",
   "OPENMAUSBOT_TOKEN", "OPENMAUSBOT_URL",
 ]);
 export const BOX_ENV_NEVER_PREFIXES: readonly string[] = ["OMB_CLOUD_"];
