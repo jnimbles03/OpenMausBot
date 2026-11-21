@@ -260,8 +260,11 @@ COPY --from=build --chown=maus:maus /src/skills ./skills
 RUN printf '#!/bin/sh\nexec node /app/dist-server/openmausbot.js "$@"\n' > /usr/local/bin/openmausbot && chmod 0755 /usr/local/bin/openmausbot
 ENV HOME=/data \
     OMB_CLI_PREFIX="docker compose exec omb openmausbot"
-# VOLUME ["/data"]
-# USER maus
+# The server image runs as `maus`, never root, and declares its /data volume,
+# as the image contract test requires. /data is created for `maus` by the
+# useradd in the runtime stage, so a fresh named volume inherits that owner.
+VOLUME ["/data"]
+USER maus
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -sf http://127.0.0.1:8799/api/health | grep -q openmausbot || exit 1
 # The launcher runs dist-server/index.js and starts it again when it asks to
