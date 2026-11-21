@@ -150,8 +150,13 @@ describe("container images", () => {
   it("keeps each image's runtime contract", () => {
     const last = (steps: Step[], op: string) => steps.filter(step => step.op === op).at(-1)?.args;
     const server = chain("server");
-    expect(last(server, "USER")).toBe("maus");
-    expect(last(server, "VOLUME")).toBe('["/data"]');
+    // This fork's server stage runs as root on purpose: Railway mounts its volume
+    // at /data root-owned, and a fresh volume cannot be handed to `maus` from
+    // inside the image, so both the USER and the VOLUME line are commented out.
+    // Upstream declares USER maus and VOLUME ["/data"] here; restore them together
+    // with the one-off volume chown that makes /data maus's.
+    expect(last(server, "USER")).toBeUndefined();
+    expect(last(server, "VOLUME")).toBeUndefined();
     expect(last(server, "CMD")).toBe('["node", "dist-server/server-launcher.js"]');
     // A container platform runs the image with no --init: the image is its own.
     expect(last(server, "ENTRYPOINT")).toBe('["/usr/bin/tini", "-s", "--"]');
