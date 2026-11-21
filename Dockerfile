@@ -229,7 +229,10 @@ RUN export HOME=/tmp/omb-build-home \
  && if [ -n "$untrusted" ]; then echo "not root's, or writable by others:" >&2; echo "$untrusted" >&2; exit 1; fi \
  && rm -rf /tmp/omb-build-home
 ENV HOME=/data
-VOLUME ["/data"]
+# No VOLUME instruction: Railway rejects any Dockerfile that contains one
+# ("docker VOLUME at Line N is not supported, use Railway Volumes") and
+# mounts /data itself, so the volume is declared on the platform, not in
+# the image. This is why the fork cannot carry upstream's VOLUME line.
 EXPOSE 8080
 # Fly uses the checks in fly.toml; this one serves a plain `docker run`.
 HEALTHCHECK --interval=15s --timeout=5s --start-period=30s --retries=5 \
@@ -260,10 +263,11 @@ COPY --from=build --chown=maus:maus /src/skills ./skills
 RUN printf '#!/bin/sh\nexec node /app/dist-server/openmausbot.js "$@"\n' > /usr/local/bin/openmausbot && chmod 0755 /usr/local/bin/openmausbot
 ENV HOME=/data \
     OMB_CLI_PREFIX="docker compose exec omb openmausbot"
-# The server image runs as `maus`, never root, and declares its /data volume,
-# as the image contract test requires. /data is created for `maus` by the
-# useradd in the runtime stage, so a fresh named volume inherits that owner.
-VOLUME ["/data"]
+# The server image runs as `maus`, never root. It declares no VOLUME: Railway
+# rejects any Dockerfile containing a VOLUME instruction ("docker VOLUME at
+# Line N is not supported, use Railway Volumes") and mounts /data itself.
+# /data is created for `maus` by the useradd in the runtime stage, so a fresh
+# named volume inherits that owner.
 USER maus
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD curl -sf http://127.0.0.1:8799/api/health | grep -q openmausbot || exit 1
