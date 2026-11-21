@@ -3,6 +3,8 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { botButtonTone } from "@/lib/bot-button";
+import { setAdvancedMode } from "@/lib/interface-mode";
 import type { UpdaterState } from "@/lib/updater";
 import { UpdateIndicator, updateIndicatorLabel, updateIndicatorShown } from "./UpdateIndicator";
 import { updateHasButton } from "./SidebarProfileMenu";
@@ -35,6 +37,7 @@ beforeEach(async () => {
       getState: async () => ({ status: "idle" }),
     },
   };
+  setAdvancedMode(true);
   host = document.createElement("div");
   document.body.appendChild(host);
   root = createRoot(host);
@@ -55,7 +58,7 @@ describe("the update button", () => {
   });
 
   it("says what it holds", () => {
-    expect(updateIndicatorLabel({ status: "downloaded", version: "0.2.0" })).toBe("Update ready: OpenMausBot 0.2.0");
+    expect(updateIndicatorLabel({ status: "downloaded", version: "0.2.0" })).toBe("Update ready: MausBot 0.2.0");
     expect(updateIndicatorLabel({ status: "downloading", percent: 41.6 })).toBe("Downloading an update, 42%");
     expect(updateIndicatorLabel({ status: "downloading" })).toBe("Downloading an update");
   });
@@ -65,6 +68,25 @@ describe("the update button", () => {
     expect(updateHasButton("downloading")).toBe(true);
     expect(updateHasButton("error")).toBe(false);
     expect(updateHasButton("handed-off")).toBe(false);
+  });
+
+  it("in Simple is a round blue button the height of the Connect apps pill, its white arrow pulsing while it downloads", async () => {
+    expect(botButtonTone("blue").ink, "white on a blue bot's own send-button fill").toBe("#ffffff");
+    await act(async () => setAdvancedMode(false));
+    expect(button(), "nothing while there is no update").toBeNull();
+    await emit({ status: "downloading", version: "0.2.0", percent: 10 });
+    const classes = () => button()!.className.split(" ");
+    expect(classes()).toEqual(expect.arrayContaining(["bot-button", "size-9", "rounded-full", "animate-pulse", "motion-reduce:animate-none"]));
+    expect(classes()).not.toContain("bg-white");
+    expect(button()!.style.getPropertyValue("--bot-button")).toBe(botButtonTone("blue").fill);
+    expect(button()!.style.getPropertyValue("--bot-button-ink")).toBe("#ffffff");
+    await emit({ status: "downloaded", version: "0.2.0" });
+    expect(classes(), "still once it is ready").not.toContain("animate-pulse");
+    await act(async () => button()!.click());
+    expect(card(), "it opens the update card").not.toBeNull();
+    await emit({ status: "idle" });
+    expect(button(), "gone once the app has updated").toBeNull();
+    expect(card()).toBeNull();
   });
 
   it("appears when an update arrives and goes when there is none", async () => {
@@ -88,7 +110,7 @@ describe("the update card", () => {
     expect(dialog.getAttribute("aria-modal")).toBe("true");
     expect(dialog.parentElement!.className).toContain("items-center");
     expect(dialog.className).toContain("max-w-[420px]");
-    expect(dialog.textContent).toContain("OpenMausBot 0.2.0");
+    expect(dialog.textContent).toContain("MausBot 0.2.0");
     expect([...dialog.querySelectorAll("li")].map((item) => item.textContent)).toEqual([
       "Faster start.",
       "Rooms keep actions.",
@@ -98,6 +120,13 @@ describe("the update card", () => {
     expect(document.activeElement).toBe(restart);
     await act(async () => restart.click());
     expect(install).toHaveBeenCalledOnce();
+  });
+
+  it("names the desktop app's version, not the version of a server page it shows", async () => {
+    (window as unknown as { ogb: { app: unknown } }).ogb.app = { version: "9.8.7", ownPage: false };
+    await emit({ status: "downloaded", version: "0.2.0", releaseNotes: NOTES, installMode: "restart" });
+    await act(async () => button()!.click());
+    expect(card()!.textContent).toContain("you have 9.8.7");
   });
 
   it("shows the download's progress and holds the action until it is done", async () => {
@@ -110,6 +139,16 @@ describe("the update card", () => {
     await emit({ status: "downloaded", version: "0.2.0", percent: 100 });
     expect(card()!.textContent).toContain("Restart to update");
     expect(card()!.querySelector('[role="progressbar"]')).toBeNull();
+  });
+
+  it("says the update installs by itself the next time the person is away, and still offers Restart", async () => {
+    await emit({ status: "downloaded", version: "0.2.0", installMode: "restart", installsByItself: true });
+    await act(async () => button()!.click());
+    expect(card()!.textContent).toContain("Restart now, or leave it: MausBot installs it by itself the next time you're away and nothing is running.");
+    expect(card()!.textContent).toContain("Restart to update");
+    await emit({ status: "downloaded", version: "0.2.0", installMode: "restart", installsByItself: false });
+    expect(card()!.textContent).toContain("MausBot closes and reopens in a moment.");
+    expect(card()!.textContent).not.toContain("by itself");
   });
 
   it("offers Install where a terminal finishes the update", async () => {

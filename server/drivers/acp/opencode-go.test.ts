@@ -2,10 +2,11 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, isAbsolute, join, relative } from "node:path";
+import { delimiter, dirname, isAbsolute, join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { removeTempDir } from "../../testing/cleanup.ts";
+import { runtimeNoticeTool } from "../../chat-notices.ts";
 import { recordEvents, type EventRecorder } from "../../testing/events.ts";
 import {
   canRunOpenCode,
@@ -15,17 +16,26 @@ import {
   createOpenCodeDriver,
   describeOpenCodeAccountError,
   discoverOpenCodeModels,
+  openCodeFreeFallback,
+  openCodeLimitFacts,
   openCodeOwnedDirectories,
+  openCodePromptUnreachedModel,
+  OpenCodeDriver,
   openCodeProviderKeysAllowed,
   openMausOwnsWorkingFolder,
   parseOpenCodeModelsOutput,
   preferredOpenCodeModel,
   resetOpenCodeModelCache,
   setOpenCodeProviderKeyPolicy,
+  surveyOpenCodeEfforts,
 } from "./opencode-go.ts";
 import { ATTACHMENTS_DIR } from "../../attachments.ts";
+import { enginesBinDir, serverInstallFor } from "../../engine-install.ts";
+import { registerFallbackPathDir, registerPathDir, resetPathCacheForTests } from "../../env-path.ts";
+import { standaloneAssetFor, standaloneEngineDir } from "../../engine-standalone.ts";
 import { cloudHomeConfigured } from "../../cloud-home.ts";
-import { OPENCODE_PROVIDER_ENV } from "../../config.ts";
+import { DATA_DIR, OPENCODE_PROVIDER_ENV } from "../../config.ts";
+import * as quietStatus from "./quiet-status.ts";
 import { hostedWorkspaceConfigured } from "../../enterprise.ts";
 import { TASK_WORKSPACES_DIR, workspaceDir } from "../../workspace.ts";
 import type { ModelCatalog, ProviderInstance, SendTurnInput } from "../../contracts.ts";
@@ -38,6 +48,16 @@ const catalog = (...ids: string[]): ModelCatalog => ({
 });
 
 describe("OpenCode catalog", () => {
+  // `opencode models opencode-go --verbose` from opencode 1.18.27, trimmed to four of its entries.
+  it("lists MiniMax M3.1 Flash from OpenCode Go's real model list, with its window and effort levels", () => {
+    const verbose = readFileSync(join(dirname(fileURLToPath(import.meta.url)), "..", "..", "testing", "fixtures", "opencode-1.18.27-models-verbose-go.txt"), "utf8");
+    const parsed = parseOpenCodeModelsOutput(verbose);
+    expect(parsed?.options.map((option) => option.id)).toEqual(["opencode-go/glm-5.3", "opencode-go/minimax-m3", "opencode-go/minimax-m3.1-flash", "opencode-go/qwen3.8-flash"]);
+    expect(parsed?.options[2]).toEqual({
+      id: "opencode-go/minimax-m3.1-flash", label: "Go · MiniMax M3.1 Flash", contextWindow: 1_000_000,
+      variants: ["low", "medium", "high", "xhigh", "max"].map((id) => ({ id, label: expect.any(String) })),
+    });
+  });
   it("keeps advertised opaque variants without inventing default or mapping minimal", () => {
     const parsed = parseOpenCodeModelsOutput([
       "opencode/reasoner",
@@ -278,6 +298,130 @@ describe("OpenCode catalog", () => {
     }
   });
 
+  describe("work OpenCode goes on with after its turn", () => {
+    // OpenCode 2.3+ moves a shell command still running at its timeout to the background, and its finish wakes a turn
+    // that no session/prompt asked for. Only deleting the session ends its background jobs.
+    const scratches: string[] = [];
+    afterEach(async () => { for (const dir of scratches.splice(0)) await removeTempDir(dir); });
+    const start = async (id: string, extra: Record<string, string> = {}) => {
+      const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-background-"));
+      scratches.push(scratch);
+      mkdirSync(join(scratch, "opencode"), { recursive: true });
+      writeFileSync(join(scratch, "opencode", "auth.json"), JSON.stringify({ opencode: { type: "api", key: "zen-secret" } }));
+      const files = { woken: join(scratch, "woken"), rpc: join(scratch, "rpc.jsonl"), dump: join(scratch, "dump.json") };
+      const instance = await createOpenCodeDriver(async () => catalog("opencode/big-pickle")).create({
+        instanceId: id,
+        displayName: "OpenCode",
+        environment: { XDG_DATA_HOME: scratch, OPENCODE_API_KEY: "", FAKE_ACP_MODELS: "opencode/big-pickle", FAKE_ACP_MODE: "background-wake",
+          FAKE_ACP_WOKEN_FILE: files.woken, FAKE_ACP_RPC_APPEND_FILE: files.rpc, FAKE_ACP_DUMP: files.dump, FAKE_ACP_STEP_MS: "100", ...extra },
+        enabled: true,
+        config: { cli: FAKE_CLI, fullAuto: true },
+      });
+      const calls = () => existsSync(files.rpc)
+        ? readFileSync(files.rpc, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { pid: number; method: string; sessionId?: string }) : [];
+      const steps = () => existsSync(files.woken) ? readFileSync(files.woken, "utf8").trim().split("\n").length : 0;
+      const ask = async (threadId: string, text: string) => {
+        const { turnId } = await instance.adapter.sendTurn({ threadId, text, model: "opencode/big-pickle" });
+        return recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId);
+      };
+      const recorder = recordEvents(instance.adapter);
+      return { instance, recorder, files, calls, steps, ask };
+    };
+    const until = async (check: () => boolean) => {
+      for (let i = 0; i < 400 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 25));
+      expect(check()).toBe(true);
+    };
+    const pause = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+    const promptedSession = (calls: () => Array<{ method: string; sessionId?: string }>) =>
+      calls().filter((call) => call.method === "session/prompt").at(-1)?.sessionId;
+
+    it("ends a turn its background command wakes between ours, keeps the history in a fork, and drops its output", async () => {
+      const { instance, recorder, calls, steps, ask } = await start("opencode-background-wake");
+      const threadId = "t-opencode-background-wake";
+      try {
+        expect(await ask(threadId, "build it")).toMatchObject({ ok: true });
+        expect(JSON.stringify(recorder.events)).toContain("build started");
+        const session = promptedSession(calls)!;
+        await until(() => calls().some((call) => call.method === "session/close" && call.sessionId === `${session}-fork`));
+        const methods = calls().map((call) => `${call.method} ${call.sessionId ?? ""}`.trim());
+        expect(methods.slice(methods.indexOf(`session/fork ${session}`))).toEqual(expect.arrayContaining([
+          `session/delete ${session}`, `session/close ${session}-fork`]));
+        // The woken turn stops once its session is deleted, and nothing of it reached the chat.
+        const woken = steps();
+        expect(woken).toBeGreaterThan(0);
+        await pause(400);
+        expect(steps()).toBe(woken);
+        expect(JSON.stringify(recorder.events)).not.toContain("WOKEN");
+        expect(recorder.events.filter((event) => event.type === "turn.completed")).toHaveLength(1);
+
+        const second = await ask(threadId, "and now?");
+        expect(second).toMatchObject({ ok: true });
+        expect(JSON.stringify(recorder.events.filter((event) => "turnId" in event && event.turnId === second.turnId))).toContain("second answer");
+        // The thread goes on in the fork, loaded again with the bot's own MCP servers.
+        expect(calls().filter((call) => call.method === "session/load").at(-1)?.sessionId).toBe(`${session}-fork`);
+        expect(promptedSession(calls)).toBe(`${session}-fork`);
+        expect(recorder.events).toEqual(expect.arrayContaining([expect.objectContaining({ type: "session.started", turnId: second.turnId, sessionId: `${session}-fork` })]));
+        expect(JSON.stringify(recorder.events)).not.toContain("WOKEN");
+      } finally {
+        recorder.stop();
+        await instance.dispose();
+      }
+    });
+
+    it("ends the session's background work when the person stops the turn, before it can wake a turn", async () => {
+      // The job wakes its turn 1.5 s after it starts, unless its session is deleted first.
+      const { instance, recorder, calls, steps, ask } = await start("opencode-background-stop", { FAKE_ACP_WAKE_MS: "1500" });
+      const threadId = "t-opencode-background-stop";
+      try {
+        const { turnId } = await instance.adapter.sendTurn({ threadId, text: "build it STOP_ME", model: "opencode/big-pickle" });
+        await until(() => JSON.stringify(recorder.events).includes("build started"));
+        const startedAt = Date.now();
+        await instance.adapter.interruptTurn(threadId);
+        expect(await recorder.until((event) => event.type === "turn.completed" && event.turnId === turnId)).toMatchObject({ stopReason: "cancelled" });
+        const session = promptedSession(calls)!;
+        await until(() => calls().some((call) => call.method === "session/delete" && call.sessionId === session));
+        expect(calls().some((call) => call.method === "session/fork" && call.sessionId === session)).toBe(true);
+        await pause(Math.max(0, 1_800 - (Date.now() - startedAt)));
+        expect(steps()).toBe(0);
+        // The next message goes on in the fork.
+        expect(await ask(threadId, "go on")).toMatchObject({ ok: true });
+        expect(promptedSession(calls)).toBe(`${session}-fork`);
+        expect(JSON.stringify(recorder.events)).not.toContain("WOKEN");
+      } finally {
+        recorder.stop();
+        await instance.dispose();
+      }
+    });
+
+    it("leaves an OpenCode that cannot fork and delete sessions as it is", async () => {
+      const { instance, recorder, calls, steps, ask } = await start("opencode-background-no-fork", { FAKE_ACP_NO_FORK: "1" });
+      const threadId = "t-opencode-background-no-fork";
+      try {
+        expect(await ask(threadId, "build it")).toMatchObject({ ok: true });
+        const session = promptedSession(calls)!;
+        await until(() => steps() > 0);
+        expect(await ask(threadId, "and now?")).toMatchObject({ ok: true });
+        expect(promptedSession(calls)).toBe(session);
+        expect(calls().filter((call) => ["session/fork", "session/delete", "session/close"].includes(call.method))).toEqual([]);
+      } finally {
+        recorder.stop();
+        await instance.dispose();
+      }
+    });
+
+    it("starts OpenCode without the person's own CLAUDE.md instructions", async () => {
+      const { instance, recorder, files, ask } = await start("opencode-no-claude-md");
+      try {
+        expect(await ask("t-opencode-no-claude-md", "hello")).toMatchObject({ ok: true });
+        const env = (JSON.parse(readFileSync(files.dump, "utf8")) as { env: Record<string, string> }).env;
+        expect(env.OPENCODE_DISABLE_CLAUDE_CODE_PROMPT).toBe("1");
+      } finally {
+        recorder.stop();
+        await instance.dispose();
+      }
+    });
+  });
+
   it("classifies ACP's standard authentication error", () => {
     expect(classifyOpenCodeError({ code: -32000 })).toBe("invalid_credentials");
   });
@@ -294,6 +438,8 @@ describe("OpenCode catalog", () => {
     ["Internal error: Insufficient account funds.", "insufficient_funds"],
     ["Internal error: An active OpenCode Go subscription is required", "inactive_subscription"],
     ["Internal error: Monthly usage limit reached for this key", "quota_or_region_restriction"],
+    ["Internal error: FreeUsageLimitError: free models are limited today", "quota_or_region_restriction"],
+    ["Internal error: GoUsageLimitError: the Go allowance is used up", "quota_or_region_restriction"],
   ] as const)("classifies the real APIError %s", (message, expected) => {
     expect(classifyOpenCodeError(apiError(message))).toBe(expected);
   });
@@ -304,6 +450,80 @@ describe("OpenCode catalog", () => {
     "Internal error: 429 Too Many Requests: rate limit has been exceeded, retry in 20s",
   ])("leaves a transient rate limit unclassified: %s", (message) => {
     expect(classifyOpenCodeError(apiError(message))).toBeUndefined();
+  });
+
+  it.each([
+    // opencode 1.19.4, then 1.18.27, with the model server's port closed
+    "Internal error: Cannot connect to API: ECONNREFUSED: Unable to connect. Is the computer able to access the url?",
+    "Internal error: Cannot connect to API: Unable to connect. Is the computer able to access the url?",
+    "Internal error: ConnectionRefused: Unable to connect. Is the computer able to access the url?",
+  ])("knows a prompt that never reached its model: %s", (message) => {
+    expect(openCodePromptUnreachedModel(apiError(message))).toBe(true);
+  });
+
+  // OpenCode 2.2.5's ACP answer for a model declared under a provider it has no SDK package for.
+  it("knows a model OpenCode has no route to never got the prompt", () => {
+    expect(openCodePromptUnreachedModel(Object.assign(
+      new Error("Internal error: Unsupported package for chutes/deepseek-ai/DeepSeek-V4.1-Flash-1017: unknown (session/prompt, service: session, provider.no-route)"),
+      { code: -32603, data: { service: "session", errorName: "provider.no-route" } },
+    ))).toBe(true);
+    expect(classifyOpenCodeError({ code: -32603, data: { service: "session", errorName: "provider.no-route" } })).toBeUndefined();
+  });
+
+  it.each([
+    apiError("Internal error: Invalid API key."),
+    apiError("Internal error: socket hang up"),
+    // Only OpenCode's refusal wording is proven; other connect failures stay ordinary errors
+    apiError("Internal error: Cannot connect to API: Connect Timeout Error"),
+    Object.assign(new Error("Cannot connect to API: ECONNREFUSED"), { code: -32602 }),
+    new Error("ECONNREFUSED"),
+  ])("does not take another prompt error as unreached: %s", (error) => {
+    expect(openCodePromptUnreachedModel(error)).toBe(false);
+  });
+
+  // A Go subscriber can still run out of Zen's free models: the paid Go and Zen models on the same login keep working,
+  // so that refusal holds only the free model, never the whole OpenCode account.
+  it.each([
+    ['AI_APICallError: Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go', "model"],
+    ["Internal error: FreeUsageLimitError: free models are limited today", "model"],
+    ['OpenCode reached a usage limit (“Free usage limit reached. Free models work in OpenCode”) and is waiting it out without replying, so this turn was stopped.', "model"],
+    ["Internal error: Monthly usage limit reached for this key", "engine"],
+    ["Internal error: GoUsageLimitError: the Go allowance is used up", "engine"],
+    ["GoUsageLimitError: usage limit reached", "engine"],
+  ] as const)("reads how far the usage limit reaches: %s", (message, expected) => {
+    expect(openCodeLimitFacts(message).limit).toBe(expected);
+  });
+
+  it("holds a provider's free models together, never a paid Go model", () => {
+    // The catalog reports Zen's free models at cost 0; a Go model is paid.
+    const catalog = parseOpenCodeModelsOutput([
+      "opencode/big-pickle", JSON.stringify({ cost: { input: 0, output: 0 } }),
+      "opencode-go/deepseek-v4.1-flash", JSON.stringify({ cost: { input: 1, output: 2 } }),
+    ].join("\n"));
+    const said = 'AI_APICallError: Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go';
+    const facts = openCodeLimitFacts(said, "opencode/deepseek-v4.1-flash-free", catalog!);
+    expect(facts.limit).toBe("model");
+    expect(facts.limitModels).toEqual(expect.arrayContaining(["opencode/deepseek-v4.1-flash-free", "opencode/big-pickle"]));
+    expect(facts.limitModels).not.toContain("opencode-go/deepseek-v4.1-flash");
+    expect(openCodeLimitFacts(said), "a refusal that names no model holds just the model scope").toEqual({ limit: "model" });
+  });
+
+  // OpenCode Go's weekly allowance is the Go subscription's alone: Zen's free models on the same login keep working, so a
+  // free model there is still a backup when a Go model runs out.
+  it("holds only the Go models when a Go model meets the Go allowance, never Zen's free models", () => {
+    const catalog = parseOpenCodeModelsOutput([
+      "opencode/deepseek-v4.1-flash-free", JSON.stringify({ cost: { input: 0, output: 0 } }),
+      "opencode-go/glm-5.3", JSON.stringify({ cost: { input: 1, output: 2 } }),
+      "opencode-go/minimax-m3", JSON.stringify({ cost: { input: 1, output: 2 } }),
+    ].join("\n"))!;
+    for (const said of ["OpenCode Go weekly usage limit reached", "Internal error: GoUsageLimitError: the Go allowance is used up"]) {
+      const facts = openCodeLimitFacts(said, "opencode-go/minimax-m3", catalog);
+      expect(facts.limit, said).toBe("model");
+      expect(facts.limitModels).toEqual(expect.arrayContaining(["opencode-go/minimax-m3", "opencode-go/glm-5.3"]));
+      expect(facts.limitModels).not.toContain("opencode/deepseek-v4.1-flash-free");
+    }
+    expect(openCodeLimitFacts("OpenCode Go weekly usage limit reached", "opencode/big-pickle", catalog), "a limit met by another model still holds the account")
+      .toEqual({ limit: "engine" });
   });
 
   it("classifies OpenCode 2's authentication refusal and leaves real internal errors alone", () => {
@@ -325,7 +545,7 @@ describe("OpenCode catalog", () => {
         expect(text.length, `${code} ${model}`).toBeLessThanOrEqual(160);
         if (model?.startsWith("openrouter/")) {
           expect(text).toContain("OpenRouter");
-          expect(text).not.toMatch(/Zen|OpenCode Go|Settings → API keys/u);
+          expect(text).not.toMatch(/Zen|OpenCode Go|Settings → AI/u);
         }
         if (model?.startsWith("anthropic/")) expect(text).toContain("Anthropic");
       }
@@ -333,7 +553,7 @@ describe("OpenCode catalog", () => {
   );
 
   it("points a rejected Zen key at the key OpenMaus saves", () => {
-    expect(describeOpenCodeAccountError("invalid_credentials", "opencode/big-pickle")).toContain("Settings → API keys");
+    expect(describeOpenCodeAccountError("invalid_credentials", "opencode/big-pickle")).toContain("Settings → AI → Providers");
     for (const model of [undefined, "opencode/big-pickle", "opencode-go/minimax-m3"]) {
       expect(describeOpenCodeAccountError("invalid_credentials", model)).not.toContain("opencode auth login");
     }
@@ -345,7 +565,7 @@ describe("OpenCode catalog", () => {
     for (const model of ["openrouter/openai/gpt-4o-mini", "venice/llama-3.3-70b", `${"very-long-provider-name".repeat(4)}/model`]) {
       const cloud = describeOpenCodeAccountError("invalid_credentials", model, { cloudHome: true });
       expect(cloud).not.toContain("opencode auth login");
-      expect(cloud).toContain("Save it under Keys for other OpenCode providers in Settings → API keys.");
+      expect(cloud).toContain("Save it under Keys for other OpenCode providers in Settings → AI.");
       expect(cloud.length, model).toBeLessThanOrEqual(160);
       expect(describeOpenCodeAccountError("invalid_credentials", model, { cloudHome: false })).toContain("opencode auth login");
     }
@@ -516,8 +736,8 @@ describe("OpenCode catalog discovery from the ACP session", () => {
     const offered = ["opencode/claude-sonnet-5-5", "opencode/big-pickle", "opencode/longcat-2.5-preview-free"];
     expect(preferredOpenCodeModel(offered, "opencode/longcat-2.5-preview-free")).toBe("opencode/longcat-2.5-preview-free");
     expect(preferredOpenCodeModel(offered, "opencode/claude-sonnet-5-5")).toBe("opencode/longcat-2.5-preview-free");
-    parseOpenCodeModelsOutput(["opencode/big-pickle", JSON.stringify({ cost: { input: 0, output: 0 } })].join("\n"));
-    expect(preferredOpenCodeModel(offered, "opencode/big-pickle")).toBe("opencode/big-pickle");
+    const catalog = parseOpenCodeModelsOutput(["opencode/big-pickle", JSON.stringify({ cost: { input: 0, output: 0 } })].join("\n"));
+    expect(preferredOpenCodeModel(offered, "opencode/big-pickle", catalog!)).toBe("opencode/big-pickle");
     expect(preferredOpenCodeModel(["anthropic/claude-sonnet-5", "openai/gpt-6"], "openai/gpt-6")).toBe("openai/gpt-6");
     expect(preferredOpenCodeModel([], null)).toBe("");
   });
@@ -563,10 +783,147 @@ describe("OpenCode catalog discovery from the ACP session", () => {
     }
   });
 
+  const efforts = (ids: string[]) => ({ currentValue: "default", options: ids.map((value) => ({ value, name: value === "xhigh" ? "Xhigh" : value })) });
+
+  it("offers each model's efforts on OpenCode 2, where only its ACP session names them", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-discover-v2-efforts-"));
+    try {
+      const found = await discoverOpenCodeModels({
+        ...process.env, HOME: scratch, FAKE_ACP_MODELS_LIST: "v2",
+        FAKE_ACP_MODELS: "opencode/big-pickle,github-copilot/gpt-5.3-codex,github-copilot/claude-sonnet-4.6,github-copilot/gemini-3.8-flash",
+        FAKE_ACP_VARIANTS: JSON.stringify({
+          "github-copilot/gpt-5.3-codex": efforts(["low", "medium", "high", "xhigh", "default"]),
+          "github-copilot/claude-sonnet-4.6": efforts(["low", "medium", "high", "default"]),
+        }),
+      }, FAKE_CLI);
+      const byId = new Map(found.options.map((option) => [option.id, option]));
+      expect(byId.get("github-copilot/gpt-5.3-codex")?.variants).toEqual([
+        { id: "low", label: "low" }, { id: "medium", label: "medium" }, { id: "high", label: "high" },
+        { id: "xhigh", label: "Xhigh" }, { id: "default", label: "default" },
+      ]);
+      expect(byId.get("github-copilot/claude-sonnet-4.6")?.variants?.map((variant) => variant.id)).toEqual(["low", "medium", "high", "default"]);
+      expect(byId.get("github-copilot/gemini-3.8-flash")).not.toHaveProperty("variants");
+      expect(byId.get("opencode/big-pickle")).not.toHaveProperty("variants");
+    } finally {
+      await removeTempDir(scratch);
+    }
+  });
+
+  it("keeps the model list when OpenCode stops while its efforts are being read", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-discover-v2-exit-"));
+    try {
+      const found = await discoverOpenCodeModels({
+        ...process.env, HOME: scratch, FAKE_ACP_MODELS_LIST: "v2",
+        FAKE_ACP_MODELS: "opencode/big-pickle,github-copilot/gpt-5.3-codex,github-copilot/gemini-3.8-flash",
+        FAKE_ACP_EXIT_ON_MODEL: "github-copilot/gpt-5.3-codex",
+      }, FAKE_CLI);
+      expect(found.options.map((option) => option.id)).toEqual([
+        "opencode/big-pickle", "github-copilot/gpt-5.3-codex", "github-copilot/gemini-3.8-flash",
+      ]);
+    } finally {
+      await removeTempDir(scratch);
+    }
+  });
+
+  it("keeps OpenCode 1's metadata beside the efforts its session names", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-discover-v1-efforts-"));
+    try {
+      const found = await discoverOpenCodeModels({
+        ...process.env, HOME: scratch, FAKE_ACP_MODELS: "opencode/big-pickle,github-copilot/gpt-5.3-codex",
+        FAKE_ACP_VARIANTS: JSON.stringify({ "github-copilot/gpt-5.3-codex": efforts(["low", "high"]) }),
+      }, FAKE_CLI);
+      expect(found.options[1]).toEqual({
+        id: "github-copilot/gpt-5.3-codex", label: expect.any(String), contextWindow: 200_000,
+        variants: [{ id: "low", label: "low" }, { id: "high", label: "high" }],
+      });
+    } finally {
+      await removeTempDir(scratch);
+    }
+  });
+
   it("offers nothing rather than an invented id when OpenCode cannot answer", async () => {
     await expect(discoverOpenCodeModels({ ...process.env }, join(tmpdir(), "no-such-opencode-binary"))).resolves.toEqual({
       default: "", options: [],
     });
+  });
+});
+
+describe("OpenCode effort survey", () => {
+  const session = (ids: string[]) => ({ sessionId: "ses_probe", configOptions: [
+    { id: "model", type: "select", currentValue: ids[0], options: ids.map((value) => ({ value, name: value })) },
+  ] });
+  const selected = (model: string, efforts?: string[]) => ({ configOptions: [
+    { id: "model", type: "select", currentValue: model, options: [] },
+    ...(efforts ? [{ id: "effort", category: "thought_level", type: "select", currentValue: "default",
+      options: efforts.map((value) => ({ value, name: value.toUpperCase() })) }] : []),
+  ] });
+
+  it("selects one model at a time and records the efforts the session then names", async () => {
+    let inFlight = 0;
+    let most = 0;
+    const requests: unknown[] = [];
+    const found = await surveyOpenCodeEfforts(async (method, params) => {
+      requests.push({ method, params });
+      most = Math.max(most, ++inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      inFlight--;
+      const value = (params as { value: string }).value;
+      return selected(value, value === "github-copilot/gpt-5.3-codex" ? ["low", "high", "default"] : undefined);
+    }, session(["opencode/big-pickle", "github-copilot/gpt-5.3-codex"]));
+    expect(most).toBe(1);
+    expect(requests).toEqual([
+      { method: "session/set_config_option", params: { sessionId: "ses_probe", configId: "model", value: "opencode/big-pickle" } },
+      { method: "session/set_config_option", params: { sessionId: "ses_probe", configId: "model", value: "github-copilot/gpt-5.3-codex" } },
+    ]);
+    expect(found).toEqual(new Map([
+      ["opencode/big-pickle", []],
+      ["github-copilot/gpt-5.3-codex", [{ id: "low", label: "LOW" }, { id: "high", label: "HIGH" }, { id: "default", label: "DEFAULT" }]],
+    ]));
+  });
+
+  it("leaves out a model the answer is not about, or that OpenCode refused", async () => {
+    const found = await surveyOpenCodeEfforts(async (_method, params) => {
+      const value = (params as { value: string }).value;
+      if (value === "openrouter/gone") throw new Error("Invalid params: model not found");
+      return selected(value === "github-copilot/claude-sonnet-4.6" ? "github-copilot/gpt-5.3-codex" : value, ["low"]);
+    }, session(["openrouter/gone", "github-copilot/claude-sonnet-4.6", "github-copilot/gpt-5.3-codex"]));
+    expect([...found.keys()]).toEqual(["github-copilot/gpt-5.3-codex"]);
+  });
+
+  it("stops at its time budget with what it has, even when OpenCode never answers", async () => {
+    const asked: string[] = [];
+    const started = Date.now();
+    const found = await surveyOpenCodeEfforts(async (_method, params) => {
+      const value = (params as { value: string }).value;
+      asked.push(value);
+      if (value === "opencode/stuck") return new Promise(() => {});
+      return selected(value, ["high"]);
+    }, session(["opencode/quick", "opencode/stuck", "opencode/never-asked"]), 200);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(asked).toEqual(["opencode/quick", "opencode/stuck"]);
+    expect([...found.keys()]).toEqual(["opencode/quick"]);
+  });
+
+  it("asks nothing more once the budget is spent, however fast OpenCode answers", async () => {
+    const blockFor = (ms: number) => {
+      const until = Date.now() + ms;
+      while (Date.now() < until);
+    };
+    const asked: string[] = [];
+    const found = await surveyOpenCodeEfforts((_method, params) => {
+      const value = (params as { value: string }).value;
+      asked.push(value);
+      if (value === "opencode/slow") blockFor(120);
+      return Promise.resolve(selected(value, ["high"]));
+    }, session(["opencode/slow", "opencode/next"]), 100);
+    expect(asked).toEqual(["opencode/slow"]);
+    expect([...found.keys()]).toEqual(["opencode/slow"]);
+  });
+
+  it("asks nothing without a session id", async () => {
+    const request = vi.fn();
+    expect(await surveyOpenCodeEfforts(request, { configOptions: session(["opencode/a"]).configOptions })).toEqual(new Map());
+    expect(request).not.toHaveBeenCalled();
   });
 });
 
@@ -624,10 +981,107 @@ describe("OpenCode turns without a sign-in gate", () => {
       const { done, events } = await f.run("t-bad-key", "opencode/big-pickle");
       expect(done, `attempt ${attempt}`).toMatchObject({ ok: false, stopReason: "auth_required" });
       const error = events.find((event) => event.type === "runtime.error");
-      expect(error).toMatchObject({ setup: true, message: expect.stringContaining("Settings → API keys") });
+      expect(error).toMatchObject({ setup: true, message: expect.stringContaining("Settings → AI → Providers") });
       expect(error).not.toMatchObject({ message: expect.stringContaining("Internal error") });
     }
     expect(f.launches()).toBe(1);
+  });
+
+  it("names a rate limit OpenCode logged for this turn's main request while the turn stays quiet", async () => {
+    vi.spyOn(quietStatus, "sampleProcessTree").mockResolvedValue({ cpuMs: 0, connections: 1 });
+    vi.stubEnv("OMB_ACP_QUIET_NOTICE_MS", "300");
+    vi.stubEnv("OMB_ACP_QUIET_TICK_MS", "50");
+    // The row format of a real opencode log, with a synthetic run and model.
+    const row = (session: string, small: boolean, error: string) =>
+      `timestamp=2026-10-01T00:00:03.000Z level=ERROR run=fixture_run message="stream error" providerID=opencode modelID=mimo-v2.6-flash-free session.id=${session} small=${small} agent=build mode=primary error.error="${error}"`;
+    const f = await open("opencode-rate-limit", () => ({
+      FAKE_ACP_MODE: "quiet-then-answer", FAKE_ACP_QUIET_MS: "1200", FAKE_ACP_MODELS: "opencode/big-pickle",
+      FAKE_ACP_OPENCODE_LOG: JSON.stringify([
+        row("ses_someone_else", false, "AI_APICallError: Insufficient balance."),
+        row("{session}", true, "AI_APICallError: The title model is busy."),
+        row("{session}", false, "AI_APICallError: Rate limit exceeded. Please try again later."),
+      ]),
+    }));
+    try {
+      const { done, events } = await f.run("t-rate-limit", "opencode/big-pickle");
+      expect(done).toMatchObject({ ok: true });
+      const notices = events.flatMap((event) => event.type === "runtime.notice" ? [event.message] : []);
+      expect(notices).toContainEqual(expect.stringContaining("Rate limit exceeded. Please try again later."));
+      expect(notices.join("\n")).not.toMatch(/Insufficient balance|title model/);
+    } finally {
+      vi.unstubAllEnvs();
+      vi.restoreAllMocks();
+    }
+  });
+
+  // OpenCode 1.18.27 against a provider at its limit (a 429 naming GoUsageLimitError, retry-after 5 h): one "stream
+  // error" row in its log, then nothing over ACP while it sleeps the whole retry-after, uncapped, five times over.
+  it("ends a turn that waits out a usage limit as that limit, so another AI can carry on", async () => {
+    vi.spyOn(quietStatus, "sampleProcessTree").mockResolvedValue({ cpuMs: 0, connections: 0 });
+    vi.stubEnv("OMB_ACP_QUIET_NOTICE_MS", "300");
+    vi.stubEnv("OMB_ACP_QUIET_TICK_MS", "50");
+    vi.stubEnv("OMB_ACP_LIMIT_QUIET_MS", "400");
+    const row = `timestamp=2026-10-28T22:11:15.919Z level=ERROR run=fixture_run message="stream error" providerID=opencode-go modelID=kimi-k3 session.id={session} small=false agent=build mode=primary error.error="AI_APICallError: Usage limit reached"`;
+    const f = await open("opencode-go-limit", () => ({
+      FAKE_ACP_MODE: "quiet-then-answer", FAKE_ACP_QUIET_MS: "30000", FAKE_ACP_MODELS: "opencode/big-pickle",
+      FAKE_ACP_OPENCODE_LOG: JSON.stringify([row]),
+    }));
+    try {
+      const { done, events } = await f.run("t-go-limit", "opencode/big-pickle");
+      expect(done).toMatchObject({ ok: false, stopReason: "quota" });
+      expect(events.find((event) => event.type === "runtime.error")).toMatchObject({ limit: "engine", message: expect.stringMatching(/usage limit/i) });
+    } finally {
+      vi.unstubAllEnvs();
+      vi.restoreAllMocks();
+    }
+  });
+
+  // Recorded from opencode 1.18.27 with a `-free` model on an account that still has Go allowance: the refusal is Zen's
+  // free-tier limit, so it holds that model alone and the account stays usable on a Go model.
+  it("holds only the free model a Go account's free allowance limited, not the account", async () => {
+    vi.spyOn(quietStatus, "sampleProcessTree").mockResolvedValue({ cpuMs: 0, connections: 0 });
+    vi.stubEnv("OMB_ACP_QUIET_NOTICE_MS", "300");
+    vi.stubEnv("OMB_ACP_QUIET_TICK_MS", "50");
+    vi.stubEnv("OMB_ACP_LIMIT_QUIET_MS", "400");
+    const row = `timestamp=2026-11-07T10:13:43.366Z level=ERROR run=fixture_run message="stream error" providerID=opencode modelID=deepseek-v4.1-flash-free session.id={session} small=false agent=build mode=primary error.error="AI_APICallError: Free usage limit reached. Free models work in OpenCode (https://opencode.ai); subscribe to OpenCode Go to keep going: https://opencode.ai/go"`;
+    const f = await open("opencode-go-free-limit", () => ({
+      FAKE_ACP_MODE: "quiet-then-answer", FAKE_ACP_QUIET_MS: "30000", FAKE_ACP_MODELS: "opencode/deepseek-v4.1-flash-free",
+      FAKE_ACP_OPENCODE_LOG: JSON.stringify([row]),
+    }));
+    try {
+      const { done, events } = await f.run("t-go-free-limit", "opencode/deepseek-v4.1-flash-free");
+      expect(done).toMatchObject({ ok: false, stopReason: "quota" });
+      expect(events.find((event) => event.type === "runtime.error")).toMatchObject({ limit: "model", message: expect.stringMatching(/usage limit/i) });
+    } finally {
+      vi.unstubAllEnvs();
+      vi.restoreAllMocks();
+    }
+  });
+
+  it("marks OpenCode's own usage-limit refusal as the account's limit, so another AI can carry on", async () => {
+    const f = await open("opencode-gave-up", (scratch) => ({ FAKE_ACP_MODELS: "opencode/big-pickle", FAKE_ACP_RPC_FAILURE_FILE: join(scratch, "failure.json") }));
+    writeFileSync(join(f.scratch, "failure.json"), JSON.stringify({
+      code: -32603, message: "Internal error: Monthly usage limit reached for this key", data: { service: "session", errorName: "APIError" },
+    }));
+    const { done, events } = await f.run("t-gave-up", "opencode/big-pickle");
+    expect(done).toMatchObject({ ok: false });
+    expect(events.find((event) => event.type === "runtime.error")).toMatchObject({ limit: "engine" });
+  });
+
+  it("stops an engine with no open request, no CPU use and nothing logged after a few minutes, not the full silence guard", async () => {
+    vi.spyOn(quietStatus, "sampleProcessTree").mockResolvedValue({ cpuMs: 0, connections: 0 });
+    vi.stubEnv("OMB_ACP_QUIET_NOTICE_MS", "200");
+    vi.stubEnv("OMB_ACP_QUIET_TICK_MS", "50");
+    vi.stubEnv("OMB_ACP_NO_SIGNS_STOP_MS", "500");
+    const f = await open("opencode-lifeless", () => ({ FAKE_ACP_MODE: "quiet-then-answer", FAKE_ACP_QUIET_MS: "30000", FAKE_ACP_MODELS: "opencode/big-pickle" }));
+    try {
+      const { done, events } = await f.run("t-lifeless", "opencode/big-pickle");
+      expect(done).toMatchObject({ ok: false });
+      expect(events.find((event) => event.type === "runtime.error")).toMatchObject({ stalled: true, message: expect.stringContaining("no open request to its model and no CPU use") });
+    } finally {
+      vi.unstubAllEnvs();
+      vi.restoreAllMocks();
+    }
   });
 });
 
@@ -703,6 +1157,80 @@ describe("OpenCode after a login added since its process started", () => {
 
 describe("OpenCode catalog probes", () => {
   afterEach(() => resetOpenCodeModelCache());
+
+  const rpcLines = (file: string) => readFileSync(file, "utf8").trim().split("\n")
+    .map((line) => JSON.parse(line) as { method: string; sessionId?: string; cwd?: string });
+
+  it("deletes only sessions a probe opened: its own, and those an earlier probe left behind", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-probe-delete-"));
+    let ledger = "";
+    try {
+      const discover = async (rpc: string) => {
+        resetOpenCodeModelCache();
+        await discoverOpenCodeModels({
+          ...process.env, HOME: scratch, FAKE_ACP_MODELS: "opencode/big-pickle",
+          FAKE_ACP_SESSION_DELETE: "1", FAKE_ACP_RPC_APPEND_FILE: rpc,
+        }, FAKE_CLI);
+        const lines = rpcLines(rpc);
+        ledger = join(lines.find((entry) => entry.method === "session/new")!.cwd!, ".openmaus-probe-sessions.json");
+        return lines.filter((entry) => entry.method === "session/delete").map((entry) => entry.sessionId).sort();
+      };
+      expect(await discover(join(scratch, "first.jsonl"))).toEqual(["fake-acp-session"]);
+      expect(JSON.parse(readFileSync(ledger, "utf8"))).toEqual({});
+
+      const stillOpening = Date.now();
+      writeFileSync(ledger, JSON.stringify({ ses_left_behind: Date.now() - 10 * 60_000, ses_other_probe: stillOpening }));
+      expect(await discover(join(scratch, "second.jsonl"))).toEqual(["fake-acp-session", "ses_left_behind"]);
+      expect(JSON.parse(readFileSync(ledger, "utf8"))).toEqual({ ses_other_probe: stillOpening });
+    } finally {
+      if (ledger) writeFileSync(ledger, "{}");
+      await removeTempDir(scratch);
+    }
+  });
+
+  it("deletes a session whose probe OpenCode died under, once a later probe finds it stale", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-probe-crashed-"));
+    let ledger = "";
+    try {
+      const environment = { ...process.env, HOME: scratch, FAKE_ACP_SESSION_DELETE: "1" };
+      const crashed = join(scratch, "crashed.jsonl");
+      await discoverOpenCodeModels({
+        ...environment, FAKE_ACP_MODELS: "opencode/big-pickle,opencode-go/minimax-m3", FAKE_ACP_SESSION_ID: "ses_crashed",
+        FAKE_ACP_EXIT_ON_MODEL: "opencode-go/minimax-m3", FAKE_ACP_RPC_APPEND_FILE: crashed,
+      }, FAKE_CLI);
+      const lines = rpcLines(crashed);
+      expect(lines.some((entry) => entry.method === "session/delete")).toBe(false);
+      ledger = join(lines.find((entry) => entry.method === "session/new")!.cwd!, ".openmaus-probe-sessions.json");
+      expect(Object.keys(JSON.parse(readFileSync(ledger, "utf8")))).toEqual(["ses_crashed"]);
+
+      writeFileSync(ledger, JSON.stringify({ ses_crashed: Date.now() - 10 * 60_000 }));
+      resetOpenCodeModelCache();
+      const next = join(scratch, "next.jsonl");
+      await discoverOpenCodeModels({
+        ...environment, FAKE_ACP_MODELS: "opencode/big-pickle", FAKE_ACP_SESSION_ID: "ses_next", FAKE_ACP_RPC_APPEND_FILE: next,
+      }, FAKE_CLI);
+      expect(rpcLines(next).filter((entry) => entry.method === "session/delete").map((entry) => entry.sessionId).sort())
+        .toEqual(["ses_crashed", "ses_next"]);
+      expect(JSON.parse(readFileSync(ledger, "utf8"))).toEqual({});
+    } finally {
+      if (ledger) writeFileSync(ledger, "{}");
+      await removeTempDir(scratch);
+    }
+  });
+
+  it("neither deletes nor records sessions when OpenCode cannot delete them", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-probe-no-delete-"));
+    try {
+      const rpc = join(scratch, "rpc.jsonl");
+      await discoverOpenCodeModels({ ...process.env, HOME: scratch, FAKE_ACP_MODELS: "opencode/big-pickle", FAKE_ACP_RPC_APPEND_FILE: rpc }, FAKE_CLI);
+      const lines = rpcLines(rpc);
+      expect(lines.some((entry) => entry.method === "session/delete")).toBe(false);
+      const ledger = join(lines.find((entry) => entry.method === "session/new")!.cwd!, ".openmaus-probe-sessions.json");
+      expect(existsSync(ledger) ? JSON.parse(readFileSync(ledger, "utf8")) : {}).toEqual({});
+    } finally {
+      await removeTempDir(scratch);
+    }
+  });
 
   it("runs in a folder that is its own git project", async () => {
     try {
@@ -972,10 +1500,23 @@ describe("OpenCode session variants", () => {
     const f = await fixture({ [model]: variantConfig(["low", "high"]) });
     expect((await f.run({ variant: "high" })).done).toMatchObject({ ok: true });
     const before = f.calls().length;
-    const { done, events } = await f.run({ threadId: "resumed-thread", resumeCursor: "native-resumed", variant: "high" });
+    const folder = join(dirname(f.dump), "resumed-thread");
+    mkdirSync(folder);
+    const { done, events } = await f.run({ threadId: "resumed-thread", cwd: folder, resumeCursor: "native-resumed", variant: "high" });
     expect(done).toMatchObject({ ok: true, threadId: "resumed-thread" });
     expect(f.calls().slice(before).map((entry) => entry.params)).toEqual([{ sessionId: "native-resumed", configId: "effort", value: "high" }]);
     expect(events.filter((event) => event.type === "session.model-variants").every((event) => event.threadId === "resumed-thread")).toBe(true);
+  });
+
+  it("sends a new effort to the same conversation's session on its next turn", async () => {
+    const f = await fixture({ [model]: variantConfig(["low", "high", "default"], "default") });
+    for (const variant of ["high", "low", "default"]) {
+      expect((await f.run({ variant })).done).toMatchObject({ ok: true });
+      expect(JSON.parse(readFileSync(`${f.dump}.selection.json`, "utf8"))).toMatchObject({ sessionId: "fake-acp-session", variant });
+    }
+    expect(f.calls().map((entry) => entry.params)).toEqual(["high", "low", "default"].map((value) => (
+      { sessionId: "fake-acp-session", configId: "effort", value }
+    )));
   });
 
   it.each(["FAKE_ACP_VARIANT_STICKS", "FAKE_ACP_EMPTY_VARIANT_ACK"])("requires confirmation when %s", async (flag) => {
@@ -1049,7 +1590,9 @@ describe("OpenCode session variants", () => {
   it("is stored as a status row the person always sees", () => {
     const source = readFileSync(new URL("../../index.ts", import.meta.url), "utf8");
     const handler = source.slice(source.indexOf('case "runtime.notice":'), source.indexOf('case "runtime.error":'));
-    expect(handler).toContain("name: `notice: ${event.message.slice(0, 240)}`");
+    expect(handler).toContain('role: "bot", kind: "activity", tool: { ...runtimeNoticeTool(event), name: `notice: ${event.message.slice(0, 400)}` }');
+    const message = "Retired model ".repeat(30);
+    expect(runtimeNoticeTool({ message })).toEqual({ name: `notice: ${message.slice(0, 240)}`, ok: true });
   });
 
   it("still switches to a model the session offers", async () => {
@@ -1094,5 +1637,213 @@ describe("OpenCode model choice without a saved model", () => {
       method: "session/set_config_option",
       params: { sessionId: "fake-acp-session", configId: "model", value: "opencode/longcat-2.5-preview-free" },
     }]);
+  });
+});
+
+describe("OpenCode ready only through its free models", () => {
+  const noKeys = { OPENCODE_API_KEY: "", OPENCODE_AUTH_CONTENT: "", ...Object.fromEntries(OPENCODE_PROVIDER_ENV.map((key) => [key, ""])) };
+  async function snapshotWith(models: ModelCatalog, environment: Record<string, string> = {}, login?: Record<string, unknown>) {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-fallback-"));
+    if (login) {
+      mkdirSync(join(scratch, "data", "opencode"), { recursive: true });
+      writeFileSync(join(scratch, "data", "opencode", "auth.json"), JSON.stringify(login));
+    }
+    resetOpenCodeModelCache();
+    const driver = createOpenCodeDriver(async () => models);
+    const instance = await driver.create({
+      instanceId: "opencode-fallback",
+      displayName: "OpenCode",
+      environment: { HOME: scratch, USERPROFILE: scratch, XDG_DATA_HOME: join(scratch, "data"), ...noKeys, ...environment },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    try {
+      return await instance.snapshot();
+    } finally {
+      await instance.dispose();
+      await removeTempDir(scratch);
+      resetOpenCodeModelCache();
+    }
+  }
+
+  it("is a free fallback with only Zen's models and no login or key", async () => {
+    expect(await snapshotWith(catalog("opencode/big-pickle", "opencode/grok-code"))).toMatchObject({ authenticated: true, freeFallback: true });
+    // A local model the app found is not the person signing OpenCode in to anything.
+    expect(await snapshotWith({ default: "opencode/big-pickle", options: [
+      { id: "opencode/big-pickle", label: "Big Pickle" }, { id: "ollama/qwen3", label: "Qwen 3", custom: true },
+    ] })).toMatchObject({ freeFallback: true });
+  });
+
+  it("is a normal AI with an OpenCode login, an OpenCode key, or a provider key", async () => {
+    const zen = catalog("opencode/big-pickle");
+    for (const snapshot of [
+      await snapshotWith(zen, {}, { opencode: { type: "oauth", access: "acc-token", refresh: "ref-token" } }),
+      await snapshotWith(zen, { OPENCODE_API_KEY: "zen-key" }),
+      await snapshotWith(zen, { ANTHROPIC_API_KEY: "provider-key" }),
+    ]) {
+      expect(snapshot.authenticated).toBe(true);
+      expect(snapshot).not.toHaveProperty("freeFallback");
+    }
+  });
+
+  it("is no fallback with an empty catalog, which is not ready at all; local models alone still are one", () => {
+    expect(openCodeFreeFallback(false, { default: "", options: [] })).toBe(false);
+    expect(openCodeFreeFallback(false, { default: "ollama/qwen3", options: [{ id: "ollama/qwen3", label: "Qwen 3", custom: true }] })).toBe(true);
+    expect(openCodeFreeFallback(true, catalog("opencode/big-pickle"))).toBe(false);
+  });
+
+  it("is a normal AI when OpenCode offers another provider's models", async () => {
+    const snapshot = await snapshotWith(catalog("opencode/big-pickle", "openrouter/vendor/model-v2"));
+    expect(snapshot.authenticated).toBe(true);
+    expect(snapshot).not.toHaveProperty("freeFallback");
+  });
+});
+
+describe("OpenCode one-off calls (connection checks, memory upkeep)", () => {
+  it("file their session under OpenMaus's own OpenCode project, never the global one the person's other folders share", async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-oneshot-"));
+    const requests = join(scratch, "requests.jsonl");
+    const driver = createOpenCodeDriver(async () => catalog("opencode/big-pickle"));
+    const instance = await driver.create({
+      instanceId: "opencode-oneshot",
+      displayName: "OpenCode",
+      environment: { XDG_DATA_HOME: join(scratch, "data"), OPENCODE_API_KEY: "", FAKE_ACP_MODELS: "opencode/big-pickle", FAKE_ACP_RPC_APPEND_FILE: requests },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    try {
+      await instance.generateMemoryText!("This is a connection check. Reply with the single word OK.").catch(() => "");
+      const folders = readFileSync(requests, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as { method: string; cwd: string });
+      const opened = folders.find((request) => request.method === "session/new")!;
+      const project = realpathSync(join(DATA_DIR, "providers", "opencode", "discovery"));
+      expect(relative(project, opened.cwd).startsWith("..")).toBe(false);
+      expect(existsSync(join(project, ".git"))).toBe(true);
+      // The one-off's own folder inside it is gone again.
+      expect(existsSync(opened.cwd)).toBe(false);
+    } finally {
+      await instance.dispose();
+      await removeTempDir(scratch);
+    }
+  });
+});
+
+describe("OpenCode without Node.js", () => {
+  const release = OpenCodeDriver.install?.standalone;
+
+  it.each([
+    ["darwin-arm64", "opencode"], ["darwin-x64", "opencode"], ["linux-x64", "opencode"], ["linux-arm64", "opencode"],
+    ["linux-x64-musl", "opencode"], ["linux-arm64-musl", "opencode"], ["win32-x64", "opencode.exe"], ["win32-arm64", "opencode.exe"],
+  ])("has a pinned %s build on OpenCode's own release, from a host the installer accepts", (platform, executable) => {
+    const asset = standaloneAssetFor(release, platform);
+    expect(asset?.executable).toBe(executable);
+    const url = new URL(asset!.url);
+    expect(url.protocol).toBe("https:");
+    expect(release!.hosts).toContain(url.hostname);
+    expect(url.pathname).toBe(`/anomalyco/opencode/releases/download/v${release!.version}/${url.pathname.split("/").at(-1)}`);
+    expect(asset!.sha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(asset!.executableSha256).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  it("offers Settings' Install button with no npm on this machine", () => {
+    expect(serverInstallFor(OpenCodeDriver.install, false)).toMatchObject({ standalone: { version: release!.version } });
+  });
+
+  it.skipIf(process.platform === "win32").each([
+    ["the app's own copy with OpenCode's self-updater off", true],
+    ["a copy the person installed with its updater left alone", false],
+  ])("runs %s", async (_label, appCopy) => {
+    const scratch = mkdtempSync(join(tmpdir(), "omb-opencode-autoupdate-"));
+    const dump = join(scratch, "env.json");
+    let cli = FAKE_CLI;
+    if (appCopy) {
+      const version = join(standaloneEngineDir("opencode"), release!.version);
+      mkdirSync(version, { recursive: true });
+      cli = join(version, "opencode");
+      writeFileSync(cli, `#!/bin/sh\nexec '${FAKE_CLI}' "$@"\n`, { mode: 0o755 });
+    }
+    const driver = createOpenCodeDriver(async () => catalog("opencode/big-pickle"));
+    const instance = await driver.create({
+      instanceId: `opencode-autoupdate-${appCopy}`, displayName: "OpenCode", enabled: true,
+      config: { cli, fullAuto: false, workspace: scratch },
+      environment: { HOME: scratch, XDG_CONFIG_HOME: scratch, XDG_DATA_HOME: scratch, FAKE_ACP_MODELS: "opencode/big-pickle", FAKE_ACP_DUMP: dump },
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      await instance.adapter.sendTurn({ threadId: "t-autoupdate", botId: "bot-7", text: "hi", model: "opencode/big-pickle", approvalMode: "full" });
+      expect(await recorder.until((event) => event.type === "turn.completed")).toMatchObject({ ok: true });
+      const env = (JSON.parse(readFileSync(dump, "utf8")) as { env: Record<string, string> }).env;
+      expect(env.OPENCODE_DISABLE_AUTOUPDATE).toBe(appCopy ? "1" : undefined);
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+      await removeTempDir(standaloneEngineDir("opencode"));
+      await removeTempDir(scratch);
+    }
+  });
+});
+
+describe.skipIf(process.platform === "win32")("which OpenCode runs", () => {
+  async function runTurn(scratch: string, log: string, withOwnCopy: boolean) {
+    const original = process.env.PATH, sealed = process.env.OMB_TEST_SEALED_PATH;
+    const dump = join(scratch, "env.json");
+    const copy = (folder: string, label: string) => {
+      mkdirSync(folder, { recursive: true });
+      writeFileSync(join(folder, "opencode"), `#!/bin/sh\necho ${label} >> '${log}'\nexec '${FAKE_CLI}' "$@"\n`, { mode: 0o755 });
+    };
+    const own = join(scratch, "own-bin");
+    if (withOwnCopy) copy(own, "own");
+    // A copy npm put in the app's folder before OpenCode had its own build, and the app's own build.
+    copy(enginesBinDir(), "npm");
+    copy(join(standaloneEngineDir("opencode"), "bin"), "standalone");
+    // Only these copies and node: a real OpenCode on this computer (Homebrew, npm) must never answer the test's turn.
+    process.env.OMB_TEST_SEALED_PATH = "1";
+    process.env.PATH = withOwnCopy ? `${own}${delimiter}${dirname(process.execPath)}` : dirname(process.execPath);
+    resetPathCacheForTests();
+    registerPathDir(enginesBinDir());
+    registerFallbackPathDir(join(standaloneEngineDir("opencode"), "bin"));
+    const driver = createOpenCodeDriver(async () => catalog("opencode/big-pickle"));
+    const instance = await driver.create({
+      instanceId: `opencode-which-${withOwnCopy}`, displayName: "OpenCode", enabled: true,
+      config: { cli: "opencode", fullAuto: false, workspace: scratch },
+      environment: { HOME: scratch, XDG_CONFIG_HOME: scratch, XDG_DATA_HOME: scratch, FAKE_ACP_MODELS: "opencode/big-pickle", FAKE_ACP_DUMP: dump },
+    });
+    const recorder = recordEvents(instance.adapter);
+    try {
+      await instance.adapter.sendTurn({ threadId: "t-which", botId: "bot-7", text: "hi", model: "opencode/big-pickle", approvalMode: "full" });
+      expect(await recorder.until((event) => event.type === "turn.completed")).toMatchObject({ ok: true });
+      return (JSON.parse(readFileSync(dump, "utf8")) as { env: Record<string, string> }).env;
+    } finally {
+      recorder.stop();
+      await instance.dispose();
+      process.env.PATH = original;
+      if (sealed === undefined) delete process.env.OMB_TEST_SEALED_PATH;
+      else process.env.OMB_TEST_SEALED_PATH = sealed;
+      resetPathCacheForTests();
+    }
+  }
+
+  let scratch = "";
+  afterEach(async () => {
+    await removeTempDir(enginesBinDir());
+    await removeTempDir(standaloneEngineDir("opencode"));
+    if (scratch) await removeTempDir(scratch);
+    scratch = "";
+  });
+
+  it("runs the person's own copy ahead of the one npm put in the app's folder, with its updater left alone", async () => {
+    scratch = mkdtempSync(join(tmpdir(), "omb-opencode-which-"));
+    const log = join(scratch, "runs.log");
+    const env = await runTurn(scratch, log, true);
+    expect(readFileSync(log, "utf8").trim().split("\n")).toEqual(["own"]);
+    expect(env.OPENCODE_DISABLE_AUTOUPDATE).toBeUndefined();
+    expect(env.PATH.split(delimiter).at(-1)).toBe(enginesBinDir());
+  });
+
+  it("runs the app's own build ahead of the npm copy, with OpenCode's self-updater off", async () => {
+    scratch = mkdtempSync(join(tmpdir(), "omb-opencode-which-"));
+    const log = join(scratch, "runs.log");
+    const env = await runTurn(scratch, log, false);
+    expect(readFileSync(log, "utf8").trim().split("\n")).toEqual(["standalone"]);
+    expect(env.OPENCODE_DISABLE_AUTOUPDATE).toBe("1");
   });
 });

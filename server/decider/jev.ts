@@ -3,27 +3,18 @@
 import type {
   BackendRequest, BackendResult, ChoiceAnswer, DeciderAnswer, DeciderBackend, DeciderQuestion, ScoreAnswer, YesNoAnswer,
 } from "./types.ts";
-import { isLoopback } from "../provider-key-check.ts";
+import { keySafeUrl } from "../provider-key-check.ts";
 
 export const JEV_DEFAULT_BASE_URL = "https://api.typesafe.ai";
 export const JEV_MODEL = "jev-latest";
 export const JEV_MAX_OPTIONS = 255;
 export const JEV_MIN_LEVELS = 2;
 export const JEV_MAX_LEVELS = 10;
+/** Sent only with Cloud's included token, to the Admin's relay. */
+export const RELAY_SEAM_HEADER = "x-omb-seam";
 
 /** Null when the key must not be sent there: https anywhere, plain http only to this machine. */
-export function jevEndpoint(baseUrl?: string | null): URL | null {
-  const root = (baseUrl?.trim() || JEV_DEFAULT_BASE_URL).replace(/\/+$/, "");
-  let url: URL;
-  try {
-    url = new URL(`${root}/v1/systemone`);
-  } catch {
-    return null;
-  }
-  if (url.username || url.password) return null;
-  if (url.protocol === "https:") return url;
-  return url.protocol === "http:" && isLoopback(url.hostname) ? url : null;
-}
+export const jevEndpoint = (baseUrl?: string | null): URL | null => keySafeUrl(baseUrl?.trim() || JEV_DEFAULT_BASE_URL, "v1/systemone");
 
 /** Questions within the API's limits: 2–255 options, 2–10 levels. */
 export function questionsFit(questions: Record<string, DeciderQuestion>): boolean {
@@ -137,6 +128,7 @@ export function parseJevResponse(
 }
 
 export function refusal(status: number): BackendResult {
+  if (status === 413) return { ok: false, reason: "too_large", status };
   if (status === 401 || status === 403) return { ok: false, reason: "rejected", status };
   if (status === 429) return { ok: false, reason: "rate_limited", status };
   if (status === 529 || status === 503) return { ok: false, reason: "overloaded", status };
@@ -150,7 +142,11 @@ async function decide(request: BackendRequest): Promise<BackendResult> {
   try {
     response = await request.fetch(endpoint, {
       method: "POST",
-      headers: { authorization: `Bearer ${request.key}`, "content-type": "application/json", accept: "application/json" },
+      headers: {
+        authorization: `Bearer ${request.key}`, "content-type": "application/json", accept: "application/json",
+        // The relay checks the request against this seam's shape (server/decider/relay.ts); Jev itself never sees it.
+        ...(request.relaySeam ? { [RELAY_SEAM_HEADER]: request.relaySeam } : {}),
+      },
       body: JSON.stringify(jevRequestBody(request.state, request.questions)),
       signal: request.signal,
       // Never replay the key to wherever a redirect points.

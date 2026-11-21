@@ -1,5 +1,5 @@
 // Scripted provider fixture that exercises the REAL injected agents MCP proxy.
-import { splitLaunchNote } from "./launch-note.ts";
+import { splitChangedNote, splitLaunchNote } from "./launch-note.ts";
 import { spawn } from "node:child_process";
 import { appendFileSync, readFileSync, existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -13,6 +13,8 @@ type ScriptEntry = { key: string; match: string[]; repeat?: boolean; [field: str
 
 // Claude reads its MCP config and system prompt once at launch; the harness deletes both after the first turn.
 const launchFiles = new Map<string, string>();
+/** The volatile half this session holds now: from its launch note, then from each note that changed it. */
+let volatileNote: string | null = null;
 const readAtLaunch = (path: string) => {
   if (!launchFiles.has(path)) launchFiles.set(path, readFileSync(path, "utf8"));
   return launchFiles.get(path)!;
@@ -55,7 +57,7 @@ async function askPermission(server: AgentsIntegration, ask: { tool_name: string
   }
 }
 
-/** `{{name}}` in a step's string arguments becomes what an earlier step's `capture` found. */
+/** `{{name}}` in a step's string arguments, and in a scripted entry's reply, becomes what an earlier step's `capture` found. */
 function withCaptured(value: unknown, captured: Record<string, string>): unknown {
   if (typeof value === "string") return value.replace(/\{\{(\w+)\}\}/g, (whole, name: string) => captured[name] ?? whole);
   if (Array.isArray(value)) return value.map((item) => withCaptured(item, captured));
@@ -98,10 +100,11 @@ async function screenCalls(server: AgentsIntegration, count: number): Promise<Ar
 
 /** Plan fields: `launch` replaces Claude's argv files; `progress`/`progressAfterGate` stream around the
  * gate; `approve` asks through Claude's permission-prompt tool (`replyIfDenied` otherwise);
- * `screenCalls` calls the mounted computer that many times. */
+ * `screenCalls` calls the mounted computer that many times; `echoSteered` ends a scripted reply with what
+ * `steered` says was sent into the turn while it ran. */
 export async function runRoomHandoffAgent(argv: string[], planPath: string, prompt?: unknown,
   launch?: { integration: AgentsIntegration; system: string; evidence?: Record<string, unknown> },
-  progress?: (text: string) => void): Promise<string> {
+  progress?: (text: string) => void, steered: () => readonly string[] = () => []): Promise<string> {
   const arg = (flag: string) => argv[argv.indexOf(flag) + 1];
   const mounted = launch ? [] : Object.values(JSON.parse(readAtLaunch(arg("--mcp-config"))).mcpServers as Record<string, AgentsIntegration>);
   // With a tool selection every server sits behind the gate, which names its upstream in OMB_GATE_UPSTREAM.
@@ -129,9 +132,11 @@ export async function runRoomHandoffAgent(argv: string[], planPath: string, prom
   const agent = agentEnv(integration);
   const botId = agent.OMB_BOT_ID;
   const launchNote = splitLaunchNote(prompt);
-  prompt = launchNote.prompt;
+  const changedNote = splitChangedNote(launchNote.prompt);
+  prompt = changedNote.prompt;
+  volatileNote = launchNote.note ?? changedNote.note ?? volatileNote;
   const launchSystem = launch?.system ?? readAtLaunch(arg("--append-system-prompt-file"));
-  const system = launchNote.note && typeof launchSystem === "string" ? `${launchSystem}\n\n${launchNote.note}` : launchSystem;
+  const system = volatileNote && typeof launchSystem === "string" ? `${launchSystem}\n\n${volatileNote}` : launchSystem;
   // Claude snapshots the launch-time system prompt; later instructions arrive in the user message.
   const turnContext = `${system}\n${JSON.stringify(prompt)}`;
   const resumed = turnContext.includes("Your downstream room requests have settled.");
@@ -200,9 +205,10 @@ export async function runRoomHandoffAgent(argv: string[], planPath: string, prom
       evidence.push(await call("tools/list"));
       evidence.push(await call("tools/call", { name: "list_room_targets", arguments: {} }));
       // `server` names another server the turn mounted ("browser", or a person's own MCP server); `capture` { name: regex }
-      // keeps the first group of the result for later steps' `{{name}}`.
+      // keeps the first group of the result for later steps' `{{name}}`; `delayMs` waits that long before the step.
       const captured: Record<string, string> = {};
       for (const step of steps) {
+        if (typeof step.delayMs === "number") await new Promise((resolve) => setTimeout(resolve, step.delayMs));
         const server = step.server ? (launch ? undefined : JSON.parse(readAtLaunch(arg("--mcp-config"))).mcpServers?.[step.server] as AgentsIntegration | undefined) : undefined;
         if (step.server && !server) throw new Error(`A scripted ${step.server} step needs that server mounted for the turn`);
         const args = withCaptured(step.arguments, captured);
@@ -245,7 +251,8 @@ export async function runRoomHandoffAgent(argv: string[], planPath: string, prom
       if (typeof plan.failWith === "string") throw new Error(plan.failWith);
       if (plan.failResumed && resumed) throw new Error("Scripted failure of a resumed turn");
       if (approval && approval.behavior !== "allow") return plan.replyIfDenied ?? `${plan.reply} (approval ${approval.behavior})`;
-      if (entry) return plan.reply ?? `Result from ${botId}`;
+      const echoed = plan.echoSteered && steered().length ? ` + steered: ${steered().join(" | ")}` : "";
+      if (entry) return `${String(withCaptured(plan.reply ?? `Result from ${botId}`, captured))}${echoed}`;
       return basePlan.turns ? plan.reply : resumed ? plan.resumeReply ?? `Summary from ${botId}` : plan.reply ?? `Result from ${botId}`;
     })()]);
   } finally {

@@ -1,15 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { botsOnCloud, createLoginHandoffClient, handoffWhat } from "./cloud-logins.mjs";
+import { botsOnCloud, createLoginHandoffClient } from "./cloud-logins.mjs";
 
 const TOKEN = "ops_fake-node-test-token";
-
-test("a page names only 1Password or one saved login by id: never a destination, a field or a value", () => {
-  assert.deepEqual(handoffWhat({ kind: "1password", origin: "https://evil.example" }), { kind: "1password" });
-  assert.deepEqual(handoffWhat({ kind: "login", id: "abc-123", password: "x" }), { kind: "login", id: "abc-123" });
-  for (const bad of [null, "1password", { kind: "login" }, { kind: "login", id: "../x" }, { kind: "all" }, [{ kind: "1password" }]]) assert.equal(handoffWhat(bad), null);
-});
 
 test("the private ask takes its answer only from the process it asked, and gives up in words", async () => {
   const sent = [];
@@ -29,6 +23,16 @@ test("the private ask takes its answer only from the process it asked, and gives
   await assert.rejects(gone, /no longer saved on this computer/);
   await assert.rejects(createLoginHandoffClient({ timeoutMs: 20 }).request(proc, { kind: "1password" }), /did not answer/);
   await assert.rejects(createLoginHandoffClient().request(null, { kind: "1password" }), /not running/);
+});
+
+test("a saved secret's answer is taken like a login's, only from the process asked", async () => {
+  const client = createLoginHandoffClient({ randomId: () => "request-0001" });
+  const posted = [];
+  const proc = { postMessage: (message) => posted.push(message) };
+  const answer = client.request(proc, { kind: "secret", id: "s1" });
+  assert.deepEqual(posted[0].what, { kind: "secret", id: "s1" });
+  client.receive(proc, { type: "openmausbot:login-handoff-result", requestId: "request-0001", ok: true, secret: { id: "s1", value: "sk_fake" } });
+  assert.deepEqual((await answer).secret, { id: "s1", value: "sk_fake" });
 });
 
 test("a login kept to some bots keeps only those My Cloud has, and every bot stays every bot", () => {

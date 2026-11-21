@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 
-import { customServerGate, gateServer, hasOwnResultBudget, mcpStdioServer, resultBudget, serverResultBudget } from "./mcp-gate-config.ts";
+import {
+  customServerGate, gateQueryTools, gateServer, hasOwnResultBudget, limitUngatedOutput, mcpStdioServer, resultBudget, serverResultBudget,
+  UNGATED_MCP_OUTPUT_TOKENS,
+} from "./mcp-gate-config.ts";
 import { DEFAULT_RESULT_BUDGET } from "./mcp-trim.ts";
 
 const server = { command: "example-mcp", args: ["--stdio"], env: { TOKEN: "disposable-test-token" } };
@@ -55,7 +58,7 @@ describe("tool directory configuration", () => {
 
   it("keeps a shared environment's settings in one private record", () => {
     const record = `OMB_REMOTE_MCP_CONFIG_${"0".repeat(64)}`;
-    const proxy = mcpStdioServer(remote, { nodeEnv: { ELECTRON_RUN_AS_NODE: "1" }, directory: { name: "whop" }, configEnvName: record })!;
+    const proxy = mcpStdioServer(remote, { sourceEnv: {}, nodeEnv: { ELECTRON_RUN_AS_NODE: "1" }, directory: { name: "whop" }, configEnvName: record })!;
     expect(proxy.args!.slice(1)).toEqual(["--config-env", record]);
     expect(Object.keys(proxy.env!).sort()).toEqual(["ELECTRON_RUN_AS_NODE", record]);
     const settings = JSON.parse(proxy.env![record]);
@@ -149,5 +152,56 @@ describe("tool directory configuration", () => {
     expect(customServerGate("whop", true, { whop: 0 }, env)).toEqual({ budget: 0, gateRemote: false });
     expect(customServerGate("notes", true, { whop: 40_000 }, env)).toEqual({ budget: 12_000, gateRemote: false });
     expect(customServerGate("whop", false, { whop: 40_000 }, env)).toEqual({ budget: 0, gateRemote: false });
+  });
+});
+
+describe("the gate's own query tool", () => {
+  const server = { command: "npx", args: ["shop"] };
+  const configEnvName = `OMB_GATE_CONFIG_${"a".repeat(64)}`;
+
+  it("is named for each mount that is a trimming gate, whatever carries its configuration", () => {
+    const trimming = gateServer({ name: "shop", server, threadId: "t", budget: 8_000 })!;
+    const scopedOnly = gateServer({ name: "notes", server, threadId: "t", budget: 0, toolScope: { allow: ["mcp:notes:*"] } })!;
+    const private_ = gateServer({ name: "files", server, threadId: "t", budget: 0, toolScope: { allow: ["mcp:files:*"] }, configEnvName })!;
+    const privateTrimming = { ...private_, env: { [configEnvName]: JSON.stringify({ ...JSON.parse(private_.env[configEnvName]!), OMB_GATE_BUDGET: "500" }) } };
+    expect(gateQueryTools({ shop: trimming, notes: scopedOnly, files: private_, docs: server, ogb: { command: "node", args: ["perm-proxy.js"] },
+      lookalike: { ...server, env: { OMB_GATE_BUDGET: "8000" } } }))
+      .toEqual(["mcp__shop__query_result"]);
+    expect(gateQueryTools({ files: privateTrimming, broken: { args: trimming.args, env: {} } })).toEqual(["mcp__files__query_result"]);
+  });
+});
+
+describe("untrimmed bot servers", () => {
+  const gated = { command: "node", args: ["gate"], env: { OMB_GATE_BUDGET: "8000" } };
+  const limit = (env: NodeJS.ProcessEnv, mounted: Record<string, unknown>, perServer?: Record<string, number>) => {
+    limitUngatedOutput(env, mounted, Object.keys(mounted), perServer);
+    return env.MAX_MCP_OUTPUT_TOKENS;
+  };
+
+  it("has the CLI save big results to a file only when a bot server reaches it untrimmed", () => {
+    expect(limit({}, { docs: remote })).toBe(String(UNGATED_MCP_OUTPUT_TOKENS));
+    expect(limit({}, { docs: gated })).toBeUndefined();
+    expect(limit({}, {})).toBeUndefined();
+    expect(limit({}, { docs: remote }, { docs: 0 })).toBeUndefined();
+    expect(limit({ OMB_MCP_RESULT_BUDGET: "0" }, { docs: remote })).toBeUndefined();
+    expect(limit({ MAX_MCP_OUTPUT_TOKENS: "40000" }, { docs: remote })).toBe("40000");
+  });
+
+  it("keeps a limit the bot's settings file sets", () => {
+    const env: NodeJS.ProcessEnv = {};
+    limitUngatedOutput(env, { docs: remote }, ["docs"], undefined, "40000");
+    expect(env.MAX_MCP_OUTPUT_TOKENS).toBeUndefined();
+  });
+
+  it("leaves the process-wide limit unset when another untrimmed server asks for whole payloads", () => {
+    expect(limit({}, { whole: remote, docs: remote }, { whole: 0 })).toBeUndefined();
+    expect(limit({}, { docs: remote, whole: remote }, { whole: 0 })).toBeUndefined();
+    expect(limit({}, { whole: gated, docs: remote }, { whole: 0 })).toBe(String(UNGATED_MCP_OUTPUT_TOKENS));
+  });
+
+  it("leaves it unset when a gate passes whole payloads through (a budget of 0)", () => {
+    const whole = { ...gated, env: { OMB_GATE_BUDGET: "0" } };
+    expect(limit({}, { whole, docs: remote })).toBeUndefined();
+    expect(limit({}, { docs: remote, whole })).toBeUndefined();
   });
 });

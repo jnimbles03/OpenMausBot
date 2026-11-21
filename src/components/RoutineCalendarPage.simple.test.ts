@@ -136,7 +136,7 @@ describe("Automations page", () => {
   it("lists each automation as one sentence with a plain status line and a switch", () => {
     const html = markup(createElement(RoutinesPage, { onBack: vi.fn(), onOpenRoom: vi.fn() }));
     expect(html).toContain("Every day at 6:30 AM, Runner summarises my inbox and calendar".replace("my inbox", "your inbox"));
-    expect(html).toMatch(/Working · last ran [^<]+ · next: [^<]+/);
+    expect(html).toMatch(/On · last ran [^<]+ · next: [^<]+/);
     expect(html).not.toMatch(/Latest: |Not run yet|runs OK this week|Run logs/);
   });
 
@@ -149,9 +149,8 @@ describe("Automations page", () => {
     expect(html).toContain("Sign in</button>");
   });
 
-  it("opens one simple panel from a sentence", () => {
-    const sentence = [...buttons(page()).keys()].find((label) => label.startsWith("Every day at 6:30"))!;
-    click(buttons(page()).get(sentence));
+  it("opens one simple panel from its name", () => {
+    click(buttons(page()).get("Morning brief"));
     expect(page().find(named("AutomationPanel"))!.props.automation).toMatchObject({ id: routine.id, kind: "schedule" });
   });
 
@@ -200,6 +199,15 @@ describe("Automations page", () => {
     const picked = tree.filter((node) => node.type === "button" && String(node.props.className).includes("border-accent/70")).map((node) => textOf(node.props.children));
     expect(picked).toContain("Other");
     expect(picked).not.toContain(bot.name);
+  });
+
+  it("dims the page behind the webhook editor without blurring it", async () => {
+    const { WebhookEditor } = await import("./WebhookTrigger");
+    fixture.values = [];
+    const tree = capture(() => WebhookEditor({ bots: [bot], onClose: vi.fn(), onCredential: vi.fn() }));
+    const overlay = tree.find((node) => String(node.props.className ?? "").includes("fixed inset-0"))!;
+    expect(overlay.props.className).toContain("bg-black/60");
+    expect(overlay.props.className).not.toMatch(/backdrop-blur|backdrop-filter/);
   });
 
   it("greets an empty list, and its example fills the New box", () => {
@@ -298,13 +306,29 @@ describe("routine editor", () => {
   it("shows a saved startup choice when the simple editor opens", () => {
     const html = editor({ ...routine, runOnStartup: true });
     expect(html).toContain('aria-expanded="true"');
-    expect(html).toMatch(/<input type="checkbox" aria-label="Also run when OpenMausBot starts"[^>]*checked[^>]*>/);
+    expect(html).toMatch(/<input type="checkbox" aria-label="Also run when MausBot starts"[^>]*checked[^>]*>/);
   });
 
   it("offers Remember the last run for a repeating routine, off unless the routine has it", () => {
     expect(editor(routine)).toMatch(/<input type="checkbox" aria-label="Remember the last run"(?![^>]*checked)[^>]*>/);
     expect(editor({ ...routine, continuity: true })).toMatch(/<input type="checkbox" aria-label="Remember the last run"[^>]*checked[^>]*>/);
     expect(editor(routine)).toContain("Each run starts with the previous run&#x27;s report");
+  });
+
+  it("schedules a goal in the bot's own chat when no group is chosen", () => {
+    const ownGoal: Routine = { ...routine, id: "own-goal", name: "Ship the fix", target: "room-goal", groupId: undefined, resultsThreadId: undefined };
+    const html = editor(ownGoal);
+    expect(html).toContain("Where it runs");
+    expect(html).toMatch(/<option value="" selected="">Just the bot, in its own chat<\/option>/);
+    expect(html).toContain("The bot works on the goal in its own chat until it is done.");
+    expect(html).toContain("Runner");
+    expect(html).not.toContain("Create a group from the sidebar first");
+
+    fixture.values = [];
+    const props = { seed: { kind: "routine" as const, at: Date.now() + 3_600_000, durationMinutes: 30, botIds: [bot.id], routine: ownGoal }, bots: [bot], onClose: vi.fn(), onSavedCall: vi.fn() };
+    click(buttons(capture(() => EventEditor(props))).get("Save"));
+    const [, init] = fixture.api.mock.calls.at(-1) as unknown as [string, { body: string }];
+    expect(JSON.parse(init.body)).toMatchObject({ target: "room-goal", botId: bot.id, groupId: null });
   });
 
   it("hides Remember the last run for a one-time routine", () => {
@@ -370,5 +394,61 @@ describe("routine editor", () => {
     }
     expect(html).not.toContain("More options");
     expect(html).not.toContain("What should happen?");
+  });
+});
+
+describe("a new routine's audience on a team's Cloud", () => {
+  const quotes = { ...bot, id: "quotes", name: "Quotes", threadId: "mine", mainThreadId: "main", tasks: [
+    { threadId: "main", title: "Shared chat", createdAt: 1, sharedChat: true }, { threadId: "mine", title: "Salary talk", createdAt: 2, private: true },
+  ] } as Bot;
+  const other = { ...bot, id: "other", name: "Other", threadId: "other-main", mainThreadId: "other-main", tasks: [{ threadId: "other-main", title: "Shared chat", createdAt: 1, sharedChat: true }] } as Bot;
+  /** The form as opened with this bot's chat on screen; what it shows, and what Save sends. */
+  function opened(onScreen: Bot, state: Partial<AppState> = {}) {
+    fixture.state = { ...initialState, bots: [onScreen, other], selectedId: onScreen.id, activeView: "chat", config: { box: { configured: false }, team: { id: "t1", name: "Acme" } } as AppState["config"], ...state };
+    fixture.values = [];
+    fixture.api.mockClear();
+    const props = { seed: { kind: "routine" as const, at: Date.now() + 3_600_000, durationMinutes: 30, botIds: [onScreen.id], name: "Salary check", description: "Check the bands" },
+      bots: [onScreen, other], onClose: vi.fn(), onSavedCall: vi.fn() };
+    const tree = () => capture(() => EventEditor(props));
+    const line = () => tree().find(named("RoutineAudience"))!.props as { value: unknown; bot?: Bot; team?: { name: string } };
+    const saved = () => {
+      click(buttons(tree()).get("Save"));
+      return JSON.parse((fixture.api.mock.calls.at(-1) as unknown as [string, { body: string }])[1].body) as { resultsThreadId?: unknown };
+    };
+    return { props, tree, line, saved, html: () => renderToStaticMarkup(createElement(EventEditor, props)) };
+  }
+
+  it("opened from a private chat, it is private: the line says so without opening More options, and Save sends Just me", () => {
+    const form = opened(quotes);
+    expect(form.line()).toMatchObject({ value: "just-me", team: { name: "Acme" } });
+    const html = form.html();
+    expect(html).toContain('data-routine-audience="me"');
+    expect(html).toContain("Private · only you");
+    expect(html, "More options stays closed").not.toContain("Post results to");
+    opened(quotes);
+    expect(opened(quotes).saved().resultsThreadId).toBe("just-me");
+  });
+
+  it("opened from the shared chat, it is shared and says who will see it", () => {
+    const form = opened({ ...quotes, threadId: "main" });
+    expect(form.line().value).toBe("main");
+    expect(form.html()).toContain("Shared · everyone in Acme can see");
+    expect(opened({ ...quotes, threadId: "main" }).saved().resultsThreadId).toBe("main");
+  });
+
+  it("opened where no chat is on screen, or moved to another bot, it is private until the person chooses", () => {
+    expect(opened({ ...quotes, threadId: "main" }, { activeView: "routines" }).saved().resultsThreadId).toBe("just-me");
+    const form = opened({ ...quotes, threadId: "main" });
+    const picker = form.tree().find(named("BotPicker"))!.props as { onChange: (ids: string[]) => void };
+    picker.onChange(["other"]);
+    expect(form.line().value, "the shared chat on screen was Quotes', not Other's").toBe("just-me");
+    expect(form.saved().resultsThreadId).toBe("just-me");
+  });
+
+  it("off a team the form is as it was: no line, and the bot's own results chat", () => {
+    const form = opened(quotes, { config: initialState.config });
+    expect(form.line().team).toBeUndefined();
+    expect(form.html()).not.toContain("data-routine-audience");
+    expect(form.saved().resultsThreadId).toBeNull();
   });
 });

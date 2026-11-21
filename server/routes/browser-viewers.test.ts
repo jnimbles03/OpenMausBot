@@ -6,9 +6,12 @@ import { createServer, request, type IncomingMessage, type Server, type ServerRe
 import type { AddressInfo, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { BrowserHostError, SETUP_COMMAND } from "../browser/chrome/host-setup.ts";
+import { BrowserHostError } from "../browser/chrome/host-setup.ts";
+import { createBrowserInputLog, type BrowserInputLog } from "../browser/input-log.ts";
+import { BrowserLiveError } from "../browser-live.ts";
+import type { Audience } from "../audience.ts";
 import type { Download } from "../browser/cdp/downloads.ts";
 import type { BrowserService } from "../browser/service.ts";
 import type { Viewer, ViewerOptions, ViewerOutput } from "../browser/viewers/core.ts";
@@ -51,22 +54,35 @@ interface Fixture {
   pickerChecks: number;
   /** The v1 views opened, by the view each asked to carry on from. */
   resumes: Array<string | null | undefined>;
+  /** The person each v1 view was opened for. */
+  people: Array<string | undefined>;
+  /** The panel size each v1 view opened at. */
+  sizes: Array<{ width: number; height: number } | null | undefined>;
+  /** Whose browser each view was opened on, and each check that the view still shows it. */
+  opened: Audience[];
+  checked: Audience[];
+  /** The last v1 view's check that it still shows the browser it opened on. */
+  isCurrent: () => boolean;
   dataDir: string;
 }
 
 const servers: Server[] = [];
 const folders: string[] = [];
 afterEach(async () => {
+  vi.unstubAllGlobals();
   for (const server of servers.splice(0)) await new Promise<void>((resolve) => { server.close(() => resolve()); server.closeAllConnections(); });
   for (const folder of folders.splice(0)) await removeTempDir(folder);
 });
 
-async function serve({ attach, current = () => true, download }: {
+async function serve({ attach, current = () => true, download, audience = () => "team", action = async () => ({ ok: true }), inputLog }: {
   attach?: (options: ViewerOptions, push: (output: ViewerOutput) => void) => Promise<Viewer>;
   current?: () => boolean;
   download?: (id: string) => Download | undefined;
+  audience?: (threadId: string | null) => Audience | null;
+  action?: (body: unknown) => Promise<unknown>;
+  inputLog?: BrowserInputLog;
 } = {}): Promise<Fixture> {
-  const fixture = { origin: "", attachments: [], inputs: [], answers: [], pickerChecks: 0, resumes: [], dataDir: mkdtempSync(join(tmpdir(), "omb-browser-viewers-")) } as unknown as Fixture;
+  const fixture = { origin: "", attachments: [], inputs: [], answers: [], pickerChecks: 0, resumes: [], people: [], sizes: [], opened: [], checked: [], dataDir: mkdtempSync(join(tmpdir(), "omb-browser-viewers-")) } as unknown as Fixture;
   folders.push(fixture.dataDir);
   const viewer = { id: "viewer", input: async (message: unknown) => { fixture.inputs.push(message); }, close: async () => {} } as unknown as Viewer;
   const service = {
@@ -82,12 +98,16 @@ async function serve({ attach, current = () => true, download }: {
   const deps: BrowserViewerRouteDeps = {
     upgrades,
     dataDir: fixture.dataDir,
+    person: (auth) => (auth.kind === "session" ? `person-of-${auth.session.id}` : "local-owner"),
     viewers: {
       open: async (options) => {
         fixture.resumes.push(options.resume);
+        fixture.people.push(options.person);
+        fixture.sizes.push(options.size);
+        fixture.isCurrent = options.isCurrent;
         options.res.writeHead(204).end();
       },
-      action: async () => ({ ok: true }),
+      action: async ({ body }) => action(body),
       stream: ({ session, spec: _spec, ...request }) => {
         stream.open({ ...request, target: { session, key: "bot:pepper" } });
         return true;
@@ -102,15 +122,24 @@ async function serve({ attach, current = () => true, download }: {
       },
       download: (_browser, id) => download?.(id),
     },
-    browser: async (botId) => (botId === "pepper" ? { botId, session: "bot-pepper", spec: { command: "omb-cdp", args: ["bot:pepper"], env: {} } } : { status: 404, error: "no such bot" }),
+    audience: (_auth, threadId) => audience(threadId),
+    browser: async (botId, opened) => {
+      fixture.opened.push(opened);
+      return botId === "pepper" ? { botId, session: "bot-pepper", spec: { command: "omb-cdp", args: ["bot:pepper"], env: {} } } : { status: 404, error: "no such bot" };
+    },
     authorize: async () => null,
-    current: () => current(),
+    current: (_botId, _session, _auth, checked) => { fixture.checked.push(checked); return current(); },
     restartRefusal: () => null,
+    ...(inputLog ? { inputLog } : {}),
   };
   const route = createBrowserViewerRoutes(deps);
   const handle = async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? "/", "http://localhost");
-    if (!await dispatchRoutes([route], { req, res, url, path: url.pathname, method: req.method ?? "GET", auth: LOOPBACK, json, readBody })) json(res, 404, { error: "no route" });
+    try {
+      if (!await dispatchRoutes([route], { req, res, url, path: url.pathname, method: req.method ?? "GET", auth: LOOPBACK, json, readBody })) json(res, 404, { error: "no route" });
+    } catch (error) {
+      json(res, (error as { status?: number }).status ?? 500, { error: error instanceof Error ? error.message : "failed" });
+    }
   };
   const server = createServer((req, res) => void handle(req, res));
   upgrades.attach(server, handle);
@@ -188,7 +217,7 @@ describe("the v2 stream", () => {
     expect(texts).toEqual([{ type: "viewport", width: 1280, height: 800, setting: { mode: "fill" }, zoom: 1 }]);
     expect(fixture.inputs).toEqual(interactive ? [...mutations, null] : []);
     expect(fixture.attachments).toEqual([{
-      owner: "local-owner", canOperate: interactive, maxWidth: 1280, maxHeight: 800, quality: 70, pace: "hi", authPrompts: true, pagePopups: true,
+      owner: "local-owner", person: "local-owner", canOperate: interactive, maxWidth: 1280, maxHeight: 800, quality: 70, pace: "hi", authPrompts: true, pagePopups: true,
       ...(interactive ? { size: { width: 1600, height: 1000 } } : {}),
     }]);
   });
@@ -244,6 +273,25 @@ describe("the v2 stream", () => {
     expect(fixture.inputs).toEqual([{ type: "takeControl" }]);
   });
 
+  it("ends a hold at once when the panel closes its socket, and waits the grace when the connection breaks", async () => {
+    const closes: Array<{ dropped?: boolean } | undefined> = [];
+    const fixture = await serve({
+      attach: async () => ({ id: "viewer", input: async () => {}, close: async (options?: { dropped?: boolean }) => { closes.push(options); } }) as unknown as Viewer,
+    });
+    const panel = new WebSocket(`ws://${fixture.origin}/api/bots/pepper/browser/stream`);
+    await new Promise((resolve) => panel.addEventListener("open", resolve));
+    await until(() => fixture.attachments.length === 1);
+    panel.close();
+    await until(() => closes.length === 1);
+    expect(closes[0]).toEqual({ dropped: false });
+    const phone = await stubbornStream(fixture);
+    await until(() => fixture.attachments.length === 2);
+    // No close frame: a phone in the background or a network that dropped.
+    phone.destroy();
+    await until(() => closes.length === 2);
+    expect(closes[1]).toEqual({ dropped: true });
+  });
+
   it("checks each message as each v1 action is checked: a person who may no longer see the bot is cut off at once", async () => {
     let current = true;
     const fixture = await serve({ current: () => current });
@@ -271,27 +319,90 @@ describe("the v2 stream", () => {
   it.each([
     { error: new BrowserHostError("sandbox"), need: "sandbox" },
     { error: new BrowserHostError("libraries", ["libnss3.so"]), need: "libraries" },
-  ])("tells viewers the command that sets up the host ($need)", async ({ error, need }) => {
+    { error: new Error("Chrome could not be started.", { cause: new BrowserHostError("container") }), need: "container" },
+  ])("tells viewers what the host needs ($need), never a command that does not exist", async ({ error, need }) => {
     const fixture = await serve({ attach: async () => { throw error; } });
     const socket = new WebSocket(`ws://${fixture.origin}/api/bots/pepper/browser/stream`);
     const { code, reason } = await new Promise<{ code: number; reason: string }>((resolve) => socket.addEventListener("close", (event) => resolve({ code: event.code, reason: event.reason })));
     expect(code).toBe(STREAM_CLOSE.hostSetup);
-    expect(JSON.parse(reason)).toEqual({ need, command: SETUP_COMMAND });
+    expect(JSON.parse(reason)).toEqual({ need });
   });
 });
 
 describe("the v1 live view", () => {
-  it("passes on the view a reconnecting panel had, so its dropped hold can be returned", async () => {
+  const act = (fixture: Fixture, body: Record<string, unknown>) => fetch(`http://${fixture.origin}/api/bots/pepper/browser/action`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+
+  it("logs one line with a reason code for each action it refuses, and none for one it took", async () => {
+    const lines: string[] = [];
+    const inputLog = createBrowserInputLog((line) => lines.push(line));
+    let current = true;
+    const fixture = await serve({ inputLog, current: () => current, action: async (body) => {
+      const { type, text } = body as { type: string; text?: string };
+      if (type === "take") throw new BrowserLiveError("Another browser view or bot action is using this browser. Try again shortly.", 409, "take_refused");
+      if (type === "input_keyboard" && text === "secret typed text") throw new BrowserLiveError("Too many browser actions are pending. Try again shortly.", 429);
+      if (type === "input_mouse") return { ok: true, notice: "The page did not take some of your input." };
+      if (type === "ack") throw new BrowserLiveError("This browser view is no longer available. Reopen the browser panel.", 404, "view_gone");
+      return { ok: true };
+    } });
+    expect((await act(fixture, { type: "take", viewerId: "v1" })).status).toBe(409);
+    expect((await act(fixture, { type: "input_keyboard", eventType: "char", text: "secret typed text", viewerId: "v1" })).status).toBe(429);
+    expect((await act(fixture, { type: "input_mouse", eventType: "mousePressed", x: 1, y: 2, viewerId: "v1" })).status).toBe(200);
+    expect((await act(fixture, { type: "ack", seq: 3, viewerId: "v1" })).status).toBe(404);
+    expect((await act(fixture, { type: "navigate", url: "https://example.com/?token=abc", viewerId: "v1" })).status).toBe(200);
+    current = false;
+    expect((await act(fixture, { type: "navigate", url: "https://example.com/?token=abc", viewerId: "v1" })).status).toBe(409);
+    expect(lines).toEqual([
+      "browser input: person take dropped reason=take_refused engine=chrome transport=v1 session=bot-pepper",
+      "browser input: person input_keyboard dropped reason=too_many_pending engine=chrome transport=v1 session=bot-pepper",
+      "browser input: person input_mouse dropped reason=page_refused engine=chrome transport=v1 session=bot-pepper",
+      "browser input: person navigate dropped reason=session_changed engine=chrome transport=v1 session=bot-pepper",
+    ]);
+    expect(lines.join("\n")).not.toMatch(/secret|token|example/);
+  });
+
+  it("counts what the app's view says it dropped before sending, by known reason only, without reaching the browser", async () => {
+    const lines: string[] = [];
+    const inputLog = createBrowserInputLog((line) => lines.push(line));
+    const actions: unknown[] = [];
+    const fixture = await serve({ inputLog, action: async (body) => { actions.push(body); return { ok: true }; } });
+    const answer = await act(fixture, { type: "client_drops", counts: { stale_after_wait: 2, queue_halted: 1, "made up": 9, send_failed: "many", queue_full: -1 }, viewerId: "v1" });
+    expect(answer.status).toBe(200);
+    expect(actions).toEqual([]);
+    expect(lines).toEqual([
+      "browser input: app input dropped reason=stale_after_wait engine=chrome transport=v1 session=bot-pepper times=2",
+      "browser input: app input dropped reason=queue_halted engine=chrome transport=v1 session=bot-pepper",
+    ]);
+  });
+
+  it("says when the own-driver v1 view answered a page question's answer it does not apply", async () => {
+    const lines: string[] = [];
+    const fixture = await serve({ inputLog: createBrowserInputLog((line) => lines.push(line)) });
+    expect((await act(fixture, { type: "dialog", accept: true, viewerId: "v1" })).status).toBe(200);
+    expect((await act(fixture, { type: "input_batch", events: [], viewerId: "v1" })).status).toBe(200);
+    expect(lines).toEqual(["browser input: person dialog dropped reason=not_handled engine=chrome transport=v1 session=bot-pepper"]);
+  });
+
+  it("passes on the view a reconnecting panel had, and the person watching, whose hold every view of theirs shares", async () => {
     const fixture = await serve();
     expect((await fetch(`http://${fixture.origin}/api/bots/pepper/browser/live?resume=old-viewer`)).status).toBe(204);
     expect((await fetch(`http://${fixture.origin}/api/bots/pepper/browser/live`)).status).toBe(204);
     expect(fixture.resumes).toEqual(["old-viewer", null]);
+    expect(fixture.people).toEqual(["local-owner", "local-owner"]);
+  });
+
+  it("opens the view at the panel's size, and leaves a collapsed or missing one to the page", async () => {
+    const fixture = await serve();
+    for (const query of ["?width=365&height=686", "?width=365&height=40", "", "?width=wide&height=686"]) {
+      expect((await fetch(`http://${fixture.origin}/api/bots/pepper/browser/live${query}`)).status).toBe(204);
+    }
+    expect(fixture.sizes).toEqual([{ width: 365, height: 686 }, null, null, null]);
   });
 });
 
 describe("the page's file picker and downloads", () => {
-  it("passes uploaded files to the page's open picker, which only its current id answers", async () => {
+  it.each(["linux", "darwin", "win32"])("passes uploaded bytes to the page's open picker on %s, which only its current id answers", async (platform) => {
     const fixture = await serve();
+    vi.stubGlobal("process", { ...process, platform });
     const upload = (chooser: string) => {
       const body = new FormData();
       body.append("file", new File(["hello"], "notes.txt", { type: "text/plain" }));
@@ -362,5 +473,32 @@ describe("the page's file picker and downloads", () => {
     expect(response.headers.get("x-content-type-options")).toBe("nosniff");
     expect(await response.text()).toBe("report contents");
     expect((await fetch(`http://${fixture.origin}/api/bots/pepper/browser/download/other`)).status).toBe(404);
+  });
+});
+
+describe("whose browser a view shows on a Team Cloud", () => {
+  it("opens the browser of the conversation shown, the person's own with none named, and nothing for a conversation hidden from them", async () => {
+    const hidden = new Set(["cleo-chat"]);
+    const fixture = await serve({ audience: (threadId) => (threadId === null ? "member:p_ada" : hidden.has(threadId) ? null : threadId === "room-chat" ? "room:launch" : "member:p_ada") });
+    const get = (query: string) => fetch(`http://${fixture.origin}/api/bots/pepper/browser/live${query}`).then((res) => res.status);
+    expect(await get("?threadId=ada-chat")).toBe(204);
+    expect(await get("?threadId=room-chat")).toBe(204);
+    expect(await get("")).toBe(204);
+    expect(await get("?threadId=cleo-chat"), "a member never reaches another member's browser").toBe(404);
+    expect(fixture.opened).toEqual(["member:p_ada", "room:launch", "member:p_ada"]);
+  });
+
+  it("ends a view once its conversation is hidden from the person, and checks the browser for that same audience", async () => {
+    let sees = true;
+    const fixture = await serve({ audience: (threadId) => (threadId === "ada-chat" && sees ? "member:p_ada" : threadId === null ? "team" : null) });
+    const act = () => fetch(`http://${fixture.origin}/api/bots/pepper/browser/action?threadId=ada-chat`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ viewerId: "v-1", type: "key" }) }).then((res) => res.status);
+    expect(await act()).toBe(200);
+    expect(fixture.checked).toEqual(["member:p_ada"]);
+    expect((await fetch(`http://${fixture.origin}/api/bots/pepper/browser/live?threadId=ada-chat`)).status).toBe(204);
+    expect(fixture.isCurrent()).toBe(true);
+    sees = false;
+    expect(fixture.isCurrent(), "an open view stops showing a conversation the person no longer sees").toBe(false);
+    expect(await act()).toBe(404);
+    expect(fixture.opened).toEqual(["member:p_ada", "member:p_ada"]);
   });
 });

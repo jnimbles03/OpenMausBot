@@ -1,11 +1,8 @@
 import { useSyncExternalStore } from "react";
-import type { CloudMoveOverview } from "../../electron/cloud-move.mjs";
 import type { CloudPlanSnapshot } from "../../electron/cloud-account.mjs";
 import { CLOUD_SETUP_HIDDEN, CLOUD_WELCOME_DONE, cloudWelcomeStage } from "@/lib/cloud-setup";
 import type { OnboardingStatus, WelcomeViewer } from "@/lib/onboarding";
 import { api, type Action, type ConfigStatus } from "@/state/store";
-
-export type BringChoice = "copy" | "fresh";
 
 interface Snapshot {
   /** The person picked a bot or room: the welcome waits behind the setup card for this session. */
@@ -16,10 +13,12 @@ interface Snapshot {
   early: readonly string[];
   /** Where Continue setup asked the welcome to open. */
   requested: string | null;
-  /** Shown in this session: it stays while the Cloud restarts under it (a copy ends with one). */
+  /** Shown in this session: it stays while the Cloud restarts under it. */
   seen: boolean;
   /** The welcome ended here but the Cloud could not save it: this device keeps it until the Cloud does. */
   doneHere: boolean;
+  /** Its last page is on screen and already recorded as done: it stays until the person leaves that screen. */
+  finishing: boolean;
 }
 
 const DONE_HERE = "omb.cloudWelcome.done";
@@ -34,7 +33,7 @@ function store(key: string, value: string | null): void {
 }
 const initial = (): Snapshot => {
   const doneHere = stored(DONE_HERE) !== null;
-  return { aside: false, ended: doneHere, early: doneHere ? [CLOUD_WELCOME_DONE] : [], requested: null, seen: false, doneHere };
+  return { aside: false, ended: doneHere, early: doneHere ? [CLOUD_WELCOME_DONE] : [], requested: null, seen: false, doneHere, finishing: false };
 };
 let snapshot: Snapshot = initial();
 const listeners = new Set<() => void>();
@@ -61,6 +60,8 @@ export function takeWelcomeRequest(): string | null {
 }
 export function endWelcomeHere(): void { update({ ended: true }); }
 export function markWelcomeSeen(): void { if (!snapshot.seen) update({ seen: true }); }
+export function keepFinishedWelcome(): void { if (!snapshot.finishing) update({ finishing: true }); }
+export function dropFinishedWelcome(): void { if (snapshot.finishing) update({ finishing: false }); }
 export function noteWelcomeHints(ids: readonly string[]): void {
   update({ early: [...new Set([...snapshot.early, ...ids])] });
 }
@@ -72,14 +73,14 @@ export function withEarlyHints(record: OnboardingStatus | undefined, early: read
   return { ...record, hintsSeen: [...new Set([...record.hintsSeen, ...early])] };
 }
 
-export function cloudWelcomeShown(stage: string, welcome: Pick<Snapshot, "aside" | "ended" | "seen">): boolean {
-  return (stage === "pending" || (stage === "waiting" && welcome.seen)) && !welcome.aside && !welcome.ended;
+export function cloudWelcomeShown(stage: string, welcome: Pick<Snapshot, "aside" | "ended" | "seen"> & { finishing?: boolean }): boolean {
+  return (stage === "pending" || (stage === "waiting" && welcome.seen) || (stage === "ended" && welcome.finishing === true)) && !welcome.aside && !welcome.ended;
 }
 
 /** Whether the welcome fills the main pane, from the Cloud's record with the hints written here that it has not saved yet. */
 export function cloudWelcomeVisible(
   facts: { viewer: WelcomeViewer | null; connected: boolean; enginesKnown: boolean; onboarding: OnboardingStatus | undefined },
-  welcome: Pick<Snapshot, "aside" | "ended" | "seen" | "early">,
+  welcome: Pick<Snapshot, "aside" | "ended" | "seen" | "early"> & { finishing?: boolean },
 ): boolean {
   return cloudWelcomeShown(cloudWelcomeStage({ ...facts, onboarding: withEarlyHints(facts.onboarding, welcome.early) }), welcome);
 }
@@ -122,22 +123,6 @@ export function cloudFirstRun(shown: { welcome: boolean; intent: boolean; signIn
   if (shown.welcome) return "welcome";
   if (shown.intent) return "intent";
   return shown.signIn ? "sign-in" : null;
-}
-
-/** Work worth bringing, as main counts it: more than the starter bot, a room or a chat. */
-export function hasWork(local: CloudMoveOverview["local"] | null | undefined): boolean {
-  return Boolean(local && (local.bots > 1 || local.rooms > 0 || local.chats > 0));
-}
-
-/** A copy from the Cloud's own page goes only into an empty Cloud (main checks again), so the welcome offers it before any chat exists. */
-export function copyPossible(overview: CloudMoveOverview | null): boolean {
-  return Boolean(overview?.destination && overview.cloud?.empty !== false && !overview.blocked && overview.fit?.fit !== "never");
-}
-
-export function suggestedChoice(desktop: boolean, overview: CloudMoveOverview | null): BringChoice {
-  if (!desktop) return "fresh";
-  if (!overview) return "copy";
-  return hasWork(overview.local) && copyPossible(overview) ? "copy" : "fresh";
 }
 
 export type WelcomeCredit = { state: "active"; left: number | null } | { state: "used_up" | "ended" };

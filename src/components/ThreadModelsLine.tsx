@@ -3,16 +3,17 @@ import { useRef, useState } from "react";
 import { threadsOnOwnModel } from "../../shared/thread-model";
 import { cn } from "@/lib/cn";
 import { t } from "@/lib/i18n";
-import { useStore, type Bot } from "@/state/store";
+import { type Bot } from "@/state/store";
+import { useStoreDispatch } from "@/state/store-select";
 
 export function ThreadModelsLine({ bot, className }: { bot: Bot; className?: string }) {
-  const { dispatch } = useStore();
+  const dispatch = useStoreDispatch();
   const [busy, setBusy] = useState(0);
   const latestRequest = useRef(0);
   const count = threadsOnOwnModel(bot.modelSelection, bot.tasks ?? []).length;
   if (count === 0) return null;
   return (
-    <div data-thread-models className={cn("flex flex-wrap items-center gap-x-2 gap-y-1 text-[12.5px] text-ink-secondary", className)}>
+    <div data-thread-models className={cn("flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px] text-ink-secondary", className)}>
       <span>{count === 1 ? t("model.threadsOwnModelOne") : t("model.threadsOwnModel", { count })}</span>
       <button
         type="button"
@@ -27,7 +28,7 @@ export function ThreadModelsLine({ bot, className }: { bot: Bot; className?: str
             },
           });
         }}
-        className="-mx-1.5 rounded-lg px-1.5 py-0.5 text-[12.5px] font-medium text-accent-text hover:bg-control/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-focus"
+        className="h-6 shrink-0 rounded-full px-2.5 text-[12px] font-medium leading-4 text-ink ring-[0.5px] ring-ink/25 hover:bg-ink/[0.06]"
       >
         {count === 1 ? t("model.switchItToo") : t("model.switchThemToo")}
       </button>

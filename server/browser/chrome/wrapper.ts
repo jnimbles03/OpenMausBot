@@ -19,7 +19,25 @@ export interface LauncherSettings {
   timeZone?: string;
   /** macOS: Chrome with any HOME but the person's own asks, in a dialog on their screen, for a keychain it cannot find. */
   home?: string;
+  /** Every Chrome this launcher starts runs in this box (a Team Cloud's), with only the profile it was started on. */
+  box?: LauncherBox;
 }
+
+/** bubblewrap's options for a browser's box, before `--` and without the profile, which the launcher binds per start. */
+export interface LauncherBox {
+  bwrap: string;
+  options: string[];
+  /** The seccomp filter, read on LAUNCHER_SECCOMP_FD; bubblewrap closes that descriptor before Chrome runs. */
+  seccomp: string | null;
+}
+
+/** agent-browser hands Chrome only stdio (it speaks to it over a port), so 9 is free for the filter. */
+export const LAUNCHER_SECCOMP_FD = 9;
+
+/** Headless Chrome 152–156 still keeps a renderer for its WebUI omnibox popups and reload button, which it never shows.
+ * agent-browser 0.37 passes --disable-features=Translate and Chrome keeps only the last value of a switch, so Translate
+ * stays in the list; agent-browser splits AGENT_BROWSER_ARGS at commas, so only the launcher can pass a list. */
+export const HEADLESS_DISABLED_FEATURES = "--disable-features=Translate,WebUIOmniboxPopup,WebUIOmniboxAimPopup,WebUIReloadButton";
 
 /** Last on the command line, so they win over any switch of the same name: Chrome keeps the last value of a switch. A bot's
  * Chrome never touches the person's keychain or keyring (agent-browser 0.37 passes these too). */
@@ -53,13 +71,37 @@ export function launcherScript(settings: LauncherSettings, platform: NodeJS.Plat
   if (platform === "win32") {
     return ["@echo off", `${batchQuote(settings.chrome)} %* ${flags.map(batchQuote).join(" ")}`, ""].join("\r\n");
   }
+  // $headless holds one word without spaces or patterns, so it is expanded unquoted: nothing at all when Chrome has a window.
+  const chrome = `${shellQuote(settings.chrome)} "$@" ${flags.map(shellQuote).join(" ")} $headless`;
   return [
     "#!/bin/sh",
     ...(settings.home ? [`HOME=${shellQuote(settings.home)}`, "export HOME"] : []),
     ...(settings.timeZone ? [`TZ=${shellQuote(settings.timeZone)}`, "export TZ"] : []),
-    `exec ${shellQuote(settings.chrome)} "$@" ${flags.map(shellQuote).join(" ")}`,
+    "headless=",
+    `for arg in "$@"; do case "$arg" in --headless|--headless=*) headless=${shellQuote(HEADLESS_DISABLED_FEATURES)} ;; esac; done`,
+    ...(settings.box ? boxedLaunch(settings.box, chrome) : [`exec ${chrome}`]),
     "",
   ].join("\n");
+}
+
+/** Chrome in its box: its profile (agent-browser's --user-data-dir=) bound back read-write, and nothing else of the home
+ * or the data folder; HOME is the box's private /tmp. Without a profile it still runs boxed, on a throwaway one. The shell
+ * stays bubblewrap's parent rather than exec'ing it: --die-with-parent ends the box with the thread that started it, and
+ * agent-browser 0.37 starts Chrome from a worker thread that ends right after. */
+function boxedLaunch(box: LauncherBox, chrome: string): string[] {
+  return [
+    "profile=",
+    'for arg in "$@"; do case "$arg" in --user-data-dir=*) profile=${arg#--user-data-dir=} ;; esac; done',
+    ...(box.seccomp ? [`exec ${LAUNCHER_SECCOMP_FD}<${shellQuote(box.seccomp)} || exit 70`] : []),
+    'if [ -n "$profile" ]; then',
+    '  mkdir -p "$profile" || exit 70',
+    `  set -- --bind "$profile" "$profile" --setenv HOME /tmp -- ${chrome}`,
+    "else",
+    `  set -- --setenv HOME /tmp -- ${chrome}`,
+    "fi",
+    `${shellQuote(box.bwrap)} ${box.options.map(shellQuote).join(" ")} "$@"`,
+    "exit $?",
+  ];
 }
 
 export function writeLauncher(path: string, settings: LauncherSettings, platform: NodeJS.Platform = process.platform): void {
@@ -99,11 +141,19 @@ export async function primaryScreen(platform: NodeJS.Platform, env: NodeJS.Proce
   return SERVER_SCREEN;
 }
 
-/** OMB_BROWSER_LANG, else the POSIX locale a server was started with; "C" and "POSIX" name no language. */
-export function browserLanguage(env: NodeJS.ProcessEnv): string | undefined {
+/** Explicit OMB_BROWSER_LANG, app language, then the POSIX locale; "C" and "POSIX" name no language. */
+export function browserLanguage(env: NodeJS.ProcessEnv, configured?: string): string | undefined {
   const named = env.OMB_BROWSER_LANG?.trim();
-  if (named) return /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/u.test(named) ? named : undefined;
+  if (named && /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/u.test(named)) return named;
+  const app = configured?.trim();
+  if (app && /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/u.test(app)) {
+    try {
+      const canonical = Intl.getCanonicalLocales(app)[0];
+      return canonical?.toLowerCase() === "ko" ? "ko-KR" : canonical;
+    } catch {}
+  }
   const locale = env.LC_ALL?.trim() || env.LC_MESSAGES?.trim() || env.LANG?.trim() || "";
+  if (/^(?:C|POSIX)(?:[.@].*)?$/u.test(locale)) return "en-US";
   const match = /^([a-z]{2,3})(?:_([A-Z]{2}))?(?:[.@]|$)/u.exec(locale);
   return match ? (match[2] ? `${match[1]}-${match[2]}` : match[1]) : undefined;
 }

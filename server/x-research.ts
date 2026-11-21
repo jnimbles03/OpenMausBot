@@ -6,6 +6,7 @@
 // Each job calls the cheapest scraper treg lists for it, with its paging and sort options; when that one is down, it
 // falls back once to treg's routed endpoint, which works through the other scrapers in turn. Scrapers name the same
 // fields differently, so rows are read through short alias lists.
+import { parseXIncludedUsage, type XIncludedUsage } from "../shared/x-connector.ts";
 import type { ServiceCredential } from "./included-services.ts";
 
 /** Posts one call may return. Fifty compact posts stay under the agents
@@ -40,15 +41,16 @@ export const TREG_X_ENDPOINTS = {
   profile: "treg.x.user.profile",
 } as const;
 
-export type XResearchErrorCode = "bad_input" | "bad_key" | "no_credit" | "rate_limited" | "not_found" | "unavailable" | "in_progress";
+/** `off`: research is not on for this account (the plan's relay said so), not a failure a retry fixes. */
+export type XResearchErrorCode = "bad_input" | "bad_key" | "no_credit" | "rate_limited" | "not_found" | "unavailable" | "in_progress" | "off";
 export const TREG_TOP_UP_URL = "https://treg.to";
 
 /** Every sentence a bot or the Settings page can be shown about X research. */
 export const X_MESSAGES = {
-  noKey: "Research isn't set up on this server. Add a treg key in Settings → API keys, or use a paid MausBot Cloud plan.",
+  noKey: "Research isn't set up on this server. Add a treg key in Settings → AI → Other services, or use a paid MausBot Cloud plan.",
   botOff: "Research is off for this bot. Turn it on in this bot's settings under Access.",
   badKey: "Sign in to MausBot Cloud again in Settings to use X research.",
-  ownBadKey: "treg rejected your key. Check it in Settings → API keys.",
+  ownBadKey: "treg rejected your key. Check it in Settings → AI → Other services.",
   /** A Cloud home's relay token is the Admin's to replace; the person has no sign-in to redo there. */
   homeBadKey: "X research isn't connected on this Cloud right now. It comes with your plan, so there is nothing to sign in to: try again later, and tell MausBot support if it keeps happening.",
   noPlan: "X research comes with MausBot Cloud plans, and this account's plan isn't active.",
@@ -57,6 +59,8 @@ export const X_MESSAGES = {
   unavailable: "X research is temporarily unavailable. Try again shortly.",
   postNotFound: "That X post was not found. It may be deleted or private.",
   accountNotFound: (handle: string) => `No X account named @${handle}.`,
+  /** After the relay's sentence that the month's included calls are used up. */
+  addOwnKey: "Add your own treg key to keep going.",
 } as const;
 
 export class XResearchError extends Error {
@@ -294,7 +298,7 @@ export function errorFor(status: number, body: unknown): XResearchError {
   if (status === 429) {
     // The month's allowance: the relay's sentence names the plan, the number and the reset date.
     const said = at(body, "message");
-    return new XResearchError("rate_limited", at(body, "error") === "quota_exceeded" && typeof said === "string" && said.length <= 300 ? said : X_MESSAGES.rateLimited);
+    return new XResearchError("rate_limited", at(body, "error") === "quota_exceeded" && typeof said === "string" && said.length <= 300 ? `${said} ${X_MESSAGES.addOwnKey}` : X_MESSAGES.rateLimited);
   }
   // treg itself is rate-limiting (the relay keeps the call counted): another scraper through the same account would
   // only count against the plan again, so this is no outage to fall back from.
@@ -441,6 +445,8 @@ export function createXRelayClient(options: { url: string; token: string; own?: 
   async function list(endpoint: string, body: Row, opts: ListOptions): Promise<XPostList> {
     const since = opts.sinceId === undefined ? undefined : BigInt(opts.sinceId);
     const posts: XPost[] = [];
+    const postIds = new Set<string>();
+    const cursors = new Set<string>();
     let cursor: string | undefined;
     let more = false;
     for (let page = 0; page < opts.pages; page++) {
@@ -457,11 +463,17 @@ export function createXRelayClient(options: { url: string; token: string; own?: 
           if (opts.newestFirst && index > 0 && at(raw, "isPinned") !== true) reachedSeen = true;
           return;
         }
-        posts.push(post);
+        if (!postIds.has(post.id)) {
+          postIds.add(post.id);
+          posts.push(post);
+        }
       });
       cursor = cursorOf(answer);
       more = Boolean(cursor) && rows.length > 0 && !reachedSeen;
       if (!more || posts.length >= opts.limit) break;
+      // A provider may repeat its cursor; do not pay for the same page again.
+      if (cursor && cursors.has(cursor)) break;
+      if (cursor) cursors.add(cursor);
     }
     if (posts.length > opts.limit) {
       posts.length = opts.limit;
@@ -526,6 +538,24 @@ export function createXRelayClient(options: { url: string; token: string; own?: 
       };
     },
   };
+}
+
+/** This month's included X calls from the plan's relay (`GET <relay>/usage`, no treg call), or null when it can't say:
+ * an own key (treg counts nothing of ours), a relay that refused or doesn't serve it, or an answer of another shape.
+ * Security: the relay token goes only to the relay, as with every call. */
+export async function readIncludedXUsage(credential: ServiceCredential, options: { fetcher?: typeof fetch; timeoutMs?: number } = {}): Promise<XIncludedUsage | null> {
+  if (!credential.included) return null;
+  try {
+    const response = await (options.fetcher ?? fetch)(`${credential.api.replace(/\/+$/, "")}/usage`, {
+      headers: { ...tregAuthHeaders(credential), accept: "application/json" },
+      redirect: "error",
+      signal: AbortSignal.timeout(options.timeoutMs ?? 10_000),
+    });
+    const raw = await readCapped(response);
+    return response.ok ? parseXIncludedUsage(JSON.parse(raw)) : null;
+  } catch {
+    return null;
+  }
 }
 
 /** The X client for a research credential: straight to treg with the person's own key, else through the plan's relay. */

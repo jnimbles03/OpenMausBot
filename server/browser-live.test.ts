@@ -1,7 +1,8 @@
 import { EventEmitter } from "node:events";
-import type { ServerResponse } from "node:http";
+import { createServer, get, type ServerResponse } from "node:http";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { BrowserRuntime } from "./browser-runtime.ts";
+import { HOLD_LIMITS } from "./browser/hold.ts";
 import { BrowserActionFailedError, BrowserLive, browserRestartRefusal, browserStreamPort, normalizeBrowserLiveMessage, parseBrowserLiveAction } from "./browser-live.ts";
 import type { Cdp, CdpListeners } from "./browser-sites.ts";
 
@@ -77,10 +78,12 @@ beforeEach(() => {
     watch: vi.fn(() => () => {}),
     onIdleClose: vi.fn(),
     settled: vi.fn(async () => {}),
+    working: vi.fn(() => true),
     launchReady: vi.fn(async () => {}),
     launched: vi.fn(async () => {}),
+    pageSizes: { resize: vi.fn(async () => {}) },
   } as unknown as BrowserRuntime;
-  live = new BrowserLive({ runtime });
+  live = new BrowserLive({ runtime, engine: { statusReadMs: () => 10_000 } });
   SocketFixture.instances = [];
   SocketFixture.initialMessages = []; SocketFixture.failOpen = false;
   vi.stubGlobal("WebSocket", SocketFixture);
@@ -91,9 +94,9 @@ beforeEach(() => {
 });
 afterEach(() => { live.closeAll(); vi.unstubAllGlobals(); vi.unstubAllEnvs(); vi.useRealTimers(); });
 
-async function open({ botId = "bot-a", session = "profile-a", owner = "admin-a", current = () => true, resume }: { botId?: string; session?: string; owner?: string; current?: () => boolean; resume?: string } = {}) {
+async function open({ botId = "bot-a", session = "profile-a", owner = "admin-a", current = () => true, resume, size, drawsSelects }: { botId?: string; session?: string; owner?: string; current?: () => boolean; resume?: string; size?: { width: number; height: number }; drawsSelects?: boolean } = {}) {
   const res = new ResponseFixture();
-  await live.open({ botId, session, owner, isCurrent: current, res: res as unknown as ServerResponse, ...(resume ? { resume } : {}),
+  await live.open({ botId, session, owner, isCurrent: current, res: res as unknown as ServerResponse, ...(resume ? { resume } : {}), ...(size ? { size } : {}), ...(drawsSelects ? { drawsSelects } : {}),
     spec: { command: "/trusted/agent-browser", args: ["mcp", "--tools", "core"], env: { AGENT_BROWSER_SESSION: session, AGENT_BROWSER_SOCKET_DIR: "/isolated/socket" } } });
   return { res, socket: SocketFixture.instances.at(-1)!, action: (body: unknown) => live.action({ viewerId: res.id, botId, owner, body }) };
 }
@@ -120,10 +123,12 @@ describe("browser viewer protocol boundary", () => {
     expect(normalizeBrowserLiveMessage({ type: "tabs", tabs: [{ tabId: "t1", title: "Page", url: "https://user:secret@example.com/", active: true, targetId: "private" }] })).toEqual({ type: "tabs", tabs: [{ tabId: "t1", title: "Page", url: "https://example.com/", active: true }] });
     expect(normalizeBrowserLiveMessage({ type: "status", connected: true, engine: "private" })).not.toHaveProperty("engine");
   });
-  it("rejects corrupt, oversized and non-image frames", () => {
-    for (const patch of [{ seq: -1 }, { seq: 1.5 }, { data: "<script>" }, { data: "/9j/" + "A".repeat(3 * 1024 * 1024) }, { metadata: { deviceWidth: 100000, deviceHeight: 100000 } }]) {
+  it("rejects corrupt, oversized and non-image frames, and passes a busy page's frame at the largest size it sizes", () => {
+    for (const patch of [{ seq: -1 }, { seq: 1.5 }, { data: "<script>" }, { data: "/9j/" + "A".repeat(4 * 1024 * 1024) }, { metadata: { deviceWidth: 100000, deviceHeight: 100000 } }]) {
       expect(normalizeBrowserLiveMessage({ ...frame, ...patch })).toBeNull();
     }
+    // 2,768,256 characters: a 1280x2560 frame of a page of noise from agent-browser 0.37.0.
+    expect(normalizeBrowserLiveMessage({ ...frame, data: "/9j/" + "A".repeat(2_768_252), metadata: { ...frame.metadata, deviceWidth: 1280, deviceHeight: 2560 } })).toMatchObject({ type: "frame" });
   });
   it("requires a valid integer port from successful stream status, not a caller URL", () => {
     expect(browserStreamPort(ready)).toBe(43210);
@@ -319,40 +324,44 @@ describe("authenticated browser viewer relay", () => {
     await expect(reconnecting).rejects.toThrow("Reconnect to retry");
     expect(nativeClose).toHaveBeenCalledTimes(2);
   });
-  it("gives a headless browser it shows the standard page size, but never sizes an attached or headed one", async () => {
-    const view = (env: Record<string, string>, status = ready) => {
-      execute.mockReset().mockResolvedValueOnce(output(status)).mockResolvedValue(output({}));
-      const res = new ResponseFixture();
-      return live.open({ botId: "a", session: "s", owner: "a", isCurrent: () => true, res: res as unknown as ServerResponse,
-        spec: { command: "/engine", env: { AGENT_BROWSER_SESSION: "s", ...env } } });
-    };
-    await view({ AGENT_BROWSER_HEADLESS: "1" }, { ...ready, connected: false });
-    expect(execute.mock.calls.map((call) => call[1])).toEqual([
-      ["stream", "status", "--json", "--no-webmcp"], ["open", "--json", "--no-webmcp"], ["set", "viewport", "1280", "720", "--json", "--no-webmcp"],
-    ]);
-    expect(execute.mock.calls[2]?.[2]).toMatchObject({ timeout: 5_000 });
-    live.closeAll();
-    await view({ AGENT_BROWSER_HEADLESS: "1" });
-    expect(execute.mock.calls.map((call) => call[1].slice(0, 2))).toEqual([["stream", "status"], ["set", "viewport"]]);
-    live.closeAll();
-    await view({ AGENT_BROWSER_HEADLESS: "1", AGENT_BROWSER_CDP: "http://127.0.0.1:9222" });
-    expect(execute.mock.calls.map((call) => call[1][0])).toEqual(["stream"]);
-    live.closeAll();
-    await view({});
-    expect(execute.mock.calls.map((call) => call[1][0])).toEqual(["stream"]);
+  it("has the page fill the panel of the view that asked last, once the bot's call ends, and the standard page when no view is left", async () => {
+    const resize = vi.mocked(runtime.pageSizes.resize);
+    const first = await open({ size: { width: 400, height: 750 } });
+    expect(resize).toHaveBeenLastCalledWith("profile-a", { width: 400, height: 750 }, true);
+    expect(execute.mock.calls.map((call) => call[1][0])).not.toContain("set");
+    const second = await open({ owner: "admin-b", size: { width: 900, height: 700 } });
+    expect(resize).toHaveBeenLastCalledWith("profile-a", { width: 900, height: 700 }, true);
+    expect(await first.action({ type: "resize", width: 380, height: 760 })).toEqual({ ok: true });
+    expect(resize).toHaveBeenLastCalledWith("profile-a", { width: 380, height: 760 }, false);
+    const calls = resize.mock.calls.length;
+    expect(await first.action({ type: "resize", width: 380, height: 40 })).toEqual({ ok: true });
+    expect(resize).toHaveBeenCalledTimes(calls);
+    await expect(first.action({ type: "resize", width: "wide", height: 760 })).rejects.toThrow("Invalid browser action.");
+    first.res.destroy();
+    expect(resize).toHaveBeenLastCalledWith("profile-a", { width: 900, height: 700 }, false);
+    second.res.destroy();
+    expect(resize).toHaveBeenLastCalledWith("profile-a", null, false);
   });
-  it("still opens the view when sizing the page fails or the session is busy again", async () => {
-    execute.mockReset().mockResolvedValueOnce(output(ready))
-      .mockRejectedValueOnce(Object.assign(new Error("Command failed"), { killed: true, signal: "SIGKILL", code: null }));
-    const res = new ResponseFixture();
-    await live.open({ botId: "a", session: "s", owner: "a", isCurrent: () => true, res: res as unknown as ServerResponse,
-      spec: { command: "/engine", env: { AGENT_BROWSER_SESSION: "s", AGENT_BROWSER_HEADLESS: "1" } } });
+  it("leaves the page of the person holding the browser as it is when another view opens or resizes", async () => {
+    const resize = vi.mocked(runtime.pageSizes.resize);
+    const holder = await open({ size: { width: 1400, height: 900 } });
+    await holder.action({ type: "take" });
+    const other = await open({ owner: "admin-b", size: { width: 400, height: 750 } });
+    expect(resize).toHaveBeenLastCalledWith("profile-a", { width: 1400, height: 900 }, true);
+    await other.action({ type: "resize", width: 420, height: 800 });
+    expect(resize).toHaveBeenLastCalledWith("profile-a", { width: 1400, height: 900 }, true);
+    await holder.action({ type: "resize", width: 1500, height: 900 });
+    expect(resize).toHaveBeenLastCalledWith("profile-a", { width: 1500, height: 900 }, false);
+  });
+  it("still opens the view when sizing the page fails", async () => {
+    vi.mocked(runtime.pageSizes.resize).mockRejectedValue(new Error("engine without viewport"));
+    const { res } = await open({ size: { width: 400, height: 750 } });
     expect(res.id).toBeTruthy();
-    expect(res.events("waiting")).toHaveLength(0);
+    expect(res.events("ready")).toHaveLength(1);
   });
-  it("opens no stream socket when the viewer closes while the page is being sized", async () => {
+  it("opens no stream socket when the viewer closes while the browser is still starting", async () => {
     let finish!: (value: ReturnType<typeof output>) => void;
-    execute.mockReset().mockResolvedValueOnce(output(ready)).mockImplementationOnce(() => new Promise((resolve) => finish = resolve));
+    execute.mockReset().mockResolvedValueOnce(output({ ...ready, connected: false })).mockImplementationOnce(() => new Promise((resolve) => finish = resolve));
     const res = new ResponseFixture();
     const opening = live.open({ botId: "a", session: "s", owner: "a", isCurrent: () => true, res: res as unknown as ServerResponse,
       spec: { command: "/engine", env: { AGENT_BROWSER_SESSION: "s", AGENT_BROWSER_HEADLESS: "1" } } });
@@ -466,14 +475,15 @@ describe("authenticated browser viewer relay", () => {
   ])("refuses a batch with %s", (_name, events) => {
     expect(() => parseBrowserLiveAction({ type: "input_batch", events })).toThrow("Invalid browser action.");
   });
-  it("requires a viewer-specific human lease and releases only its own control on disconnect", async () => {
-    const a = await open(); const b = await open({ botId: "bot-b" });
+  it("requires the person's own human lease and releases only theirs on disconnect", async () => {
+    const a = await open(); const b = await open({ botId: "bot-b", owner: "admin-b" });
     await expect(a.action({ type: "navigate", url: "https://example.com" })).rejects.toThrow("Browser control changed");
     await a.action({ type: "take" });
     await expect(b.action({ type: "take" })).rejects.toThrow("Another window or device controls this browser. Hand control back there");
     await expect(b.action({ type: "back" })).rejects.toThrow("Another window or device controls this browser");
+    await b.action({ type: "release" });
     b.socket.close();
-    expect(held.get("profile-a")).toBe(a.res.id);
+    expect(held.get("profile-a")).toBe("admin-a");
     await a.action({ type: "input_keyboard", eventType: "keyDown", key: "a", text: "a" });
     expect(nativeInput.mock.calls[0]?.[0]).toBe("http://127.0.0.1:43210/api/command");
     expect(nativeInput.mock.calls[0]?.[1]).toMatchObject({ method: "POST", redirect: "error", headers: { Origin: "http://127.0.0.1:43210" } });
@@ -482,8 +492,8 @@ describe("authenticated browser viewer relay", () => {
     a.socket.close(); expect(held.has("profile-a")).toBe(false);
     expect(execute).toHaveBeenCalledTimes(2); // No close command: logins/browser survive viewers.
   });
-  it("withholds login frames/tabs/URLs from other views, advances their upstream ACK and restores the newest frame on release", async () => {
-    const a = await open(); const b = await open({ botId: "bot-b" });
+  it("withholds login frames/tabs/URLs from another person's views, advances their upstream ACK and restores the newest frame on release", async () => {
+    const a = await open(); const b = await open({ botId: "bot-b", owner: "admin-b" });
     await a.action({ type: "take" });
     a.socket.receive(frame); b.socket.receive(frame);
     b.socket.receive({ type: "url", url: "https://private.example/login" });
@@ -524,7 +534,8 @@ describe("authenticated browser viewer relay", () => {
     live.closeForBot("bot-a");
     expect(a.res.writableEnded).toBe(true);
     expect(b.res.writableEnded).toBe(false);
-    expect(held.get("profile-a")).toBe(b.res.id);
+    expect(held.get("profile-a")).toBe("admin-a");
+    expect(b.res.events("control").at(-1)).toEqual({ held: true, owned: true, controlling: true });
   });
   it("sends a typed password to the page only: never logged, echoed or sent to another view", async () => {
     const secret = "hunter2-correct-horse";
@@ -545,14 +556,14 @@ describe("authenticated browser viewer relay", () => {
     const a = await open(); const b = await open({ botId: "bot-b" });
     await a.action({ type: "take" });
     live.handBack("profile-b");
-    expect(held.get("profile-a")).toBe(a.res.id);
+    expect(held.get("profile-a")).toBe("admin-a");
     live.handBack("profile-a");
     expect(held.has("profile-a")).toBe(false);
     expect(a.res.events("control").at(-1)).toEqual({ held: false, owned: false, controlling: false });
     expect(b.res.events("control").at(-1)).toEqual({ held: false, owned: false, controlling: false });
     expect(a.res.writableEnded).toBe(false);
     await a.action({ type: "take" });
-    expect(held.get("profile-a")).toBe(a.res.id);
+    expect(held.get("profile-a")).toBe("admin-a");
   });
   it("inserts pasted text literally and preserves modifier shortcuts via native acknowledged actions", async () => {
     const a = await open(); await a.action({ type: "take" });
@@ -748,7 +759,7 @@ describe("authenticated browser viewer relay", () => {
   });
   describe("the page's own dialogs", () => {
     const URL = "ws://127.0.0.1:9222/devtools/browser/abc-123";
-    function devTools() {
+    function devTools(reply: (method: string, params?: Record<string, unknown>) => Record<string, unknown> = () => ({})) {
       const sent: Array<{ method: string; params?: Record<string, unknown>; sessionId?: string }> = [];
       let listeners: CdpListeners = {};
       let answered!: () => void;
@@ -757,7 +768,7 @@ describe("authenticated browser viewer relay", () => {
         send: vi.fn(async (method: string, params?: Record<string, unknown>, sessionId?: string) => {
           sent.push({ method, params, sessionId });
           if (method === "Page.handleJavaScriptDialog") { answered(); listeners.event?.({ method: "Page.javascriptDialogClosed", params: {}, sessionId }); }
-          return {};
+          return reply(method, params);
         }),
         close: vi.fn(),
       };
@@ -771,7 +782,7 @@ describe("authenticated browser viewer relay", () => {
     it("shows the page's question to the view holding the browser, not to another, and its answer lets the input it held through", async () => {
       const tools = devTools();
       live = new BrowserLive({ runtime, devTools: { url: tools.url, connect: tools.connect } });
-      const a = await open(); const b = await open({ botId: "bot-b" });
+      const a = await open(); const b = await open({ botId: "bot-b", owner: "admin-b" });
       expect(tools.connect).toHaveBeenCalledOnce();
       expect(tools.connect.mock.calls[0]![0]).toBe(URL);
       expect(tools.sent[0]).toMatchObject({ method: "Target.setAutoAttach", params: { autoAttach: true, flatten: true } });
@@ -821,6 +832,120 @@ describe("authenticated browser viewer relay", () => {
       expect(tools.cdp.close).not.toHaveBeenCalled();
       b.socket.close();
       expect(tools.cdp.close).toHaveBeenCalledOnce();
+    });
+
+    /** A view of a page its DevTools client is attached to, shown as the active tab. */
+    async function attachedView(tools: ReturnType<typeof devTools>, drawsSelects = true) {
+      live = new BrowserLive({ runtime, devTools: { url: tools.url, connect: tools.connect } });
+      const a = await open({ drawsSelects });
+      tools.emit("Target.attachedToTarget", { sessionId: "page-1", targetInfo: { type: "page", targetId: "TARGET-1" } });
+      a.socket.receive({ type: "tabs", tabs: [{ tabId: "t1", targetId: "TARGET-1", title: "Page", url: "https://example.com/", active: true }] });
+      await a.action({ type: "take" });
+      return a;
+    }
+    const keyEvents = (tools: ReturnType<typeof devTools>) => tools.sent.filter((call) => call.method === "Input.dispatchKeyEvent").map((call) => ({ ...call.params, sessionId: call.sessionId }) as Record<string, unknown>);
+
+    it("sends a person's keys to the page with their key code, modifiers and location, each one confirmed", async () => {
+      const tools = devTools();
+      const a = await attachedView(tools);
+      nativeInput.mockClear();
+      await a.action({ type: "input_keyboard", eventType: "keyDown", key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16, modifiers: 8 });
+      await a.action({ type: "input_keyboard", eventType: "keyDown", key: "Z", code: "KeyZ", windowsVirtualKeyCode: 90, modifiers: 8, text: "Z" });
+      await a.action({ type: "input_keyboard", eventType: "keyUp", key: "Z", code: "KeyZ", windowsVirtualKeyCode: 90, modifiers: 8 });
+      await a.action({ type: "input_keyboard", eventType: "keyUp", key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16 });
+      await a.action({ type: "input_keyboard", eventType: "keyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2 });
+      await a.action({ type: "input_keyboard", eventType: "keyDown", key: "F2", code: "F2", windowsVirtualKeyCode: 113 });
+      expect(keyEvents(tools)).toEqual([
+        { type: "rawKeyDown", key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16, modifiers: 8, location: 1, sessionId: "page-1" },
+        { type: "keyDown", key: "Z", code: "KeyZ", windowsVirtualKeyCode: 90, modifiers: 8, text: "Z", unmodifiedText: "Z", sessionId: "page-1" },
+        { type: "keyUp", key: "Z", code: "KeyZ", windowsVirtualKeyCode: 90, modifiers: 8, sessionId: "page-1" },
+        { type: "keyUp", key: "Shift", code: "ShiftLeft", windowsVirtualKeyCode: 16, modifiers: 0, location: 1, sessionId: "page-1" },
+        // A shortcut is pressed and let go at once, as macOS sends no key-up under Cmd.
+        { type: "rawKeyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2, sessionId: "page-1" },
+        { type: "keyUp", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, modifiers: 2, sessionId: "page-1" },
+        { type: "rawKeyDown", key: "F2", code: "F2", windowsVirtualKeyCode: 113, modifiers: 0, sessionId: "page-1" },
+      ]);
+      expect(nativeInput).not.toHaveBeenCalled();
+      await a.action({ type: "input_keyboard", eventType: "keyUp", key: "F2", code: "F2", windowsVirtualKeyCode: 113 });
+      expect(keyEvents(tools).at(-1)).toMatchObject({ type: "keyUp", key: "F2", code: "F2", windowsVirtualKeyCode: 113 });
+      await a.action({ type: "release" });
+      expect(runtime.abandonHumanInput).not.toHaveBeenCalled();
+    });
+
+    it("gives a key an older view sent without its code the code a page reads, and sends one it cannot name through the engine", async () => {
+      const tools = devTools();
+      const a = await attachedView(tools);
+      nativeInput.mockClear();
+      await a.action({ type: "input_keyboard", eventType: "keyDown", key: "Enter", code: "Enter" });
+      await a.action({ type: "input_keyboard", eventType: "keyDown", key: "F7", code: "F7" });
+      expect(keyEvents(tools)).toEqual([
+        { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, modifiers: 0, text: "\r", unmodifiedText: "\r", sessionId: "page-1" },
+        { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, modifiers: 0, sessionId: "page-1" },
+      ]);
+      expect(nativeInput.mock.calls.map(([, options]) => JSON.parse(options.body))).toEqual([{ action: "input_keyboard", type: "keyDown", key: "F7", code: "F7" }]);
+    });
+
+    it("sends keys through the engine when the active tab is not one its DevTools client is attached to", async () => {
+      const tools = devTools();
+      const a = await attachedView(tools);
+      a.socket.receive({ type: "tabs", tabs: [{ tabId: "t2", targetId: "TARGET-2", title: "New", url: "about:blank", active: true }] });
+      nativeInput.mockClear();
+      await a.action({ type: "input_keyboard", eventType: "keyDown", key: "a", code: "KeyA", windowsVirtualKeyCode: 65, text: "a" });
+      expect(keyEvents(tools)).toEqual([]);
+      expect(nativeInput.mock.calls.map(([, options]) => JSON.parse(options.body))).toEqual([{ action: "input_keyboard", type: "keyDown", key: "a", code: "KeyA", text: "a" }]);
+    });
+
+    it("draws a dropdown list for a press on one, keeps that press and its release from the page, and applies the option chosen", async () => {
+      let selected = 0;
+      const tools = devTools((method, params) => {
+        if (method === "Page.getFrameTree") return { frameTree: { frame: { id: "FRAME-1" } } };
+        if (method === "Page.createIsolatedWorld") return { executionContextId: 7 };
+        if (method !== "Runtime.evaluate") return {};
+        const script = String(params?.expression);
+        if (script.includes("getBoundingClientRect")) return { result: { value: { options: [{ label: "Alpha", disabled: false }, { label: "Beta", disabled: false }], selectedIndex: 0, rect: { x: 40, y: 160, width: 200, height: 30 } } } };
+        if (script.includes("startsWith(label)")) return { result: { value: "Beta" } };
+        if (script.includes("dispatchEvent")) return { result: { value: true } };
+        selected = 1;
+        return { result: { value: selected } };
+      });
+      const a = await attachedView(tools);
+      nativeInput.mockClear();
+      await a.action({ type: "input_mouse", eventType: "mouseMoved", x: 140, y: 175, button: "none" });
+      await a.action({ type: "input_mouse", eventType: "mousePressed", x: 140, y: 175, button: "left", clickCount: 1 });
+      await a.action({ type: "input_mouse", eventType: "mouseReleased", x: 140, y: 175, button: "left", clickCount: 1 });
+      expect(nativeInput.mock.calls.map(([, options]) => JSON.parse(options.body).type)).toEqual(["mouseMoved"]);
+      const [popup] = a.res.events("selectPopup");
+      expect(popup).toMatchObject({ options: [{ label: "Alpha" }, { label: "Beta" }], selectedIndex: 0, rect: { x: 40, y: 160, width: 200, height: 30 } });
+      expect(tools.sent.filter((call) => call.method === "Runtime.evaluate").every((call) => call.params?.contextId === 7 && call.sessionId === "page-1")).toBe(true);
+      await expect(a.action({ type: "select_choose", id: "another", index: 1 })).resolves.toMatchObject({ notice: expect.any(String) });
+      await a.action({ type: "input_mouse", eventType: "mousePressed", x: 140, y: 175, button: "left", clickCount: 1 });
+      const again = a.res.events("selectPopup").at(-1);
+      expect(again.id).not.toBe(popup.id);
+      await expect(a.action({ type: "select_choose", id: again.id, index: 1 })).resolves.toEqual({ ok: true });
+      expect(keyEvents(tools).map((event) => `${event.type}:${event.key}`)).toEqual(["keyDown:B", "keyUp:B", "keyDown:e", "keyUp:e", "keyDown:t", "keyUp:t", "keyDown:a", "keyUp:a"]);
+      expect(selected).toBe(1);
+      // The list is chosen from once.
+      await expect(a.action({ type: "select_choose", id: again.id, index: 0 })).resolves.toMatchObject({ notice: expect.any(String) });
+    });
+
+    it("leaves a press on a dropdown list to the page for a view that does not draw lists, as an older phone app's", async () => {
+      const tools = devTools((method) => method === "Page.getFrameTree" ? { frameTree: { frame: { id: "FRAME-1" } } } : method === "Page.createIsolatedWorld" ? { executionContextId: 7 } : method === "Runtime.evaluate" ? { result: { value: { options: [{ label: "Alpha", disabled: false }], selectedIndex: 0, rect: { x: 0, y: 0, width: 9, height: 9 } } } } : {});
+      const a = await attachedView(tools, false);
+      nativeInput.mockClear();
+      await a.action({ type: "input_mouse", eventType: "mousePressed", x: 5, y: 5, button: "left", clickCount: 1 });
+      expect(nativeInput.mock.calls.map(([, options]) => JSON.parse(options.body).type)).toEqual(["mousePressed"]);
+      expect(a.res.events("selectPopup")).toEqual([]);
+      expect(tools.sent.some((call) => call.method === "Runtime.evaluate")).toBe(false);
+    });
+
+    it("lets a press that is not on a dropdown list through to the page", async () => {
+      const tools = devTools((method) => method === "Page.getFrameTree" ? { frameTree: { frame: { id: "FRAME-1" } } } : method === "Page.createIsolatedWorld" ? { executionContextId: 7 } : method === "Runtime.evaluate" ? { result: { value: null } } : {});
+      const a = await attachedView(tools);
+      nativeInput.mockClear();
+      await a.action({ type: "input_mouse", eventType: "mousePressed", x: 10, y: 10, button: "left", clickCount: 1 });
+      await a.action({ type: "input_mouse", eventType: "mouseReleased", x: 10, y: 10, button: "left", clickCount: 1 });
+      expect(nativeInput.mock.calls.map(([, options]) => JSON.parse(options.body).type)).toEqual(["mousePressed", "mouseReleased"]);
+      expect(a.res.events("selectPopup")).toEqual([]);
     });
 
     it("never connects to a DevTools address off this machine", async () => {
@@ -914,13 +1039,13 @@ describe("authenticated browser viewer relay", () => {
   });
   it("does not clear uncertain input or other owners when native restart fails", async () => {
     runtime = new BrowserRuntime(); live = new BrowserLive({ runtime });
-    const a = await open(); const b = await open({ botId: "bot-b" });
+    const a = await open(); const b = await open({ botId: "bot-b", owner: "admin-b" });
     await a.action({ type: "take" });
     await expect(b.action({ type: "restart" })).rejects.toThrow("could not restart");
     nativeClose.mockResolvedValueOnce(false);
     await expect(a.action({ type: "restart" })).rejects.toThrow("could not restart");
-    expect(runtime.heldBy("profile-a")).toBe(a.res.id);
-    expect(runtime.canControl("profile-a", a.res.id)).toBe(false);
+    expect(runtime.heldBy("profile-a")).toBe("admin-a");
+    expect(runtime.canControl("profile-a", "admin-a")).toBe(false);
     await expect(runtime.withAgentAction("profile-a", async () => true)).rejects.toThrow();
     await a.action({ type: "restart" });
     await expect(runtime.withAgentAction("profile-a", async () => true)).resolves.toBe(true);
@@ -946,6 +1071,16 @@ describe("a person's view whose stream drops while they hold the browser", () =>
     await b.action({ type: "release" });
     await expect(botWorks()).resolves.toBe(true);
     expect(runtime.interrupted("profile-a")).toBe(false);
+  });
+
+  it("gives the hold to the same person's next view, which can hand it back, though it never named the view that dropped", async () => {
+    const phone = await open(); await phone.action({ type: "take" });
+    // The phone leaves the browser, or the app is closed: its stream ends.
+    phone.res.destroy();
+    const reopened = await open();
+    expect(reopened.res.events("control").at(-1)).toEqual({ held: true, owned: true, controlling: true });
+    await reopened.action({ type: "release" });
+    await expect(botWorks()).resolves.toBe(true);
   });
 
   it("lets go of a key and button it held in the page instead of asking for a restart", async () => {
@@ -1023,16 +1158,18 @@ describe("a person's view whose stream drops while they hold the browser", () =>
     await expect(botWorks()).resolves.toBe(true);
   });
 
-  it("gives the hold to no other view, and lets the same person take it back with an explicit take", async () => {
+  it("gives the hold to no other person, even one naming the view that dropped", async () => {
     const a = await open(); await a.action({ type: "take" });
     a.res.destroy();
     const stranger = await open({ owner: "other", resume: a.res.id });
     expect(stranger.res.events("control").at(-1)).toEqual({ held: true, owned: false, controlling: false });
     await expect(stranger.action({ type: "take" })).rejects.toThrow("Another window or device controls this browser");
+    await expect(stranger.action({ type: "release" })).resolves.toEqual({ ok: true });
+    await expect(botWorks()).rejects.toThrow("paused while a person controls");
     const reloaded = await open({ botId: "bot-a" });
-    expect(reloaded.res.events("control").at(-1)).toEqual({ held: true, owned: false, controlling: false });
+    expect(reloaded.res.events("control").at(-1)).toEqual({ held: true, owned: true, controlling: true });
     await expect(reloaded.action({ type: "take" })).resolves.toEqual({ ok: true, waited: false });
-    expect(runtime.canControl("profile-a", reloaded.res.id)).toBe(true);
+    expect(runtime.canControl("profile-a", "admin-a")).toBe(true);
   });
 
   it("does not keep a hold for a view closed on purpose: a revoked owner, a deleted profile, a changed session", async () => {
@@ -1048,6 +1185,68 @@ describe("a person's view whose stream drops while they hold the browser", () =>
     c.res.destroy();
     live.closeForSession("profile-a");
     await expect.poll(() => runtime.heldBy("profile-a")).toBeNull();
+  });
+});
+
+describe("one person's hold, across their views and devices", () => {
+  const bodies = () => nativeInput.mock.calls.map(([, init]) => JSON.parse(init.body));
+  const botWorks = () => runtime.withAgentAction("profile-a", async () => true);
+  const control = (view: { res: ResponseFixture }) => view.res.events("control").at(-1);
+  beforeEach(() => { runtime = new BrowserRuntime(); live = new BrowserLive({ runtime }); });
+
+  it("lets their other view see the hold, take it over and hand it back while the first is still open", async () => {
+    const phone = await open(); await phone.action({ type: "take" });
+    const laptop = await open({ botId: "bot-b" });
+    expect(control(laptop)).toEqual({ held: true, owned: true, controlling: false });
+    await expect(laptop.action({ type: "input_keyboard", eventType: "char", text: "x" })).rejects.toThrow("Browser control changed");
+    expect(await laptop.action({ type: "take" })).toEqual({ ok: true, waited: false });
+    expect(control(laptop)).toEqual({ held: true, owned: true, controlling: true });
+    expect(control(phone)).toEqual({ held: true, owned: true, controlling: false });
+    await expect(phone.action({ type: "input_keyboard", eventType: "char", text: "y" })).rejects.toThrow("Browser control changed");
+    await expect(botWorks()).rejects.toThrow("paused while a person controls");
+    await phone.action({ type: "release" });
+    expect(runtime.heldBy("profile-a")).toBeNull();
+    expect(control(laptop)).toEqual({ held: false, owned: false, controlling: false });
+    await expect(botWorks()).resolves.toBe(true);
+  });
+
+  it("lets go of what the view it was taken from pressed before the new one types", async () => {
+    const phone = await open(); await phone.action({ type: "take" });
+    await phone.action({ type: "input_keyboard", eventType: "keyDown", key: "Shift", code: "ShiftLeft", modifiers: 8 });
+    const laptop = await open({ botId: "bot-b" });
+    nativeInput.mockClear();
+    await laptop.action({ type: "take" });
+    await laptop.action({ type: "input_keyboard", eventType: "char", text: "a" });
+    expect(bodies()).toEqual([
+      { action: "input_keyboard", type: "keyUp", key: "Shift", code: "ShiftLeft" },
+      { action: "keyboard", subaction: "insertText", text: "a" },
+    ]);
+    expect(runtime.interrupted("profile-a")).toBe(false);
+  });
+
+  it("ends a hold its person stopped using, kept or not, while every key they type keeps it", async () => {
+    vi.useFakeTimers();
+    // A view the person left open, whose stream the server never sees end.
+    const phone = await open(); await phone.action({ type: "take" });
+    await vi.advanceTimersByTimeAsync(HOLD_LIMITS.idleMs - 10_000);
+    await phone.action({ type: "input_keyboard", eventType: "char", text: "still typing" });
+    await vi.advanceTimersByTimeAsync(HOLD_LIMITS.idleMs - 10_000);
+    expect(runtime.heldBy("profile-a")).toBe("admin-a");
+    await expect(botWorks()).rejects.toThrow("paused while a person controls");
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(runtime.heldBy("profile-a")).toBeNull();
+    expect(control(phone)).toEqual({ held: false, owned: false, controlling: false });
+    await expect(botWorks()).resolves.toBe(true);
+  });
+
+  it("still refuses another person, from any view", async () => {
+    const phone = await open(); await phone.action({ type: "take" });
+    phone.res.destroy();
+    const someoneElse = await open({ owner: "admin-b" });
+    expect(control(someoneElse)).toEqual({ held: true, owned: false, controlling: false });
+    await expect(someoneElse.action({ type: "take" })).rejects.toThrow("Another window or device controls this browser");
+    await someoneElse.action({ type: "release" });
+    await expect(botWorks()).rejects.toThrow("paused while a person controls");
   });
 });
 
@@ -1079,6 +1278,110 @@ describe("opening a view while the bot holds the browser", () => {
     expect(execute.mock.calls[0]?.[2]).toMatchObject({ timeout: 10_000, killSignal: "SIGKILL" });
   });
 
+  it("resets an engine whose process is gone, says so, and reconnects to a fresh session", async () => {
+    live = new BrowserLive({ runtime, engine: { alive: () => false } });
+    vi.mocked(runtime.working).mockReturnValue(false);
+    execute.mockRejectedValueOnce(busy());
+    const { res, opening } = start();
+    await opening;
+    expect(res.events("waiting")).toHaveLength(0);
+    expect(res.events("error")).toEqual([{ retryable: true, message: "The browser stopped responding, so it is being restarted. The live view reconnects by itself.", errorKey: "serverError.browser.restartingUnresponsive" }]);
+    expect(nativeClose).toHaveBeenCalledTimes(1);
+    expect(nativeClose).toHaveBeenCalledWith("/engine", expect.objectContaining({ AGENT_BROWSER_SESSION: "profile-a" }));
+    // The next view waits for that reset, then meets the fresh session.
+    const again = start();
+    await again.opening;
+    expect(again.res.events("ready")).toHaveLength(1);
+    expect(nativeClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("carries the restart error code and original English over an isolated HTTP event stream", async () => {
+    live = new BrowserLive({ runtime, engine: { alive: () => false } });
+    vi.mocked(runtime.working).mockReturnValue(false);
+    execute.mockRejectedValueOnce(busy());
+    const server = createServer((_req, res) => {
+      void live.open({ botId: "bot-a", session: "profile-a", owner: "admin-a", isCurrent: () => true, res,
+        spec: { command: "/engine", env: { AGENT_BROWSER_SESSION: "profile-a" } } })
+        .catch(error => res.destroy(error instanceof Error ? error : new Error(String(error))));
+    });
+    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const address = server.address();
+      if (!address || typeof address === "string") throw new Error("The isolated SSE fixture has no TCP address");
+      const received = await new Promise<{ status?: number; contentType?: string; body: string }>((resolve, reject) => {
+        const request = get(`http://127.0.0.1:${address.port}/`, response => {
+          let body = "";
+          response.setEncoding("utf8");
+          response.on("data", chunk => { body += chunk; });
+          response.on("error", reject);
+          response.on("end", () => resolve({ status: response.statusCode, contentType: response.headers["content-type"], body }));
+        });
+        request.on("error", reject);
+        request.setTimeout(5_000, () => request.destroy(new Error("The isolated SSE fixture timed out")));
+      });
+      expect(received).toEqual({ status: 200, contentType: "text/event-stream", body: `event: error\ndata: ${JSON.stringify({
+        retryable: true,
+        message: "The browser stopped responding, so it is being restarted. The live view reconnects by itself.",
+        errorKey: "serverError.browser.restartingUnresponsive",
+      })}\n\n` });
+      expect(nativeClose).toHaveBeenCalledOnce();
+    } finally {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+  });
+
+  it("waits for an engine still starting on a slow machine, as starting, not as a busy bot, and resets nothing", async () => {
+    vi.useFakeTimers();
+    live = new BrowserLive({ runtime, engine: { alive: () => true, now: () => Date.now(), statusReadMs: () => 10_000 } });
+    vi.mocked(runtime.working).mockReturnValue(false);
+    execute.mockRejectedValueOnce(busy()).mockRejectedValueOnce(busy()).mockResolvedValue(output(ready));
+    const { res, opening } = start();
+    await vi.advanceTimersByTimeAsync(5_000);
+    await opening;
+    expect(res.events("waiting")).toEqual([{ reason: "starting" }, { reason: "starting" }]);
+    expect(res.events("ready")).toHaveLength(1);
+    expect(res.events("error")).toEqual([]);
+    expect(nativeClose).not.toHaveBeenCalled();
+  });
+
+  it("resets an engine that leaves status reads unanswered for minutes, alive or not, unless a person holds the browser", async () => {
+    vi.useFakeTimers();
+    let now = 0;
+    live = new BrowserLive({ runtime, engine: { alive: () => true, now: () => now, statusReadMs: () => 10_000 } });
+    vi.mocked(runtime.working).mockReturnValue(false);
+    execute.mockImplementation(async () => { now += 10_000; throw busy(); });
+    const { res, opening } = start();
+    await vi.advanceTimersByTimeAsync(200_000);
+    await opening;
+    // Some 18 reads of 10 s each: three minutes of an engine that never answered.
+    expect(now).toBeGreaterThanOrEqual(180_000);
+    expect(res.events("waiting").length).toBeGreaterThan(10);
+    expect(res.events("error")).toEqual([expect.objectContaining({ errorKey: "serverError.browser.restartingUnresponsive" })]);
+    expect(nativeClose).toHaveBeenCalledOnce();
+    // Held by a person, a silent engine is never reset under them.
+    nativeClose.mockClear();
+    held.set("profile-a", "admin-b");
+    now = 0;
+    live = new BrowserLive({ runtime, engine: { alive: () => true, now: () => now, statusReadMs: () => 10_000 } });
+    const again = start();
+    await vi.advanceTimersByTimeAsync(200_000);
+    expect(again.res.events("error")).toEqual([]);
+    expect(nativeClose).not.toHaveBeenCalled();
+    again.res.destroy();
+    await vi.advanceTimersByTimeAsync(10_000);
+  });
+
+  it("keeps waiting, and resets nothing, while a bot call still works in the browser", async () => {
+    vi.useFakeTimers();
+    execute.mockRejectedValueOnce(busy()).mockResolvedValue(output(ready));
+    const { res, opening } = start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await opening;
+    expect(types(res).slice(0, 2)).toEqual(["waiting", "ready"]);
+    expect(nativeClose).not.toHaveBeenCalled();
+  });
+
   it("does not show a peer's control changes before it is ready", async () => {
     vi.useFakeTimers();
     const a = await open();
@@ -1089,7 +1392,8 @@ describe("opening a view while the bot holds the browser", () => {
     expect(res.events("control")).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(1_000);
     await opening;
-    expect(res.events("control").at(-1)).toMatchObject({ held: true, owned: false });
+    // The same person's other view has their hold: this one watches it, and may take it over or hand it back.
+    expect(res.events("control").at(-1)).toEqual({ held: true, owned: true, controlling: false });
   });
 
   it("stops waiting, and stops asking the browser, when the viewer leaves", async () => {

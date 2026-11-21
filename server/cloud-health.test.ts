@@ -1,9 +1,9 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { failedTurnTool } from "../shared/failed-turn.ts";
 import type { PlaceRow } from "../shared/place-view.ts";
 import { TRIAL_CREDIT_REFUSED } from "../shared/trial-credit.ts";
@@ -12,6 +12,8 @@ import { CLOUD_HEALTH_MAX_BYTES, HEALTH_BUCKET_CAP, createCloudHealth, createClo
 import { DATA_DIR, EVENTS_DIR } from "./config.ts";
 import { memoryStallText, memoryStopText } from "./engine-memory.ts";
 import type { RuntimeEvent } from "./contracts.ts";
+import { doctorAtStart } from "./doctor/start.ts";
+import { toolFailureMessage } from "./drivers/tool-failure.ts";
 import { createCloudSignedRoutes } from "./routes/cloud-signed.ts";
 import { SessionRegistry } from "./sessions.ts";
 import { Store } from "./store.ts";
@@ -47,6 +49,48 @@ function world(overrides: Partial<CloudHealthDeps> = {}) {
 
 const incidents = (w: ReturnType<typeof world>, after?: string) => w.health.report(after).incidents.map(({ kind, code, engine, count }) => ({ kind, code, engine, count }));
 const place = (state: PlaceRow["state"]): PlaceRow => ({ state, params: { bot: "Tallyspoon Ops", cause: "Boat said: quota exceeded for ada@example.test." }, source: "works-on" });
+
+describe("a Cloud home's memory pressure in its health report", () => {
+  it("carries the last day's counts where the home watches memory, and null where it does not", () => {
+    expect(world().health.report(undefined)).toMatchObject({ room: null });
+    const room = { waits: 3, waitMs: 360_000, stopped: 1, killed: 2, stallMinutes: 4 };
+    expect(world({ room: () => room }).health.report(undefined)).toMatchObject({ room });
+  });
+});
+
+describe("the doctor in a Cloud home's health report", () => {
+  it("carries the check ids and counts of this version's first start, and null before it ran", () => {
+    expect(world().health.report(undefined)).toMatchObject({ doctor: null });
+    writeFileSync(join(DATA_DIR, `config.json.31337.${"0b4d8f7a-3c2e-4f1a-9b6d-5e7c8a9f0d1e"}.tmp`), "{}");
+    doctorAtStart(DATA_DIR, "0.1.120", { now: () => START, pidAlive: () => false, log: () => {} });
+    const { doctor } = world().health.report(undefined);
+    expect(doctor).toMatchObject({ at: START, version: "0.1.120", fixed: expect.arrayContaining(["temp-files"]), problems: [], thisStart: true });
+    expect(JSON.stringify(doctor)).not.toContain(DATA_DIR);
+  });
+});
+
+describe("a Cloud home's speed in its health report", () => {
+  it("times a person's message to its engine's turn through the store and the bus, in a few numbers and fixed buckets", () => {
+    const w = world();
+    w.store.appendMessage(w.bot.threadId, { role: "user", kind: "text", text: "Sort my inbox, Tallyspoon", at: w.now() });
+    w.advance(700);
+    w.emit(w.bot.threadId, { type: "turn.started" });
+    const { speed } = w.health.report(undefined);
+    expect(speed).toMatchObject({ bootMs: null, wakeMs: null, turnStarts: [0, 1, 0, 0, 0, 0] });
+    expect(Object.keys(speed).sort()).toEqual(["bootMs", "psi", "steal", "turnStarts", "wakeMs", "windowS"]);
+    expect(JSON.stringify(speed)).not.toMatch(/Tallyspoon|inbox/);
+    expect(JSON.stringify(speed).length).toBeLessThan(200);
+  });
+});
+
+describe("a new Cloud's first hour in its health report", () => {
+  it("carries the milestones and the Chief's counts, and null where there are none", () => {
+    expect(world().health.report(undefined)).toMatchObject({ firstHour: null, value: null });
+    const firstHour = { startedAt: START, ms: { firstMessage: 40_000, firstApp: 95_000 }, apps: ["gmail" as const] };
+    const value = { sorted: 3, drafted: 1, prepped: 0, routines: 0, minutes: 8 };
+    expect(world({ firstHour: () => ({ firstHour, value }) }).health.report(undefined)).toMatchObject({ firstHour, value });
+  });
+});
 
 describe("the failure code a Cloud home reports", () => {
   it("names a place that could not be used by its state", () => {
@@ -84,6 +128,14 @@ describe("the failure code a Cloud home reports", () => {
     ]);
   });
 
+  it("files a turn a failed tool call stopped under tool_error, not unknown", () => {
+    const w = world();
+    w.emit(w.bot.threadId, { type: "turn.started" }, "openai-compat");
+    w.fail(toolFailureMessage(["composio_CLARITY_GET_INSIGHTS"], []));
+    w.emit(w.bot.threadId, { type: "turn.completed", ok: false, stopReason: "tool_error" }, "openai-compat");
+    expect(incidents(w)).toEqual([{ kind: "turn", code: "tool_error", engine: "openai-compat", count: 1 }]);
+  });
+
   it("files a row whose turn never reports a stop under its own class once it has waited", () => {
     const w = world();
     w.emit(w.bot.threadId, { type: "turn.started" });
@@ -100,14 +152,15 @@ describe("the failure code a Cloud home reports", () => {
     w.fail("this thread could not start — the engine is not installed");
     w.fail("queued message could not start — the engine is not installed");
     w.fail(TRIAL_CREDIT_REFUSED.used_up);
-    w.fail(`${memoryStopText(5)} (opencodeGo exited null before the prompt result)`);
+    w.fail(`${memoryStopText(false)} (opencodeGo exited null before the prompt result)`);
     w.fail(memoryStallText("no activity for 20 minutes — the turn was stopped", 1));
+    w.fail(memoryStopText(true));
     expect(incidents(w)).toEqual([
       { kind: "turn", code: "stalled", engine: null, count: 1 },
       { kind: "turn", code: "restart", engine: null, count: 1 },
       { kind: "turn", code: "could_not_start", engine: null, count: 2 },
       { kind: "turn", code: "trial_used_up", engine: null, count: 1 },
-      { kind: "turn", code: "out_of_memory", engine: null, count: 2 },
+      { kind: "turn", code: "out_of_memory", engine: null, count: 3 },
     ]);
   });
 
@@ -169,13 +222,23 @@ describe("the ledger", () => {
     expect(w.health.report(null).turns).toEqual({ started15m: 0, failed15m: 0, started24h: 0, failed24h: 0 });
   });
 
-  it("follows each routine's last outcome and its failures in a row", () => {
-    const w = world();
-    const run = (id: string, status: "completed" | "failed" | "missed" | "running") => w.health.noteRoutineRun({ id, routineId: "routine-1", status, finishedAt: w.now() });
-    run("r1", "failed"); run("r1", "failed"); run("r2", "running"); run("r2", "missed");
-    expect(w.health.report(null).routines).toEqual([{ routineId: "routine-1", status: "missed", at: START, consecutiveFailures: 2 }]);
-    run("r3", "completed");
-    expect(w.health.report(null).routines).toEqual([{ routineId: "routine-1", status: "completed", at: START, consecutiveFailures: 0 }]);
+  it("reports each routine's last outcome and failures in a row as the saved run rows give them, so a restart hides none", () => {
+    const rows = [{ routineId: "routine-1", status: "missed" as const, at: START, consecutiveFailures: 2 }, { routineId: "not an id!", status: "failed" as const, at: START, consecutiveFailures: 9 }];
+    const caps: number[] = [], none = { ran: 0, failed: 0, missed: 0, late: 0, retried: 0 };
+    const schedule = { v: 1 as const, seq: 7, unreadable: true, nextDueAt: null, oldestUnconfirmed: null, lastConfirmed: null, due: { boot: none, day: none }, slowStops: 2 };
+    const deps = { routines: (cap: number) => { caps.push(cap); return rows; }, schedule: () => schedule };
+    for (const w of [world(deps), world(deps)]) {
+      const report = w.health.report(null);
+      expect(report.routines).toEqual([rows[0]]);
+      expect(report.schedule).toEqual(schedule);
+    }
+    expect(caps).toEqual([100, 100]);
+    expect(world().health.report(null)).toMatchObject({ routines: [], schedule: null });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const broken = world({ routines: () => { throw new Error("Quarterly-Secret-Plan"); }, schedule: () => { throw new Error("Quarterly-Secret-Plan"); } }).health.report(null);
+    expect(broken).toMatchObject({ v: 1, routines: [], schedule: null, turns: { started15m: 0 } });
+    expect(JSON.stringify(vi.mocked(console.error).mock.calls)).not.toContain("Quarterly");
+    vi.restoreAllMocks();
   });
 });
 
@@ -226,8 +289,7 @@ describe("the report", () => {
   it("stays under 64 KB, and the cursor picks up what did not fit", () => {
     let clock = START;
     const routines = Array.from({ length: 100 }, (_, i) => `r${String(i).padStart(63, "0")}`);
-    const w = world({ now: () => clock });
-    for (const routineId of routines) w.health.noteRoutineRun({ id: routineId, routineId, status: "failed" });
+    const w = world({ now: () => clock, routines: () => routines.map((routineId) => ({ routineId, status: "failed" as const, at: START, consecutiveFailures: 1 })) });
     const ledger = w.health.ledger;
     for (let i = 0; i < HEALTH_BUCKET_CAP; i++) {
       const thread = `t${String(i).padStart(63, "0")}`;
@@ -279,6 +341,18 @@ describe("GET /api/cloud/health", () => {
     expect(answer.body).toMatchObject({ v: 1, version: "0.1.120", bootedAt: START, incidents: [{ kind: "turn", code: "restart", count: 1 }] });
     const again = `${CLOUD_HEALTH_PATH}?after=${answer.body.cursor}`;
     expect((await send("GET", again, sign(again))).body.incidents).toEqual([]);
+  });
+
+  it("still answers 200, with perf null and one warning a minute, when the performance recorder throws", async () => {
+    const warned: string[] = [];
+    const w = world({ perf: () => { throw new TypeError("boom at /Users/ada/secret"); }, log: (line) => warned.push(line) });
+    const { sign, send } = routes(w);
+    const target = `${CLOUD_HEALTH_PATH}?after=0`;
+    const answer = await send("GET", target, sign(target));
+    expect(answer.status).toBe(200);
+    expect(answer.body).toMatchObject({ v: 1, perf: null });
+    w.health.report(undefined);
+    expect(warned).toEqual(["cloud health: perf left out: TypeError"]);
   });
 
   it("refuses a wrong key, another path or query, a stale or replayed request, and anything but GET", async () => {

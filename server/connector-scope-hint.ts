@@ -18,11 +18,27 @@ function appName(slug: string): string {
   return toolkit.charAt(0) + toolkit.slice(1).toLowerCase();
 }
 
+const GOOGLE_APPS: Record<string, string> = {
+  GOOGLEDRIVE: "Google Drive", GOOGLECALENDAR: "Google Calendar", GOOGLEDOCS: "Google Docs", GOOGLESHEETS: "Google Sheets",
+  GOOGLESLIDES: "Google Slides", GOOGLETASKS: "Google Tasks", GOOGLEMEET: "Google Meet", GOOGLEPHOTOS: "Google Photos",
+};
+
 export function scopeHint(slugs: readonly string[]): string {
   const slug = slugs.find((candidate) => requiredScope(candidate)) ?? slugs[0] ?? "";
   const app = slug ? appName(slug) : null;
   const scope = slug ? requiredScope(slug) : null;
-  const permission = scope ? `the ${scope} permission` : "the permission this action needs";
+  if (!scope) {
+    // Composio's default connection asks for the app's usual permissions, so a refusal here is most often a permission
+    // the person left unticked on the provider's consent screen: signing in again with it ticked fixes it.
+    const toolkit = slug.split("_")[0] ?? "";
+    const named = GOOGLE_APPS[toolkit] ?? app ?? "the app";
+    return `OpenMausBot note: ${app ?? "The app"} refused this because the connected account has not granted the permission this action needs. `
+      + `${app === "Google" ? "Google's sign-in screen lets a person leave a permission unticked, and then every call that needs it fails. " : ""}`
+      + `Tell the person to open Connected apps, go to the Connected tab, choose Disconnect on ${named}, then Connect it again `
+      + "and allow every permission the sign-in screen asks for. If it still fails after that, the default Composio connection does not "
+      + `ask for this permission: with their own Composio project key they can add it in an auth config for ${named}. Do not retry this call before they reconnect.`;
+  }
+  const permission = `the ${scope} permission`;
   return `OpenMausBot note: ${app ?? "The app"} refused this because the connected account has not granted ${permission}. ` +
     `Reconnecting will not add it: the default Composio connection never asks for it. ` +
     `To allow it, the person creates their own ${app ? `${app} ` : ""}auth config in their Composio project that includes ${permission}, ` +
@@ -81,25 +97,36 @@ export function annotateFailedCall(
   return true;
 }
 
-/** Anything else, an unreadable body included, is returned byte for byte. */
-export function withScopeHint(bytes: Uint8Array, contentType: string, slugs: readonly string[]): Uint8Array {
+/** Adds `hint` to each failed tool result in an MCP answer that matches `pattern`. Anything else, an unreadable body
+ * included, is returned byte for byte. */
+export function withFailedCallHint(
+  bytes: Uint8Array,
+  contentType: string,
+  pattern: RegExp,
+  hint: (slugs: readonly string[]) => string,
+  slugs: readonly string[],
+): Uint8Array {
   const text = new TextDecoder().decode(bytes);
-  if (!SCOPE_ERROR.test(text)) return bytes;
+  if (!pattern.test(text)) return bytes;
   try {
     if (/text\/event-stream/i.test(contentType)) {
       let changed = false;
       const lines = text.split("\n").map((line) => {
         if (!line.startsWith("data:")) return line;
         const frame = JSON.parse(line.slice(5));
-        if (!annotateFailedCall(frame, SCOPE_ERROR, scopeHint, slugs)) return line;
+        if (!annotateFailedCall(frame, pattern, hint, slugs)) return line;
         changed = true;
         return `data: ${JSON.stringify(frame)}`;
       });
       return changed ? new TextEncoder().encode(lines.join("\n")) : bytes;
     }
     const frame = JSON.parse(text);
-    return annotateFailedCall(frame, SCOPE_ERROR, scopeHint, slugs) ? new TextEncoder().encode(JSON.stringify(frame)) : bytes;
+    return annotateFailedCall(frame, pattern, hint, slugs) ? new TextEncoder().encode(JSON.stringify(frame)) : bytes;
   } catch {
     return bytes;
   }
+}
+
+export function withScopeHint(bytes: Uint8Array, contentType: string, slugs: readonly string[]): Uint8Array {
+  return withFailedCallHint(bytes, contentType, SCOPE_ERROR, scopeHint, slugs);
 }

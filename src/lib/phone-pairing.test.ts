@@ -15,6 +15,7 @@ import {
   resetPhonePairingAccess,
   revealPhonePairing,
   takePhonePairingRequest,
+  takePairOnOpen,
   type PhonePairingAccess,
 } from "./phone-pairing";
 
@@ -66,6 +67,14 @@ describe("Connect your phone in the account menu", () => {
     expect(connectPhoneEntry("cloud", access(chatOnly))).toBeNull();
   });
 
+  it("on a Team Cloud: to the team, for every member, whatever their role", () => {
+    const member = { kind: "session" as const, id: "s", label: "Desktop", scopes: ["client"], expiresAt: 1, team: { id: "team-acme-1", name: "Acme", role: "member" } };
+    const entry = connectPhoneEntry("cloud", access(member, false));
+    expect(entry).toMatchObject({ target: "cloud", team: "Acme" });
+    expect(t("sidebar.menu.connectPhone.team", { team: entry!.team! })).toBe("to Acme");
+    expect(phoneDestinations(entry, null)).toEqual([{ ...entry, id: "here" }]);
+  });
+
   it("on another server: to the bots here, only for a session that may make a pairing code", () => {
     expect(subtitle(connectPhoneEntry("server", access(admin)))).toBe("to the bots here");
     expect(subtitle(connectPhoneEntry("server", access(owner)))).toBe("to the bots here");
@@ -110,24 +119,28 @@ describe("asking the server", () => {
 });
 
 describe("opening Settings on the phone pairing", () => {
-  it("is Remote access, asking for the pairing to be revealed", () => {
-    expect(phonePairingSettingsAction()).toEqual({ type: "toggleAppSettings", open: true, section: "companion", phonePairing: true });
+  it("is Phone & devices, asking for the pairing to be revealed", () => {
+    expect(phonePairingSettingsAction()).toEqual({ type: "toggleAppSettings", open: true, section: "phone", phonePairing: true });
   });
 
   type Focusable = { focus: (options?: FocusOptions) => void };
   const focusable = () => ({ focus: vi.fn<(options?: FocusOptions) => void>() });
+  const pane = { scrollTop: 0, clientHeight: 600, getBoundingClientRect: () => ({ top: 100 }), querySelector: () => ({ offsetHeight: 88 }) };
   const element = (action: Focusable | null) => ({
-    scrollIntoView: vi.fn<(options: ScrollIntoViewOptions) => void>(),
+    closest: vi.fn((_selector: string) => pane as unknown as Element),
+    getBoundingClientRect: () => ({ top: 500 }),
     focus: vi.fn<(options?: FocusOptions) => void>(),
     querySelector: vi.fn((_selector: string) => action),
   });
   const now = (callback: () => void) => callback();
 
-  it("scrolls the card into view and focuses the button that shows the code", () => {
+  it("scrolls only the Settings pane to the card, never the sheet, and focuses the button that shows the code", () => {
     const action = focusable();
     const root = element(action);
+    pane.scrollTop = 0;
     expect(revealPhonePairing(root, now)).toBe(true);
-    expect(root.scrollIntoView).toHaveBeenCalledWith({ block: "start" });
+    expect(root.closest).toHaveBeenCalledWith("[data-settings-scroll]");
+    expect(pane.scrollTop).toBe(304);
     expect(root.querySelector).toHaveBeenCalledWith("[data-phone-pairing-action]:not([disabled])");
     expect(action.focus).toHaveBeenCalledWith({ preventScroll: true });
     expect(root.focus).not.toHaveBeenCalled();
@@ -143,9 +156,9 @@ describe("opening Settings on the phone pairing", () => {
     const root = element(focusable());
     const frames: Array<() => void> = [];
     revealPhonePairing(root, (callback) => frames.push(callback));
-    expect(root.scrollIntoView).not.toHaveBeenCalled();
+    expect(root.closest).not.toHaveBeenCalled();
     frames[0]!();
-    expect(root.scrollIntoView).toHaveBeenCalled();
+    expect(root.closest).toHaveBeenCalled();
     expect(revealPhonePairing(null, now)).toBe(false);
   });
 });
@@ -158,12 +171,28 @@ describe("the ?desktop-settings=phone request", () => {
     expect(takePhonePairingRequest("https://home.fly.dev/")).toBeNull();
   });
 
+  it("asks once for Pair a phone with pair=open, in the desktop window only, and drops the flag from the address", () => {
+    expect(takePhonePairingRequest("https://home.fly.dev/?desktop-settings=phone&pair=open", false)).toBe("/");
+    expect(takePairOnOpen()).toBe(false);
+    expect(takePhonePairingRequest("https://home.fly.dev/?desktop-settings=phone&pair=open", true)).toBe("/");
+    expect(takePairOnOpen()).toBe(true);
+    expect(takePairOnOpen()).toBe(false);
+  });
+
   it("survives pairing, and nothing else does", () => {
+    expect(pairedDestination("?desktop-settings=phone&pair=open")).toBe("/?desktop-settings=phone&pair=open");
     expect(pairedDestination("?desktop-settings=phone")).toBe("/?desktop-settings=phone");
     expect(pairedDestination("?desktop-settings=phone&next=https://evil.example")).toBe("/?desktop-settings=phone");
     expect(pairedDestination("?desktop-settings=workspaces")).toBe("/");
     expect(pairedDestination("?next=//evil.example")).toBe("/");
     expect(pairedDestination("")).toBe("/");
+  });
+
+  it("keeps a linked thread through sign-in, and nothing else with it", () => {
+    expect(pairedDestination("?thread=t-1&bot=scout")).toBe("/?thread=t-1&bot=scout");
+    expect(pairedDestination("?thread=t%201&x=1")).toBe("/?thread=t+1");
+    expect(pairedDestination("?bot=scout")).toBe("/");
+    expect(pairedDestination("?thread=t-1&next=/settings")).toBe("/settings");
   });
 });
 
@@ -185,6 +214,13 @@ describe("the person's Cloud as a destination on this computer", () => {
       expect(cloudPhoneDestination(paid({ machine }))).toBe("not-ready");
     }
     expect(cloudPhoneDestination(paid({ machine: undefined }))).toBe("not-ready");
+  });
+
+  it("a Team or Business plan has no Cloud of its own to pair here: nothing, never 'once it's ready'", () => {
+    const acme = [{ id: "team-acme", name: "Acme", role: "owner" as const, machine: { status: "ready" as const, origin: "https://omb-t-2.fly.dev" } }];
+    for (const tier of ["team", "business"]) {
+      expect(cloudPhoneDestination(paid({ entitlement: { plan: "pro", tier, status: "active", expiresAt: null, version: 1 }, machine: undefined, teams: acme })), tier).toBeNull();
+    }
   });
 
   it("no paid plan, signed out or not known yet: nothing", () => {

@@ -3,6 +3,7 @@
 import { z } from "zod";
 
 import type { WebhookRequestCardData, WebhookRequestDefinition, WebhookRequestOperation, WebhookRequestSnapshot } from "../shared/webhook-request.ts";
+import { instructionsUpdateRefusal } from "./automation-instructions.ts";
 import { newId } from "./contracts.ts";
 import { UNDO_STALE } from "./direct-apply.ts";
 import { redactSecretsInText } from "./redact.ts";
@@ -46,8 +47,13 @@ const definitionSchema = z.object({
   instructions: z.string().trim().max(INSTRUCTIONS_MAX).default(""),
   runOn: z.enum(["maus", "cloud"]).default("maus"),
   eventTypes: z.array(z.string().trim().min(1).max(200)).max(20).optional(),
+  payloadFilter: z.record(z.string().trim().min(1).max(200), z.string().trim().max(200)).optional(),
+  sameConversation: z.boolean().optional(),
 }).strict();
-const changesSchema = definitionSchema.partial().strict()
+const changesSchema = definitionSchema.partial().extend({
+  instructions: definitionSchema.shape.instructions.removeDefault().optional(),
+  runOn: definitionSchema.shape.runOn.removeDefault().optional(),
+}).strict()
   .refine((changes) => Object.keys(changes).length > 0, "The update action needs at least one field in changes");
 const webhookIdSchema = z.string().trim().min(1).max(200);
 const targetSchema = z.object({ botId: z.string(), name: z.string() }).optional();
@@ -81,6 +87,8 @@ function snapshot(webhook: WebhookTrigger): WebhookRequestSnapshot {
     runOn: webhook.runOn,
     enabled: webhook.enabled,
     ...(webhook.eventTypes?.length ? { eventTypes: [...webhook.eventTypes] } : {}),
+    ...(webhook.payloadFilter ? { payloadFilter: { ...webhook.payloadFilter } } : {}),
+    ...(webhook.sameConversation ? { sameConversation: true } : {}),
   };
 }
 
@@ -90,13 +98,17 @@ function managerInput(definition: Partial<WebhookRequestDefinition>) {
     ...(definition.instructions !== undefined ? { prompt: definition.instructions } : {}),
     ...(definition.runOn !== undefined ? { runOn: definition.runOn } : {}),
     ...(definition.eventTypes !== undefined ? { eventTypes: definition.eventTypes } : {}),
+    ...(definition.payloadFilter !== undefined ? { payloadFilter: definition.payloadFilter } : {}),
+    ...(definition.sameConversation !== undefined ? { sameConversation: definition.sameConversation } : {}),
   };
 }
 
 /** What the card and the tool result say the trigger does, credential-scrubbed. */
-export function webhookTriggerSentence(webhook: Pick<WebhookTrigger, "prompt" | "eventTypes">, botName: string): string {
+export function webhookTriggerSentence(webhook: Pick<WebhookTrigger, "prompt" | "eventTypes" | "payloadFilter">, botName: string): string {
   const instructions = redactSecretsInText(webhook.prompt).trim();
-  const events = webhook.eventTypes?.length ? ` (only ${webhook.eventTypes.join(", ")})` : "";
+  const fields = Object.entries(webhook.payloadFilter ?? {}).map(([field, value]) => `${field} is ${redactSecretsInText(value)}`);
+  const only = [...(webhook.eventTypes ?? []), ...fields];
+  const events = only.length ? ` (only ${only.join(", ")})` : "";
   return `When another app sends something${events}, ${botName} ${instructions ? `follows: ${instructions.slice(0, 400)}` : "does what it is asked"}`;
 }
 
@@ -128,7 +140,7 @@ export class WebhookRequestService {
   private owned(webhookId: string, owner: string): WebhookTrigger {
     const webhook = this.options.webhooks.list().find((candidate) => candidate.id === webhookId);
     if (!webhook || webhook.botId !== owner) {
-      throw new WebhookRequestError("No webhook trigger with that id belongs to this bot. Call list_triggers and copy its id.", 404);
+      throw new WebhookRequestError("No webhook trigger with that id belongs to this bot. Call trigger_info and copy its id.", 404);
     }
     return webhook;
   }
@@ -146,11 +158,15 @@ export class WebhookRequestService {
     const owner = operation.forBot?.botId ?? args.botId;
     const webhooks = this.options.webhooks;
     const before = operation.action === "create" ? undefined : this.owned(operation.webhookId, owner);
+    if (operation.action === "update") {
+      const refusal = instructionsUpdateRefusal(before!.prompt, operation.changes.instructions);
+      if (refusal) throw new WebhookRequestError(refusal, 409);
+    }
     if (operation.action === "create") {
       const duplicate = webhooks.list().find((webhook) => webhook.botId === owner && webhook.enabled &&
         webhook.name === operation.webhook.name && webhook.prompt === operation.webhook.instructions);
       if (duplicate) {
-        throw new WebhookRequestError(`An enabled webhook trigger with the same name and instructions already exists (${duplicate.id}). Use list_triggers to review it, then change that one instead.`, 409);
+        throw new WebhookRequestError(`An enabled webhook trigger with the same name and instructions already exists (${duplicate.id}). Use trigger_info to review it, then change that one instead.`, 409);
       }
     }
     if (args.canCommit && !args.canCommit()) throw new WebhookRequestError("The requesting turn ended before this change could be saved", 401);
@@ -243,7 +259,7 @@ export class WebhookRequestService {
           const before = payload.undo?.before;
           if (!current || current.updatedAt !== payload.undo?.appliedUpdatedAt) return stale;
           const patch = operation.action === "update"
-            ? before ? { ...managerInput(before), eventTypes: before.eventTypes ?? [], enabled: before.enabled } : undefined
+            ? before ? { ...managerInput(before), eventTypes: before.eventTypes ?? [], payloadFilter: before.payloadFilter ?? null, sameConversation: before.sameConversation === true, enabled: before.enabled } : undefined
             : { enabled: operation.action === "pause" };
           if (!patch || !webhooks.update(webhookId, patch)) return stale;
           break;

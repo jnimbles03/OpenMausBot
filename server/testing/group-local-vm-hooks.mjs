@@ -4,6 +4,7 @@ import { registerHooks } from 'node:module';
 const state = process.env.OMB_TEST_VM_STATE;
 if (!state) throw new Error('An explicit isolated VM state file is required');
 const actual = new URL('../container-computer.ts?actual', import.meta.url).href;
+const atomic = new URL('../atomic.ts', import.meta.url).href;
 const mock = new URL('./group-local-vm-mock.mjs', import.meta.url).href;
 const profilesMock = new URL('./group-local-vm-profiles-mock.mjs', import.meta.url).href;
 registerHooks({
@@ -15,13 +16,14 @@ registerHooks({
   load(url, context, nextLoad) {
     // Sign-in rescue: recorded in the state file, in order with the container actions, instead of running docker cp.
     if (url === profilesMock) return { format: 'module', shortCircuit: true, source: `
-      import { readFileSync, writeFileSync } from 'node:fs';
+      import { readFileSync } from 'node:fs';
+      import { writeFileAtomic } from ${JSON.stringify(atomic)};
       const file = ${JSON.stringify(state)};
       export async function rescueFirefoxProfile(_runtime, target) {
         const state = JSON.parse(readFileSync(file, 'utf8'));
         if (state.failRescue) throw new Error("could not copy the desktop's Firefox profile: fixture refused");
         state.actions = [...(state.actions ?? []), { action: 'rescue', target: target.key }];
-        writeFileSync(file, JSON.stringify(state));
+        writeFileAtomic(file, JSON.stringify(state), { durable: false });
         return 'rescued';
       }
       export async function keepFirefoxProfileBeforeRemove(target, status, stop) {
@@ -29,17 +31,34 @@ registerHooks({
         if (status.container === 'running') await stop();
         return rescueFirefoxProfile(status.runtime, target);
       }
+      export async function keepInstalledAppsBeforeRemove(target, status, _stop) {
+        if (!status.runtime || status.container === 'missing' || !status.managed || status.imageMatches) return 'none';
+        const state = JSON.parse(readFileSync(file, 'utf8'));
+        if (state.failAppRescue) throw new Error("could not copy installed desktop apps: fixture refused");
+        state.appRescues = [...(state.appRescues ?? []), target.key];
+        writeFileAtomic(file, JSON.stringify(state), { durable: false });
+        return 'rescued';
+      }
     ` };
     if (url === mock) return { format: 'module', shortCircuit: true, source: `
       export * from ${JSON.stringify(actual)};
-      import { SHARED_LOCAL_VM_TARGET } from ${JSON.stringify(actual)};
+      import { SHARED_LOCAL_VM_TARGET, containerComputerFrame as actualFrame } from ${JSON.stringify(actual)};
       import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+      import { writeFileAtomic } from ${JSON.stringify(atomic)};
       const file = ${JSON.stringify(state)};
       const read = () => JSON.parse(readFileSync(file, 'utf8'));
-      export async function containerRuntimeStatus() { return { runtime: 'podman', daemonUp: true }; }
+      export async function containerRuntimeStatus() {
+        while (read().holdRuntime) { writeFileSync(file + '.runtime', '1'); await new Promise(r => setTimeout(r, 30)); }
+        return { runtime: 'podman', daemonUp: true };
+      }
+      export async function containerComputerFrame(...args) {
+        if (!read().frames) return actualFrame(...args);
+        writeFileSync(file + '.frame', '1');
+        return { png: 'iVBORw0KGgo=', format: 'png' };
+      }
       export async function containerExec(target, command) {
         writeFileSync(file + '.exec', JSON.stringify({ target, command }));
-        return { exitCode: 0, stdout: 'fixture command completed', stderr: '', timedOut: false };
+        return read().execResult ?? { exitCode: 0, stdout: 'fixture command completed', stderr: '', timedOut: false };
       }
       export async function containerComputerExists(_runtime, target) {
         const state = read();
@@ -59,15 +78,16 @@ registerHooks({
           imageMatches: !outdated && image, network: 'loopback', security: 'hardened', persistence: 'durable', resumable: Boolean(stopped) && !outdated && image,
           stopped_at: stopped ? read().stoppedAt : null,
           problem: ready ? null : outdated ? 'The existing Local VM uses an older desktop or Cua Driver; recreate it' : 'fixture desktop unavailable',
+          viewer_port: ready ? (read().viewerPort ?? 6080) : null, viewer_url: ready ? 'http://127.0.0.1:' + (read().viewerPort ?? 6080) + '/vnc.html#autoconnect=true&resize=scale&password=fixture-vnc' : '',
           container_name: target.containerName, target_key: target.key, workspace_path: target.workspaceDir };
       }
       export async function containerComputerAction(action, _run, _platform, target = SHARED_LOCAL_VM_TARGET) {
         if (action === 'pull' && read().containers) {
-          while (read().holdPull) await new Promise(r => setTimeout(r, 30));
+          while (read().holdPull) { writeFileSync(file + '.pull', '1'); await new Promise(r => setTimeout(r, 30)); }
           const state = read();
           state.imageMissing = false;
           state.actions = [...(state.actions ?? []), { action, target: target.key }];
-          writeFileSync(file, JSON.stringify(state));
+          writeFileAtomic(file, JSON.stringify(state), { durable: false });
           return containerComputerStatus(_run, _platform, target);
         }
         const state = read();
@@ -86,11 +106,17 @@ registerHooks({
           state.outdated = (state.outdated ?? []).filter(key => key !== target.key);
         }
         state.actions = [...(state.actions ?? []), { action, target: target.key }];
-        writeFileSync(file, JSON.stringify(state));
+        writeFileAtomic(file, JSON.stringify(state), { durable: false });
         return containerComputerStatus(_run, _platform, target);
       }
     ` };
     const result = nextLoad(url, context);
+    if (url.endsWith('/computer-control.ts') && process.env.OMB_TEST_LEASE_GRACE_MS) {
+      return { ...result, source: String(result.source).replace('const LEASE_GRACE_MS = 60_000;', `const LEASE_GRACE_MS = ${Number(process.env.OMB_TEST_LEASE_GRACE_MS)};`) };
+    }
+    if (url.endsWith('/routes/desktop-viewer.ts') && process.env.OMB_TEST_VIEWER_RECHECK_MS) {
+      return { ...result, source: String(result.source).replace('const RECHECK_MS = 5_000;', `const RECHECK_MS = ${Number(process.env.OMB_TEST_VIEWER_RECHECK_MS)};`) };
+    }
     if (url.endsWith('/computer-idle.ts')) {
       return { ...result, source: `import { readFileSync as readVmIdle } from 'node:fs';\n` +
         String(result.source).replaceAll('checkedIdleMs(idleMs)', `(JSON.parse(readVmIdle(${JSON.stringify(state)}, 'utf8')).idleMs ?? checkedIdleMs(idleMs))`) };
@@ -107,7 +133,7 @@ registerHooks({
     if (url.endsWith('/turn-watchdog.ts')) {
       return { ...result, source: `import { readFileSync as readVmWatch } from 'node:fs';\n` +
         String(result.source).replace('this.opts = opts;', 'this.opts = { ...opts, checkMs: 30 };')
-          .replace('at - turn.lastEventAt < this.opts.stallMs', `at - turn.lastEventAt < (JSON.parse(readVmWatch(${JSON.stringify(state)}, 'utf8')).stall ? 0 : JSON.parse(readVmWatch(${JSON.stringify(state)}, 'utf8')).stallThread === turn.threadId ? 100 : this.opts.stallMs)`) };
+          .replace('at - turn.lastEventAt < silentMs', `at - turn.lastEventAt < (JSON.parse(readVmWatch(${JSON.stringify(state)}, 'utf8')).stall ? 0 : JSON.parse(readVmWatch(${JSON.stringify(state)}, 'utf8')).stallThread === turn.threadId ? 100 : silentMs)`) };
     }
     if (url.endsWith('/turn-dispatch-guard.ts')) {
       // wedgeClear parks a room turn inside waitForClear; the clearwait marker proves it got there.
@@ -117,8 +143,8 @@ registerHooks({
     }
     if (url.endsWith('/room-turn-timeout.ts')) {
       return { ...result, source: `import { readFileSync as readVmDeadline } from 'node:fs';\n` +
-        String(result.source).replace('this.remainingMs = roomTurnTimeoutMs(minutes);',
-          `this.remainingMs = JSON.parse(readVmDeadline(${JSON.stringify(state)}, 'utf8')).timeout ? 5000 : roomTurnTimeoutMs(minutes);`) };
+        String(result.source).replace('this.limitMs = roomTurnTimeoutMs(minutes);',
+          `this.limitMs = JSON.parse(readVmDeadline(${JSON.stringify(state)}, 'utf8')).timeout ? 5000 : roomTurnTimeoutMs(minutes);`) };
     }
     return result;
   },

@@ -8,9 +8,12 @@ import { delimiter, dirname, join, resolve } from "node:path";
 import { writeFileAtomic } from "./atomic.ts";
 import { DATA_DIR } from "./config.ts";
 import { browserBundlePaths } from "./browser-bundle-release.ts";
-import { browserProcessesRunning, browserProcessTree, releaseBrowserProfile, stopBrowserProcesses } from "./browser-processes.ts";
-import { BROWSER_VIEWPORT_ARGS, browserRuntimeEnv, ownsBrowserViewport } from "./browser-runtime.ts";
+import { browserProcessesRunning, browserProcessTree, browserProfileProcessTrees, releaseBrowserProfile, stopBrowserProcesses } from "./browser-processes.ts";
+import { BROWSER_VIEWPORT, viewportArgs, type PageSize } from "./browser-page-size.ts";
+import { browserRuntimeEnv, ownsBrowserViewport } from "./browser-runtime.ts";
+import { spawnBotWork } from "./oom-score.ts";
 import { SIGN_IN_PROMPT } from "./system-prompt.ts";
+import { devShmIsSmall } from "./browser/chrome/shm.ts";
 import { gateChromeSettings } from "./browser/egress/gate.ts";
 import {
   AGENT_BROWSER_VERSION,
@@ -84,7 +87,7 @@ function runBrowserCommand(binaryPath: string, env: NodeJS.ProcessEnv, args: str
     let output = "";
     const finish = (ok: boolean) => { if (!settled) { settled = true; done({ ok, output }); } };
     let child: ReturnType<typeof spawn>;
-    try { child = spawn(binaryPath, args, { env, stdio: capture ? ["ignore", "pipe", "ignore"] : "ignore", windowsHide: true }); }
+    try { child = spawnBotWork(() => spawn(binaryPath, args, { env, stdio: capture ? ["ignore", "pipe", "ignore"] : "ignore", windowsHide: true })); }
     catch { return finish(false); }
     let exited = false;
     let killTimer: NodeJS.Timeout | undefined;
@@ -128,7 +131,16 @@ export function closeBrowserSession(binaryPath: string, env: NodeJS.ProcessEnv, 
   const session = env.AGENT_BROWSER_SESSION;
   if (!session || !/^[A-Za-z0-9_.-]{1,96}$/.test(session)) return Promise.resolve(false);
   const key = browserDaemonFile(env, ".pid");
-  const attempt = (closingBrowsers.get(key) ?? Promise.resolve(true)).then(() => closeOnce(binaryPath, env, session, timeoutMs)).catch(() => false).finally(() => {
+  const attempt = (closingBrowsers.get(key) ?? Promise.resolve(true)).then(async () => {
+    const trees = await browserProfileProcessTrees(env.AGENT_BROWSER_PROFILE, binaryPath, session);
+    if (trees === null) return false;
+    const closed = await closeOnce(binaryPath, env, session, timeoutMs);
+    let stopped = true;
+    for (const tree of trees) {
+      if (await browserProcessesRunning(tree) && !await stopBrowserProcesses(tree)) stopped = false;
+    }
+    return closed && stopped;
+  }).catch(() => false).finally(() => {
     if (closingBrowsers.get(key) === attempt) closingBrowsers.delete(key);
   });
   closingBrowsers.set(key, attempt);
@@ -139,15 +151,17 @@ async function closeOnce(binaryPath: string, env: NodeJS.ProcessEnv, session: st
   const closeEnv = daemonControlEnv(env);
   if (!closeEnv) return false;
   const deadline = Date.now() + timeoutMs;
-  // `close` to a stopped session starts a daemon only to stop it again and leaves its .config file behind.
-  const running = await runningBrowserSessions(binaryPath, closeEnv, deadline);
-  if (!running) return false;
-  if (!running.includes(session)) return true;
   const pidFile = browserDaemonFile(env, ".pid");
   const daemonPid = () => { try { return readFileSync(pidFile, "utf8").trim(); } catch { return null; } };
+  // `close` to a stopped session starts a daemon only to stop it again and leaves its .config file behind.
+  const running = await runningBrowserSessions(binaryPath, closeEnv, deadline);
+  if (running && !running.includes(session)) return true;
   const closing = daemonPid();
   // Read first: once the daemon exits, its Chrome is re-parented and can no longer be found under it.
   const tree = closing === null ? null : await browserProcessTree(binaryPath, Number(closing), session).catch(() => null);
+  // The list could not be read: on a box out of processes, every agent-browser command fails to start, so the daemon
+  // the pid file names (checked to be this session's own, from /proc where there is one) is stopped directly.
+  if (!running) return tree ? stopBrowserProcesses(tree) : false;
   if ((await runBrowserCommand(binaryPath, closeEnv, ["close"], deadline)).ok) {
     // Native close answers before the daemon exits, and Chrome's helper processes can outlive the answer.
     while (Date.now() < deadline) {
@@ -166,7 +180,7 @@ async function closeOnce(binaryPath: string, env: NodeJS.ProcessEnv, session: st
 export async function startBrowserSession(binaryPath: string, env: NodeJS.ProcessEnv, timeoutMs = 30_000): Promise<boolean> {
   const session = env.AGENT_BROWSER_SESSION;
   if (!session || !/^[A-Za-z0-9_.-]{1,96}$/.test(session)) return false;
-  await releaseBrowserProfile(env.AGENT_BROWSER_PROFILE);
+  await releaseBrowserProfile(env.AGENT_BROWSER_PROFILE, binaryPath, env.AGENT_BROWSER_EXECUTABLE_PATH);
   return (await runBrowserCommand(binaryPath, env, ["open", "--json", "--no-webmcp"], Date.now() + timeoutMs)).ok;
 }
 
@@ -237,7 +251,7 @@ export async function prepareBrowserSessionState(
   const env = browserRuntimeEnv({ ...options.env, AGENT_BROWSER_SESSION: session, AGENT_BROWSER_HEADLESS: "1" });
   ensureManagedBrowserConfig(env);
   if (options.persistent === false) return;
-  await releaseBrowserProfile(env.AGENT_BROWSER_PROFILE);
+  await releaseBrowserProfile(env.AGENT_BROWSER_PROFILE, binaryPath, env.AGENT_BROWSER_EXECUTABLE_PATH);
   check();
   const directory = browserSessionsDirectory(env);
   const key = join(directory, session);
@@ -472,7 +486,7 @@ export function ensureChrome(binaryPath: string, options: { withDeps?: boolean; 
   }
   const args = ["install", ...(options.withDeps ? ["--with-deps"] : [])];
   return new Promise((done, fail) => {
-    const child = spawn(binaryPath, args, { env: options.env ?? process.env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    const child = spawnBotWork(() => spawn(binaryPath, args, { env: options.env ?? process.env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true }));
     let output = "";
     const record = (chunk: Buffer) => {
       output += String(chunk);
@@ -548,6 +562,7 @@ export function browserEngineStatus(options: BrowserLookupOptions = {}): Browser
 }
 
 const PROFILE_CACHE_ARG = `--disk-cache-size=${64 * 1024 * 1024}`;
+export const NO_BACK_FORWARD_CACHE = "--disable-back-forward-cache";
 
 /** agent-browser 0.37 relaunches a running Chrome without a word when a command's launch settings differ, so every
  * command for a session must carry these same ones. Chrome fails every connection through port 0. */
@@ -579,6 +594,8 @@ export function agentBrowserIntegration(input: {
   /** The Chrome OMB prepared for the engine to start (server/browser/chrome/launcher.ts); unused when attaching. */
   launcher?: Record<string, string>;
   dataDir?: string;
+  /** /dev/shm is too small for Chrome's shared memory; read from the host when absent. */
+  smallShm?: boolean;
 }): { command: string; args: string[]; env: Record<string, string> } {
   const sourceEnv = input.env ?? process.env;
   const env: Record<string, string> = {
@@ -619,19 +636,22 @@ export function agentBrowserIntegration(input: {
   }
   // The gate goes last, so nothing the launcher sets can route Chrome around it; launcher arguments are kept beside its own.
   if (!input.attach) {
-    const launch = { ...env, ...input.launcher };
+    // Chrome keeps up to six pages a tab left alive for Back, each cross-site one in a renderer process of its own.
+    const launch = { ...env, ...input.launcher, AGENT_BROWSER_ARGS: [input.launcher?.AGENT_BROWSER_ARGS, NO_BACK_FORWARD_CACHE].filter(Boolean).join("\n") };
     // A kept profile's disk cache would otherwise grow to Chrome's default of several hundred megabytes per profile.
     if (env.AGENT_BROWSER_PROFILE) launch.AGENT_BROWSER_ARGS = [launch.AGENT_BROWSER_ARGS, PROFILE_CACHE_ARG].filter(Boolean).join("\n");
+    // agent-browser 0.37 adds this itself only where it recognises Docker, and a container platform leaves no such mark.
+    if (input.smallShm ?? devShmIsSmall(input.platform ?? process.platform)) launch.AGENT_BROWSER_ARGS = [launch.AGENT_BROWSER_ARGS, "--disable-dev-shm-usage"].filter(Boolean).join("\n");
     Object.assign(env, input.launcher, agentBrowserEgressEnv(launch, input.egressPort ?? 0, input.platform ?? process.platform));
   }
   return { command: input.binaryPath, args: ["mcp", "--tools", "core", "--no-webmcp"], env };
 }
 
-export function setBrowserViewport(binaryPath: string, env: NodeJS.ProcessEnv, timeoutMs = 30_000): Promise<boolean> {
+export function setBrowserViewport(binaryPath: string, env: NodeJS.ProcessEnv, size: PageSize = BROWSER_VIEWPORT, timeoutMs = 30_000): Promise<boolean> {
   if (!ownsBrowserViewport(env)) return Promise.resolve(true);
   return new Promise((settle) => {
     let child: ReturnType<typeof spawn>;
-    try { child = spawn(binaryPath, [...BROWSER_VIEWPORT_ARGS, "--json", "--no-webmcp"], { env: browserRuntimeEnv(env), stdio: ["ignore", "pipe", "ignore"], windowsHide: true }); }
+    try { child = spawnBotWork(() => spawn(binaryPath, [...viewportArgs(size), "--json", "--no-webmcp"], { env: browserRuntimeEnv(env), stdio: ["ignore", "pipe", "ignore"], windowsHide: true })); }
     catch { settle(false); return; }
     let output = "";
     let settled = false;

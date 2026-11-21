@@ -2,24 +2,31 @@ import { useEffect, useState } from "react";
 import { browserUnavailableReason } from "@/lib/feature-flags";
 import { ChevronDown, ChevronRight, FolderOpen, Plus } from "lucide-react";
 
-import { api, useStore, type Bot } from "@/state/store";
+import { api, type Bot } from "@/state/store";
 import { useBotEditor } from "./BotEditorContext";
 import { cn } from "@/lib/cn";
 import { t } from "@/lib/i18n";
 import type { LocaleKey } from "@/locales";
-import { mcpServersForBot, useMcpServers } from "@/lib/mcp-servers";
-import { placeFacts, placeViewFor, usePlaceSeat } from "@/lib/place-view";
+import { mcpServersForBot, mcpServersOfBot, mcpSwitch, useMcpServers } from "@/lib/mcp-servers";
+import { instanceSupportsLocalComputer, localComputerDisabledReason, localComputerSelectable } from "@/lib/local-computer";
+import { placeBlocked, placeFacts, placeHasIssue, placeViewFor, usePlaceSeat, type PlaceSeat } from "@/lib/place-view";
 import { shortPath } from "@/lib/short-path";
+import { isOwnThreadFolder } from "../../../shared/thread-folder";
 import { useDesktopCapabilities } from "../DesktopCapabilities";
 import { CloudBackendPicker } from "../CloudBackendPicker";
-import { ConfirmDialog } from "../ConfirmDialog";
+import { placeManagedBy, worksOnChoices, WorksOnGrid, worksOnSelected, type WorksOnMode } from "../WorksOnGrid";
 import { Switch } from "../SettingsPrimitives";
+import { PhoneAppsCard } from "./PhoneAppsCard";
 import { ProposalStatus } from "./ProposalStatus";
+import { ToolGroupsCard } from "./ToolGroupsCard";
 import { ToolSelectionCard } from "./ToolSelectionCard";
+import { BotApiCard } from "./BotApiCard";
+import { ToolBudgetLine } from "./ToolBudgetLine";
 import { useCloudPlan } from "../ProIntroduction";
 import { xResearchAction } from "@/lib/cloud-plan";
-import { HIGHLEVEL_SLUG } from "@/lib/highlevel-sign-in";
+import { useOwnerOrAdmin } from "@/lib/use-owner-or-admin";
 import { useBotApps } from "./useBotApps";
+import { connectAppFromBot } from "../AppGrantPrompt";
 import {
   classifyConnectorTool,
   connectorServiceAccess,
@@ -27,24 +34,23 @@ import {
   type ConnectorVerb,
 } from "@/lib/connector-grants";
 import { inputCls } from "./field";
+import { openKeySettings } from "../keys/key-focus";
+import { KeysLink } from "../keys/KeysLink";
 import type { ConnectorScope, ConnectorScopes } from "../../../shared/connector-scopes";
+import type { ConnectorAccount } from "@/lib/connector-status";
 import type { useBotSettingsDerived } from "./useBotSettingsDerived";
+import { sameFields, useStoreDispatch, useStoreSelector } from "@/state/store-select";
 
 /**
  * Claude keeps sessions per project folder, so the server pins each task's folder on its first turn. PATCHed directly,
  * not via updateBot: the server validates the path, and a rejected folder must not stick in local state.
  */
-export function WorkingFolder({ bot }: { bot: Bot }) {
+export function useWorkingFolder(bot: Pick<Bot, "id" | "cwd">) {
   const { request: api } = useBotEditor();
-  const { capabilities } = useDesktopCapabilities();
-  const home = capabilities.host.homeDir;
   const [draft, setDraft] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const canPick = Boolean(window.ogb?.pickFolder);
-  const task = bot.tasks?.find((t) => t.threadId === bot.threadId);
-  const pinned = task?.cwd;
-  const pinnedElsewhere = pinned !== undefined && (pinned ?? undefined) !== bot.cwd;
 
   const save = async (cwd: string | null) => {
     setSaving(true);
@@ -62,6 +68,16 @@ export function WorkingFolder({ bot }: { bot: Bot }) {
     const chosen = await window.ogb?.pickFolder?.(bot.cwd);
     if (chosen) void save(chosen);
   };
+  return { draft, setDraft, error, saving, canPick, save, pick };
+}
+
+export function WorkingFolder({ bot }: { bot: Bot }) {
+  const { capabilities } = useDesktopCapabilities();
+  const home = capabilities.host.homeDir;
+  const { draft, setDraft, error, saving, canPick, save, pick } = useWorkingFolder(bot);
+  const task = bot.tasks?.find((t) => t.threadId === bot.threadId);
+  const pinned = task?.cwd;
+  const pinnedElsewhere = pinned !== undefined && (pinned ?? undefined) !== bot.cwd && !isOwnThreadFolder(pinned, bot.id, bot.threadId);
 
   return (
     <div className="rounded-xl bg-card p-4">
@@ -70,7 +86,7 @@ export function WorkingFolder({ bot }: { bot: Bot }) {
       <ProposalStatus bot={bot} kind="chief" />
       {canPick ? (
         <div className="mt-3 flex items-center gap-2">
-          <div className="min-w-0 flex-1 truncate rounded-lg border border-hairline/40 bg-inset px-3 py-2 font-mono text-[12.5px] text-ink" title={bot.cwd}>
+          <div className="min-w-0 flex-1 truncate rounded-lg border border-hairline/40 bg-inset px-3 py-2 font-mono text-[13px] text-ink" title={bot.cwd}>
             {bot.cwd ? shortPath(bot.cwd, home) : <span className="text-ink-secondary">{t("botAccess.folder.private")}</span>}
           </div>
           <button onClick={() => void pick()} disabled={saving} className="flex shrink-0 items-center gap-1.5 rounded-lg bg-control px-3 py-2 text-[13px] text-ink hover:bg-raised-hover disabled:opacity-50">
@@ -91,7 +107,8 @@ export function WorkingFolder({ bot }: { bot: Bot }) {
           }}
         >
           <input
-            className={cn(inputCls, "font-mono text-[12.5px]")}
+            className={cn(inputCls, "font-mono text-[13px]")}
+            aria-label={t("botAccess.folder.title")}
             placeholder={t("botAccess.folder.placeholder")}
             value={draft ?? bot.cwd ?? ""}
             onChange={(e) => setDraft(e.target.value)}
@@ -116,16 +133,15 @@ export function WorkingFolder({ bot }: { bot: Bot }) {
  * bot.
  */
 export function McpServersCard({ bot, patch }: { bot: Bot; patch: (patch: { mcpServers: string[] | null }) => void }) {
-  const { dispatch } = useStore();
-  const { servers, error, refresh } = useMcpServers();
-  const mounted = new Set((servers ? mcpServersForBot(servers, bot.mcpServers) : []).map((server) => server.name));
+  const dispatch = useStoreDispatch();
+  const { servers: all, error, refresh } = useMcpServers();
+  const servers = all ? mcpServersOfBot(all, bot.id) : null;
+  const mounted = new Set((servers ? mcpServersForBot(servers, bot.mcpServers, bot.id) : []).map((server) => server.name));
   const usesAll = bot.mcpServers == null;
 
   const toggle = (name: string) => {
-    if (!servers || bot.busy || error) return;
-    const current = usesAll ? servers.filter((server) => server.enabled).map((server) => server.name) : [...(bot.mcpServers ?? [])];
-    const next = current.includes(name) ? current.filter((item) => item !== name) : [...current, name];
-    patch({ mcpServers: next });
+    if (!servers || error) return;
+    patch({ mcpServers: mcpSwitch(servers, bot.mcpServers, name) });
   };
   const openPlugins = () => {
     dispatch({ type: "toggleSettings", open: false });
@@ -157,12 +173,13 @@ export function McpServersCard({ bot, patch }: { bot: Bot; patch: (patch: { mcpS
           {servers.map((server) => (
             <div key={server.name} className="flex items-center justify-between gap-3 px-3 py-2">
               <div className="min-w-0 flex-1">
-                <div className="truncate font-mono text-[12.5px] text-ink">{server.name}</div>
-                {!server.enabled && <div className="text-[11.5px] text-ink-secondary">{t("botAccess.mcpDisabled")}</div>}
+                <div className="truncate font-mono text-[13px] text-ink">{server.name}</div>
+                {!server.enabled && <div className="text-[12px] text-ink-secondary">{t("botAccess.mcpDisabled")}</div>}
+                {server.enabled && server.offFor?.includes(bot.id) && <div className="text-[12px] text-ink-secondary">{t("mcp.offFor", { bots: bot.name })}</div>}
               </div>
               <Switch
                 checked={mounted.has(server.name)}
-                disabled={!server.enabled || !!bot.busy || error}
+                disabled={!server.enabled || error}
                 aria-label={t("botAccess.mcpAllow", { name: server.name })}
                 onClick={() => toggle(server.name)}
                 className="disabled:cursor-not-allowed"
@@ -171,17 +188,18 @@ export function McpServersCard({ bot, patch }: { bot: Bot; patch: (patch: { mcpS
           ))}
         </div>
       )}
+      <ToolBudgetLine botId={bot.id} busy={!!bot.busy} />
       <div className="mt-3 flex items-center gap-2">
         <button type="button" onClick={openPlugins} className="flex items-center gap-1.5 rounded-lg bg-control px-3 py-2 text-[13px] text-ink hover:bg-raised-hover">
           <Plus size={14} /> {t("botAccess.mcpAdd")}
         </button>
         {!usesAll && servers && servers.length > 0 && (
-          <button type="button" disabled={!!bot.busy || error} onClick={() => { if (!bot.busy && !error) patch({ mcpServers: null }); }} className="rounded-lg px-2 py-2 text-[13px] text-ink-secondary hover:text-ink disabled:opacity-50">
+          <button type="button" disabled={error} onClick={() => { if (!error) patch({ mcpServers: null }); }} className="rounded-lg px-2 py-2 text-[13px] text-ink-secondary hover:text-ink disabled:opacity-50">
             {t("botAccess.mcpUseAll")}
           </button>
         )}
       </div>
-      {bot.busy && <p className="mt-2 text-[12px] text-ink-secondary">{t("botAccess.mcpBusy")}</p>}
+      {bot.busy && <p className="mt-2 text-[12px] text-ink-secondary">{t("botAccess.nextTurn")}</p>}
     </div>
   );
 }
@@ -239,10 +257,6 @@ function ConnectorToolsGrants({
   const [tools, setTools] = useState<Record<string, ToolListing[]> | null>(null);
   const [toolsError, setToolsError] = useState<string | null>(null);
   const [lastExplicit, setLastExplicit] = useState<Record<string, string[]>>({});
-  /**
-   * The first grant creates the grants record, which limits every other connected app to no tools: confirm it first.
-   */
-  const [confirmFirstGrant, setConfirmFirstGrant] = useState<{ slug: string; tools: "*" | string[] } | null>(null);
 
   useEffect(() => {
     if (!openSlug || tools || toolsError) return;
@@ -267,7 +281,7 @@ function ConnectorToolsGrants({
   };
 
   const apply = (slug: string, next: { tools: "*" | string[] } | null) => {
-    const value = withServiceGrant(record, slug, next);
+    const value = withServiceGrant(record, slug, next, slugs);
     if (value === undefined) return;
     patch({ connectorTools: value });
   };
@@ -280,18 +294,10 @@ function ConnectorToolsGrants({
       return;
     }
     setLastExplicit((prev) => ({ ...prev, [slug]: next }));
-    if (!recordExists) {
-      setConfirmFirstGrant({ slug, tools: next });
-      return;
-    }
     apply(slug, { tools: next });
   };
 
   const allForService = (slug: string) => {
-    if (!recordExists) {
-      setConfirmFirstGrant({ slug, tools: "*" });
-      return;
-    }
     const selected = selectedFor(slug);
     if (selected.length) setLastExplicit((prev) => ({ ...prev, [slug]: selected }));
     apply(slug, { tools: "*" });
@@ -304,13 +310,13 @@ function ConnectorToolsGrants({
   };
 
   if (!slugs.length) {
-    return <div className="mt-3 text-[11.5px] text-ink-secondary">{t("botAccess.grants.noApps")}</div>;
+    return <div className="mt-3 text-[12px] text-ink-secondary">{t("botAccess.grants.noApps")}</div>;
   }
 
   return (
     <div className="mt-3">
       <div className="text-[12px] font-medium text-ink">{t("botAccess.grants.header")}</div>
-      <div className="mt-0.5 text-[11.5px] text-ink-secondary">{t("botAccess.grants.hint")}</div>
+      <div className="mt-0.5 text-[12px] text-ink-secondary">{t("botAccess.grants.hint")}</div>
       <div className="mt-2 divide-y divide-hairline/40 overflow-hidden rounded-lg border border-hairline/40">
         {slugs.map((slug) => {
           const access = connectorServiceAccess(record, slug);
@@ -344,8 +350,8 @@ function ConnectorToolsGrants({
                 className="flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-control/60"
               >
                 {open ? <ChevronDown size={14} className="shrink-0 text-ink-secondary" /> : <ChevronRight size={14} className="shrink-0 text-ink-secondary" />}
-                <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink">{slug}</span>
-                <span className="shrink-0 text-[11.5px] text-ink-secondary">
+                <span className="min-w-0 flex-1 truncate font-mono text-[13px] text-ink">{slug}</span>
+                <span className="shrink-0 text-[12px] text-ink-secondary">
                   {!access.editable
                     ? t("botAccess.grants.custom")
                     : access.level === "all"
@@ -358,7 +364,7 @@ function ConnectorToolsGrants({
               {open && (
                 <div className="border-t border-hairline/40 bg-inset/40 px-3 py-3">
                   {!access.editable ? (
-                    <div className="text-[11.5px] leading-relaxed text-ink-secondary">
+                    <div className="text-[12px] leading-relaxed text-ink-secondary">
                       {t("botAccess.grants.uneditable")}
                     </div>
                   ) : (
@@ -368,7 +374,7 @@ function ConnectorToolsGrants({
                           type="button"
                           onClick={() => (isAll ? leaveAllForService(slug) : allForService(slug))}
                           className={cn(
-                            "rounded-full px-2.5 py-1 text-[11.5px] font-medium",
+                            "rounded-full px-2.5 py-1 text-[12px] font-medium",
                             isAll ? "bg-accent/15 text-accent-text" : "bg-control text-ink hover:bg-raised-hover",
                           )}
                         >
@@ -378,19 +384,14 @@ function ConnectorToolsGrants({
                           <button
                             type="button"
                             onClick={() => patch({ connectorTools: null })}
-                            className="rounded-full bg-control px-2.5 py-1 text-[11.5px] font-medium text-ink hover:bg-raised-hover"
+                            className="rounded-full bg-control px-2.5 py-1 text-[12px] font-medium text-ink hover:bg-raised-hover"
                           >
                             {t("botAccess.grants.allApps")}
                           </button>
                         )}
                       </div>
-                      {!recordExists && (
-                        <div className="mt-2 text-[11px] leading-relaxed text-ink-secondary">
-                          {t("botAccess.grants.firstGrantWarning")}
-                        </div>
-                      )}
                       {toolsError ? (
-                        <div className="mt-2 text-[11.5px] text-ink-secondary">
+                        <div className="mt-2 text-[12px] text-ink-secondary">
                           {t("botAccess.grants.loadError")}{" "}
                           <button
                             type="button"
@@ -405,9 +406,9 @@ function ConnectorToolsGrants({
                           </button>
                         </div>
                       ) : tools === null ? (
-                        <div className="mt-2 text-[11.5px] text-ink-secondary">{t("botAccess.grants.loading")}</div>
+                        <div className="mt-2 text-[12px] text-ink-secondary">{t("botAccess.grants.loading")}</div>
                       ) : serviceTools.length === 0 ? (
-                        <div className="mt-2 text-[11.5px] text-ink-secondary">{t("botAccess.grants.noListing")}</div>
+                        <div className="mt-2 text-[12px] text-ink-secondary">{t("botAccess.grants.noListing")}</div>
                       ) : (
                         <>
                           <div className="mt-2 flex flex-wrap gap-1.5">
@@ -421,10 +422,6 @@ function ConnectorToolsGrants({
                                   onClick={() => {
                                     const next = [...new Set([...selected, ...names])];
                                     setLastExplicit((prev) => ({ ...prev, [slug]: next }));
-                                    if (!recordExists) {
-                                      setConfirmFirstGrant({ slug, tools: next });
-                                      return;
-                                    }
                                     apply(slug, { tools: next });
                                   }}
                                   className="rounded-full bg-control px-2.5 py-1 text-[11px] text-ink hover:bg-raised-hover"
@@ -454,7 +451,7 @@ function ConnectorToolsGrants({
                                     className="mt-0.5"
                                   />
                                   <span className="min-w-0 flex-1">
-                                    <span className="block truncate font-mono text-[11.5px] text-ink" title={tool.name}>{tool.name}</span>
+                                    <span className="block truncate font-mono text-[12px] text-ink" title={tool.name}>{tool.name}</span>
                                     {tool.description && (
                                       <span className="block truncate text-[11px] text-ink-secondary" title={tool.description}>
                                         {tool.description}
@@ -465,7 +462,7 @@ function ConnectorToolsGrants({
                               );
                             })}
                             {matches.length === 0 && (
-                              <div className="px-1.5 py-2 text-[11.5px] text-ink-secondary">{t("botAccess.grants.noMatches")}</div>
+                              <div className="px-1.5 py-2 text-[12px] text-ink-secondary">{t("botAccess.grants.noMatches")}</div>
                             )}
                           </div>
                         </>
@@ -478,19 +475,6 @@ function ConnectorToolsGrants({
           );
         })}
       </div>
-      <ConfirmDialog
-        open={confirmFirstGrant !== null}
-        title={t("botAccess.grants.firstGrantTitle", { service: confirmFirstGrant?.slug ?? "" })}
-        body={t("botAccess.grants.firstGrantBody", { service: confirmFirstGrant?.slug ?? "" })}
-        confirmLabel={t("botAccess.grants.saveGrant")}
-        onCancel={() => setConfirmFirstGrant(null)}
-        onConfirm={() => {
-          const pending = confirmFirstGrant;
-          setConfirmFirstGrant(null);
-          if (!pending) return;
-          apply(pending.slug, { tools: pending.tools });
-        }}
-      />
     </div>
   );
 }
@@ -498,7 +482,7 @@ function ConnectorToolsGrants({
 /** Research through treg (the X tools and the general research tools): on for every bot whenever this server holds a
  * treg key or a Cloud plan's research credential, and switchable off per bot. */
 function ResearchCard({ bot, patch }: { bot: Bot; patch: (patch: { xResearch: boolean }) => void }) {
-  const { state, dispatch } = useStore();
+  const state = useStoreSelector((s) => ({ config: s.config }), sameFields), dispatch = useStoreDispatch();
   const connecting = xResearchAction(useCloudPlan()?.view ?? null) === "connecting" && state.config?.xResearch?.unavailable !== true;
   const ownKey = state.config?.treg?.configured === true, included = state.config?.xResearch?.included === true;
   const available = ownKey || included;
@@ -511,7 +495,7 @@ function ResearchCard({ bot, patch }: { bot: Bot; patch: (patch: { xResearch: bo
         <div className="text-[15px] font-medium text-ink">{t("research.title")}</div>
         <div className="mt-0.5 text-[13px] text-ink-secondary">{line}</div>
         {!available && !connecting && (
-          <button type="button" className="ui-button mt-2" onClick={() => dispatch({ type: "toggleAppSettings", open: true, section: "connections" })}>
+          <button type="button" className="ui-button mt-2" onClick={() => dispatch(openKeySettings("treg"))}>
             {t("research.openKeys")}
           </button>
         )}
@@ -527,12 +511,34 @@ function ResearchCard({ bot, patch }: { bot: Bot; patch: (patch: { xResearch: bo
   );
 }
 
+/** On a Team Cloud: whether this bot may add and change the team's shared files, from any chat (an admin's to set). */
+function TeamFilesCard({ bot, patch }: { bot: Bot; patch: (patch: { teamFilesEdit: boolean }) => void }) {
+  const admin = useOwnerOrAdmin();
+  const on = bot.teamFilesEdit === true;
+  return (
+    <div className="flex items-center justify-between gap-4 rounded-xl bg-card p-4" data-testid="access-team-files">
+      <div>
+        <div className="text-[15px] font-medium text-ink">{t("botAccess.teamFiles.title")}</div>
+        <div className="mt-0.5 text-[13px] text-ink-secondary">{t(on ? "botAccess.teamFiles.on" : "botAccess.teamFiles.off")}</div>
+        {!admin && <div className="mt-0.5 text-[12px] text-ink-secondary">{t("botAccess.teamFiles.adminsOnly")}</div>}
+      </div>
+      <Switch
+        checked={on}
+        aria-label={t("botAccess.teamFiles.title")}
+        disabled={!admin}
+        onClick={() => patch({ teamFilesEdit: !on })}
+        className="disabled:cursor-not-allowed"
+      />
+    </div>
+  );
+}
+
 function RecordStepsRow({ on, browserOn, myChrome, onChange }: { on: boolean; browserOn: boolean; myChrome: boolean; onChange: (on: boolean) => void }) {
   return (
     <div className="mt-3 flex items-center justify-between gap-4 border-t border-hairline/40 pt-3">
       <div>
-        <div className="text-[13.5px] font-medium text-ink">{t("botAccess.recordSteps.title")}</div>
-        <div className="mt-0.5 text-[12.5px] text-ink-secondary">
+        <div className="text-[14px] font-medium text-ink">{t("botAccess.recordSteps.title")}</div>
+        <div className="mt-0.5 text-[13px] text-ink-secondary">
           {!browserOn ? t("botAccess.recordSteps.needsBrowser") : on ? t("botAccess.recordSteps.on") : t("botAccess.recordSteps.off")}
           {browserOn && on && myChrome ? ` ${t("botAccess.recordSteps.myChrome")}` : ""}
         </div>
@@ -558,7 +564,7 @@ export function cloudPreferenceShown(bot: Pick<Bot, "computer">, config: { cloud
  */
 export function VpsAliasField({ bot }: { bot: Bot }) {
   const { request: api } = useBotEditor();
-  const { state } = useStore();
+  const state = useStoreSelector((s) => ({ config: s.config }), sameFields);
   const defaultAlias = state.config?.vps?.sshAlias ?? "";
   const [draft, setDraft] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -583,10 +589,10 @@ export function VpsAliasField({ bot }: { bot: Bot }) {
   return (
     <div className="mt-3 rounded-lg bg-inset p-3">
       <div className="text-[13px] text-ink">{t("botAccess.cloud.server")}</div>
-      <div className="mt-0.5 text-[11.5px] text-ink-secondary">
+      <div className="mt-0.5 text-[12px] text-ink-secondary">
         {defaultAlias
           ? t("botAccess.cloud.serverDefault", { alias: defaultAlias })
-          : t("botAccess.cloud.serverNoDefault")}
+          : t("botAccess.cloud.serverNoDefault")} <KeysLink id="vps" />
       </div>
       <form
         className="mt-2 flex items-center gap-2"
@@ -596,7 +602,7 @@ export function VpsAliasField({ bot }: { bot: Bot }) {
         }}
       >
         <input
-          className={cn(inputCls, "font-mono text-[12.5px]")}
+          className={cn(inputCls, "font-mono text-[13px]")}
           placeholder={defaultAlias || t("botAccess.cloud.serverPlaceholder")}
           value={value}
           aria-label={t("botAccess.cloud.server")}
@@ -617,13 +623,13 @@ export function VpsAliasField({ bot }: { bot: Bot }) {
 }
 
 export function CloudPreference({ bot, patch }: { bot: Bot; patch: ReturnType<typeof useBotSettingsDerived>["patch"] }) {
-  const { state } = useStore();
+  const state = useStoreSelector((s) => ({ config: s.config }), sameFields);
   const { draft } = useBotEditor();
   if (!cloudPreferenceShown(bot, state.config)) return null;
   return (
     <>
-      {!bot.computer && (
-        <div className="mt-3 rounded-lg bg-inset px-3 py-2.5 text-[11.5px] leading-relaxed text-ink-secondary">
+      {!bot.computer && !draft && (
+        <div className="mt-3 rounded-lg bg-inset px-3 py-2.5 text-[12px] leading-relaxed text-ink-secondary">
           <span className="font-medium text-ink">{t("botAccess.cloud.autoTitle")}</span>{" "}
           {t("botAccess.cloud.autoDescription")}
         </div>
@@ -638,7 +644,7 @@ export function CloudPreference({ bot, patch }: { bot: Bot; patch: ReturnType<ty
         <div className="mt-3 flex items-center justify-between gap-4 rounded-lg bg-inset px-3 py-2.5">
           <div className="min-w-0">
             <div className="text-[13px] text-ink">{t("botAccess.cloud.startVps")}</div>
-            <div className="mt-0.5 text-[11.5px] text-ink-secondary">
+            <div className="mt-0.5 text-[12px] text-ink-secondary">
               {t("botAccess.cloud.startVpsDescription")}
             </div>
           </div>
@@ -653,7 +659,38 @@ export function CloudPreference({ bot, patch }: { bot: Bot; patch: ReturnType<ty
   );
 }
 
-export type AccessPart = "worksOn" | "folder" | "apps" | "xResearch" | "mcp" | "tools" | "browser" | "webhooks" | "always";
+function DraftWorksOn({ bot, patch, seat }: { bot: Bot; patch: ReturnType<typeof useBotSettingsDerived>["patch"]; seat: PlaceSeat }) {
+  const state = useStoreSelector((s) => ({ config: s.config, instances: s.instances }), sameFields);
+  const { capabilities } = useDesktopCapabilities();
+  const providerSupportsLocal = instanceSupportsLocalComputer(state.instances, bot);
+  const localReason = localComputerDisabledReason({ capabilities, providerSupportsLocal });
+  const named = { ...bot, name: bot.name || t("sidebar.newBotSimple") };
+  const options = worksOnChoices(state.config, capabilities).map(([mode, labelKey, descriptionKey, Icon]) => {
+    const view = placeViewFor(placeFacts({
+      bot: named, place: mode ?? "auto", seat, config: state.config, instances: state.instances,
+      local: {
+        ready: localComputerSelectable({ capabilities, providerSupportsLocal }),
+        reason: localReason ?? t("computer.unavailableLocal"),
+      },
+    }));
+    const managedBy = placeManagedBy(mode, bot.cloudBackend, state.config?.managedPolicy);
+    return {
+      mode, labelKey, descriptionKey, Icon, view, managedBy,
+      selected: worksOnSelected(mode, bot.computer, capabilities),
+      disabled: Boolean(managedBy) || placeBlocked(view),
+      issue: !managedBy && placeHasIssue(view),
+      note: placeHasIssue(view) ? view.line : mode === "local" ? localReason ?? undefined : undefined,
+    };
+  });
+  const choose = (mode: WorksOnMode) => patch(mode === "browser" ? { computer: mode, browser: true } : { computer: mode });
+  return <>
+    <div className="text-[15px] font-medium text-ink">{t("computer.worksOn")}</div>
+    <p className="mt-1 text-[12px] leading-5 text-ink-secondary">{t(state.config?.cloudHome ? "computer.worksOnHintCloudHome" : "computer.worksOnHint")}</p>
+    <WorksOnGrid options={options} onSelect={choose} />
+  </>;
+}
+
+export type AccessPart = "worksOn" | "folder" | "apps" | "phone" | "xResearch" | "teamFiles" | "mcp" | "tools" | "browser" | "webhooks" | "always";
 
 export function AccessSection({
   bot,
@@ -665,7 +702,7 @@ export function AccessSection({
   parts?: readonly AccessPart[];
 }) {
   const { draft } = useBotEditor();
-  const { state, dispatch } = useStore();
+  const state = useStoreSelector((s) => ({ config: s.config, instances: s.instances, webhooks: s.webhooks }), sameFields), dispatch = useStoreDispatch();
   const {
     patch,
     canUseConnectedApps,
@@ -681,15 +718,16 @@ export function AccessSection({
   } = derived;
   const browserInstallable = state.config?.browserEngine?.installable === true;
   const { capabilities } = useDesktopCapabilities();
-  const placeSeat = usePlaceSeat(state.config, capabilities.host?.platform ?? "other");
+  const placeSeat = usePlaceSeat(state.config, capabilities);
   const worksOn = placeViewFor(placeFacts({
     bot, place: bot.computer ?? "auto", seat: placeSeat, config: state.config, instances: state.instances,
   }));
-  // The same list the Vault tab shows: Composio's connected accounts plus the native HighLevel connection.
+  // The same list the Vault tab shows: Composio's connected accounts plus the native Email connection.
   const apps = useBotApps(bot);
   const inventoryReady = apps.phase === "ready";
   const connectedSlugs = apps.connectedSlugs;
   const appLabels = Object.fromEntries(apps.apps.map((app) => [app.slug, app.label]));
+  const appAccounts = Object.fromEntries(apps.apps.map((app) => [app.slug, app.accounts ?? []]));
 
   const webhooks = state.webhooks.filter((webhook) => webhook.botId === bot.id);
   const alwaysAllow = bot.alwaysAllow ?? [];
@@ -698,18 +736,20 @@ export function AccessSection({
   return (
     <div className="flex flex-col gap-4">
       {shows("worksOn") && <div className="rounded-xl bg-card p-4" data-testid="access-works-on">
-        <div className="text-[15px] font-medium text-ink">{t("access.worksOn", { name: bot.name, short: worksOn.short })}</div>
-        <ProposalStatus bot={bot} kind="owner" />
-        <button
-          type="button"
-          onClick={() => {
-            dispatch({ type: "toggleSettings", open: false });
-            dispatch({ type: "toggleComputer", open: true });
-          }}
-          className="mt-3 rounded-lg bg-control px-3 py-1.5 text-[13px] text-ink hover:bg-raised-hover"
-        >
-          {t("place.action.openComputerPanel")}
-        </button>
+        {draft ? <DraftWorksOn bot={bot} patch={patch} seat={placeSeat} /> : <>
+          <div className="text-[15px] font-medium text-ink">{t("access.worksOn", { name: bot.name, short: worksOn.short })}</div>
+          <ProposalStatus bot={bot} kind="owner" />
+          <button
+            type="button"
+            onClick={() => {
+              dispatch({ type: "toggleSettings", open: false });
+              dispatch({ type: "toggleComputer", open: true });
+            }}
+            className="mt-3 rounded-lg bg-control px-3 py-1.5 text-[13px] text-ink hover:bg-raised-hover"
+          >
+            {t("place.action.openComputerPanel")}
+          </button>
+        </>}
         <CloudPreference bot={bot} patch={patch} />
       </div>}
 
@@ -753,18 +793,14 @@ export function AccessSection({
         </div>
         {connectedAppsEnabled && inventoryReady && (
           <>
-            {!draft && <ConnectorScopesControl connectedSlugs={connectedSlugs} labels={appLabels} scopes={bot.connectorScopes} onChange={(connectorScopes) => patch({ connectorScopes })} />}
-            {/* Tool-level grants list Composio's tools; HighLevel's tools are scoped by read/write above. */}
-            <ConnectorToolsGrants bot={bot} patch={patch} slugs={connectedSlugs.filter((slug) => slug !== HIGHLEVEL_SLUG)} />
+            {!draft && <ConnectorScopesControl connectedSlugs={connectedSlugs} labels={appLabels} accounts={appAccounts} scopes={bot.connectorScopes} onChange={(connectorScopes) => patch({ connectorScopes })} />}
+            <ConnectorToolsGrants bot={bot} patch={patch} slugs={connectedSlugs} />
           </>
         )}
         {connectedAppsEnabled && connectedAppsConfigured && (
           <button
             type="button"
-            onClick={() => {
-              dispatch({ type: "toggleSettings", open: false });
-              dispatch({ type: "togglePlugins", open: true, surface: "apps" });
-            }}
+            onClick={() => connectAppFromBot(dispatch, bot.id)}
             className="mt-3 flex items-center gap-1.5 rounded-lg bg-control px-3 py-2 text-[13px] text-ink hover:bg-raised-hover"
           >
             <Plus size={14} /> {t("botAccess.connectApp")}
@@ -772,7 +808,9 @@ export function AccessSection({
         )}
       </div>}
 
+      {shows("phone") && <PhoneAppsCard bot={bot} patch={patch} />}
       {shows("mcp") && <McpServersCard bot={bot} patch={patch} />}
+      {!draft && shows("tools") && <ToolGroupsCard bot={bot} patch={patch} />}
       {shows("tools") && <ToolSelectionCard key={bot.id} bot={bot} engineKind={derived.engine?.driverKind} />}
 
       {shows("browser") && <div className="rounded-xl bg-card p-4">
@@ -820,6 +858,10 @@ export function AccessSection({
 
       {!draft && shows("xResearch") && <ResearchCard bot={bot} patch={patch} />}
 
+      {!draft && shows("teamFiles") && state.config?.team && <TeamFilesCard bot={bot} patch={patch} />}
+
+      {!draft && shows("webhooks") && <BotApiCard bot={bot} />}
+
       {!draft && shows("webhooks") && <div className="rounded-xl bg-card p-4">
         <div className="text-[15px] font-medium text-ink">{t("botAccess.webhooks.title")}</div>
         <div className="mt-0.5 text-[13px] text-ink-secondary">{t("botAccess.webhooks.description")}</div>
@@ -839,7 +881,7 @@ export function AccessSection({
                 >
                   {webhook.enabled ? t("botAccess.webhooks.active") : t("botAccess.webhooks.paused")}
                 </span>
-                <span className="shrink-0 text-[11.5px] tabular-nums text-ink-secondary">
+                <span className="shrink-0 text-[12px] tabular-nums text-ink-secondary">
                   {t("botAccess.webhooks.deliveries", { count: webhook.deliveryCount })}
                 </span>
               </div>
@@ -858,7 +900,7 @@ export function AccessSection({
           <div className="mt-3 divide-y divide-hairline/40 overflow-hidden rounded-lg border border-hairline/40">
             {alwaysAllow.map((entry) => (
               <div key={entry} className="flex items-center justify-between gap-3 px-3 py-2">
-                <span className="min-w-0 flex-1 truncate font-mono text-[12.5px] text-ink">{entry}</span>
+                <span className="min-w-0 flex-1 truncate font-mono text-[13px] text-ink">{entry}</span>
                 <button
                   type="button"
                   aria-label={t("botAccess.always.remove", { entry })}
@@ -877,20 +919,36 @@ export function AccessSection({
   );
 }
 
-function ConnectorScopesControl({ connectedSlugs, labels = {}, scopes, onChange }: {
+export function ConnectorScopesControl({ connectedSlugs, labels = {}, accounts = {}, scopes, onChange }: {
   connectedSlugs: string[];
   /** display names by slug; a slug without one shows as itself */
   labels?: Record<string, string>;
+  /** each app's connected accounts; an app with two or more can be limited to some of them */
+  accounts?: Record<string, ConnectorAccount[]>;
   scopes: ConnectorScopes | undefined;
   onChange: (scopes: ConnectorScopes | null) => void;
 }) {
   const limited = scopes !== undefined;
   const slugs = [...new Set([...connectedSlugs, ...Object.keys(scopes?.apps ?? {})])].sort();
+  const emit = (apps: ConnectorScopes["apps"], limits: Record<string, string[]>) =>
+    onChange(Object.keys(limits).length ? { apps, accounts: limits } : { apps });
   const setScope = (slug: string, scope: ConnectorScope | null) => {
     const apps = { ...scopes?.apps };
+    const limits = { ...scopes?.accounts };
     if (scope) apps[slug] = scope;
-    else delete apps[slug];
-    onChange({ apps });
+    else {
+      delete apps[slug];
+      delete limits[slug];
+    }
+    emit(apps, limits);
+  };
+  // No limit means every account, also ones connected later; once a box is changed the ticked ids stay a limit, so a
+  // later account is allowed only when it is ticked too. Ids no longer connected are dropped.
+  const connectedIds = (slug: string) => (accounts[slug] ?? []).map((account) => account.id);
+  const allowedIds = (slug: string) => scopes?.accounts?.[slug]?.filter((id) => connectedIds(slug).includes(id)) ?? connectedIds(slug);
+  const setAccount = (slug: string, id: string, on: boolean) => {
+    const ids = allowedIds(slug).filter((one) => one !== id).concat(on ? [id] : []);
+    emit({ ...scopes?.apps }, { ...scopes?.accounts, [slug]: ids });
   };
   return <div className="mt-3">
     <div className="flex items-center justify-between gap-4">
@@ -900,14 +958,26 @@ function ConnectorScopesControl({ connectedSlugs, labels = {}, scopes, onChange 
       <Switch checked={limited} aria-label={t("botAccess.scopes.limitLabel")} onClick={() => onChange(limited ? null : { apps: {} })} />
     </div>
     {limited && <div className="mt-2 flex flex-col divide-y divide-hairline/20 rounded-lg bg-inset">
-      {!slugs.length && <div className="px-3 py-2 text-[11.5px] text-ink-secondary">{t("botAccess.scopes.empty")}</div>}
+      {!slugs.length && <div className="px-3 py-2 text-[12px] text-ink-secondary">{t("botAccess.scopes.empty")}</div>}
       {slugs.map((slug) => <div key={slug} className="flex flex-wrap items-center justify-between gap-3 px-3 py-1.5">
-        <span className="min-w-0 text-[13px] text-ink">{labels[slug] ?? slug}{!connectedSlugs.includes(slug) && <span className="ml-2 text-[10.5px] text-ink-secondary">{t("botAccess.scopes.notConnected")}</span>}</span>
+        <span className="min-w-0 text-[13px] text-ink">{labels[slug] ?? slug}{!connectedSlugs.includes(slug) && <span className="ml-2 text-[11px] text-ink-secondary">{t("botAccess.scopes.notConnected")}</span>}</span>
         <div className="flex shrink-0 gap-0.5 rounded-md bg-card p-0.5" role="group" aria-label={t("botAccess.scopes.accessLabel", { app: slug })}>
           {([[null, t("botAccess.scopes.off"), t("botAccess.scopes.offHint")], ["read", t("botAccess.scopes.read"), t("botAccess.scopes.readHint")], ["write", t("botAccess.scopes.readWrite"), t("botAccess.scopes.readWriteHint")]] as const).map(([value, label, hint]) =>
             <button key={label} type="button" title={hint} aria-pressed={(scopes?.apps[slug] ?? null) === value} onClick={() => setScope(slug, value)}
-              className={cn("rounded px-2 py-0.5 text-[11.5px] font-medium", (scopes?.apps[slug] ?? null) === value ? "bg-raised text-ink" : "text-ink-secondary hover:text-ink")}>{label}</button>)}
+              className={cn("rounded px-2 py-0.5 text-[12px] font-medium", (scopes?.apps[slug] ?? null) === value ? "bg-raised text-ink" : "text-ink-secondary hover:text-ink")}>{label}</button>)}
         </div>
+        {scopes?.apps[slug] && ((accounts[slug]?.length ?? 0) > 1 || scopes.accounts?.[slug]) && <fieldset className="flex w-full flex-wrap items-center gap-x-3 gap-y-1">
+          <legend className="sr-only">{t("botAccess.scopes.accountsLabel")}</legend>
+          <span aria-hidden className="text-[12px] text-ink-secondary">{t("botAccess.scopes.accountsLabel")}</span>
+          {(accounts[slug] ?? []).map((account) => {
+            const allowed = allowedIds(slug);
+            const on = allowed.includes(account.id);
+            return <label key={account.id} className="flex items-center gap-1.5 text-[12px] text-ink">
+              <input type="checkbox" checked={on} disabled={on && allowed.length === 1} onChange={(event) => setAccount(slug, account.id, event.target.checked)} />
+              {account.alias ?? account.id}
+            </label>;
+          })}
+        </fieldset>}
       </div>)}
     </div>}
   </div>;

@@ -3,18 +3,27 @@
 // access, a viewer that may operate sizes the page while it only watches, a larger frame cap is sent in place and a
 // reconnect opens with the newest size and cap, and OpenMausBot's own messages are passed on.
 
+import { t } from "./i18n";
+
 /** The browser's host cannot run Chrome until it is set up; the close reason names the fix. */
 export const PREVIEW_STREAM_HOST_SETUP_CLOSE_CODE = 4503;
 export const PREVIEW_STREAM_TAB_GONE_CODE = 4404;
 
-export interface PreviewStreamHostSetup {
-  readonly need: "sandbox" | "libraries";
-  readonly command: string;
-}
+/** A sandbox has no command to run, only steps for an administrator; missing libraries have one, a container a setting. */
+export type PreviewStreamHostSetup =
+  | { readonly need: "sandbox" }
+  | { readonly need: "libraries" | "container"; readonly command: string };
+
+/** The server's LIBRARIES_COMMAND and SANDBOX_STEPS_URL: a close reason is too short to carry the link. */
+export const PREVIEW_STREAM_LIBRARIES_COMMAND = "sudo openmausbot browser install --with-deps";
+/** What a container's operator sets to run its browser without Chrome's own sandbox. */
+export const PREVIEW_STREAM_SANDBOX_OFF = "OMB_BROWSER_SANDBOX=0";
+export const PREVIEW_STREAM_SANDBOX_STEPS_URL =
+  "https://github.com/milind-soni/OpenMausBot/blob/main/docs/deploy-vps.md#ubuntu-2404-browser-sandbox";
 
 export type PreviewViewportSetting =
   | { readonly mode: "fill" }
-  | { readonly mode: "preset"; readonly preset: "desktop" | "tablet" | "phone"; readonly landscape?: boolean };
+  | { readonly mode: "preset"; readonly preset: "desktop" | "fullHd" | "tablet" | "phone"; readonly landscape?: boolean };
 
 /** Where a bot's browser is served: `httpBase` and `wsBase` end in `/api/bots/<id>/browser`. */
 export interface PreviewStreamAccess {
@@ -34,12 +43,12 @@ export const withAccessQuery = (url: string, access: PreviewStreamAccess): strin
 };
 
 /** The same origin's routes for a bot's browser. */
-export function browserStreamAccess(botId: string, location: Pick<Location, "protocol" | "host"> = window.location): PreviewStreamAccess {
+export function browserStreamAccess(botId: string, location: Pick<Location, "protocol" | "host"> = window.location, scope: Readonly<Record<string, string>> = {}): PreviewStreamAccess {
   const path = `/api/bots/${encodeURIComponent(botId)}/browser`;
   return {
     httpBase: `${location.protocol}//${location.host}${path}`,
     wsBase: `${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}${path}`,
-    query: {},
+    query: { ...scope },
     credentials: true,
   };
 }
@@ -62,6 +71,8 @@ export interface PreviewStreamControl {
   };
   /** The bot's work outlasted the person's takeover and was cut off. */
   readonly stale?: boolean;
+  /** The person watching holds the browser, from this view or another of theirs: they may hand it back from here. */
+  readonly owned?: boolean;
 }
 
 /** Status line shown above a viewer; `null` control means the socket is not connected. */
@@ -95,6 +106,9 @@ export type PreviewStreamInput =
   | { readonly type: "dialog"; readonly accept: boolean; readonly promptText?: string }
   | { readonly type: "viewport"; readonly setting: PreviewViewportSetting }
   | { readonly type: "zoom"; readonly factor: number }
+  /** The installed extensions, for the Extensions menu; an extension's own page opens by its id only. */
+  | { readonly type: "extensions" }
+  | { readonly type: "openExtension"; readonly id: string }
   | {
       readonly type: "mouse";
       readonly action: "move" | "down" | "up";
@@ -182,7 +196,7 @@ export async function uploadPreviewStreamFiles(
     try {
       message = (JSON.parse(text) as { error?: string }).error ?? text;
     } catch {}
-    throw new Error(message || "The upload was refused.");
+    throw new Error(message || t("browser.page.uploadRefused"));
   }
 }
 
@@ -265,9 +279,11 @@ export interface PreviewStreamClient {
   readonly stop: () => void;
 }
 
-/** A viewer that may operate sizes the page while it watches, and may restart or wake it; everything else needs control. */
+/** A viewer that may operate sizes the page while it watches, and may restart or wake it; the person holding the browser
+ * hands it back from any of their views; everything else needs control. */
 const allowed = (input: PreviewStreamInput, control: PreviewStreamControl): boolean =>
-  input.type === "takeControl" || input.type === "resize" || input.type === "frameCap" || input.type === "restart" || input.type === "wake" || control.controller === "you";
+  input.type === "takeControl" || input.type === "resize" || input.type === "frameCap" || input.type === "restart" || input.type === "wake"
+  || (input.type === "releaseControl" && control.owned === true) || control.controller === "you";
 
 const ACK_MESSAGE = JSON.stringify({ type: "ack" });
 export function createPreviewStreamClient(
@@ -335,6 +351,7 @@ export function createPreviewStreamClient(
         generation,
         dialog,
         stale,
+        owned,
         text,
         id,
         fileName,
@@ -412,6 +429,7 @@ export function createPreviewStreamClient(
           generation,
           dialog,
           ...(stale === true ? { stale: true } : {}),
+          ...(owned === true ? { owned: true } : {}),
         };
         const first = control === null;
         control = nextControl;
@@ -526,22 +544,21 @@ export function createPreviewFramePainter(
   };
 }
 
-/** A malformed reason still stops the viewer and offers the usual command. */
+/** A malformed reason still stops the viewer, with the sandbox steps. */
 const decodeHostSetup = (reason: string): PreviewStreamHostSetup => {
   try {
-    const value = JSON.parse(reason) as Partial<PreviewStreamHostSetup>;
-    if (
-      (value.need === "sandbox" || value.need === "libraries") &&
-      typeof value.command === "string"
-    ) {
-      return { need: value.need, command: value.command };
-    }
+    // An older server's command for either need was `openmausbot browser setup`, which never existed.
+    const need = (JSON.parse(reason) as { need?: unknown }).need;
+    if (need === "libraries") return { need, command: PREVIEW_STREAM_LIBRARIES_COMMAND };
+    if (need === "container") return { need, command: PREVIEW_STREAM_SANDBOX_OFF };
   } catch {}
-  return { need: "sandbox", command: "sudo openmausbot browser setup" };
+  return { need: "sandbox" };
 };
 
-/** What a viewer tells the person; `command` is shown beside it, ready to copy. */
+/** What a viewer tells the person; beside it, the `command` ready to copy or a link to the sandbox steps. */
 export const previewStreamHostSetupMessage = (setup: PreviewStreamHostSetup) =>
   setup.need === "sandbox"
-    ? "This server's host blocks the sandbox its browser runs in. Run this once on the host, then try again:"
+    ? "This server's host blocks the sandbox its browser runs in. An administrator can allow it for one copy of Chrome with these steps, then try again:"
+    : setup.need === "container"
+    ? "Chrome's sandbox can't start in this server's container. Its operator can set this to run the browser without it and rely on the container's isolation, then restart OpenMausBot:"
     : "This server's host is missing libraries its browser needs. Run this once on the host, then try again:";

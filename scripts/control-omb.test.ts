@@ -14,6 +14,15 @@ describe("a fixture driven from a real browser", () => {
     expect(childEnv({}).OMB_DEV_TRUST_LOCAL_BROWSER).toBe("1");
     expect(childEnv({ OMB_DEV_TRUST_LOCAL_BROWSER: "0" })).not.toHaveProperty("OMB_DEV_TRUST_LOCAL_BROWSER");
   });
+
+  it("boots on the bundled model list, never the one published on main", () => {
+    expect(childEnv({}).OMB_DISABLE_MODEL_MANIFEST_FETCH).toBe("1");
+    expect(childEnv({ OMB_DISABLE_MODEL_MANIFEST_FETCH: "0" }).OMB_DISABLE_MODEL_MANIFEST_FETCH).toBe("1");
+  });
+
+  it("checks every narrowed save of bots.json against the whole serialization", () => {
+    expect(childEnv({}).OMB_BOTS_SAVE_CHECK).toBe("1");
+  });
 });
 
 describe("the fixture's fake engine knobs", () => {
@@ -24,6 +33,21 @@ describe("the fixture's fake engine knobs", () => {
     });
     expect(env).toMatchObject({ FAKE_CLAUDE_TEXT_ROUTES: "/tmp/routes.json", FAKE_CODEX_TEXT_ROUTES: "/tmp/codex-routes.json", FAKE_CODEX_TEXT_LOG: "/tmp/codex.jsonl" });
     for (const key of ["FAKE_CODEX_MODE", "FAKE_CODEX_DUMP", "SOME_SECRET"]) expect(env, key).not.toHaveProperty(key);
+  });
+
+  it("lets every fake's scripted stream cross, for a reply that arrives in pieces", () => {
+    const env = childEnv({ FAKE_STREAM_SCRIPT: "/tmp/script.json", FAKE_STREAM_CADENCE: "3:90", FAKE_ACP_DUMP: "/tmp/acp.json" });
+    expect(env).toMatchObject({ FAKE_STREAM_SCRIPT: "/tmp/script.json", FAKE_STREAM_CADENCE: "3:90" });
+    expect(env).not.toHaveProperty("FAKE_ACP_DUMP");
+  });
+});
+
+describe("the fixture's Netlify stand-in", () => {
+  it("lets only a loopback stand-in's API address cross, so a fixture never lists or deletes on Netlify", () => {
+    expect(childEnv({ OMB_NETLIFY_API_URL: " http://127.0.0.1:4010/api/v1 " }).OMB_NETLIFY_API_URL).toBe("http://127.0.0.1:4010/api/v1");
+    for (const url of ["https://api.netlify.com/api/v1", "http://localhost:4010/api/v1", "http://127.0.0.1:4010", "http://127.0.0.1:4010/api/v1@evil.test", "http://192.0.2.1:4010/api/v1", ""]) {
+      expect(childEnv({ OMB_NETLIFY_API_URL: url }), url).not.toHaveProperty("OMB_NETLIFY_API_URL");
+    }
   });
 });
 
@@ -46,6 +70,19 @@ describe("the fixture's Live call environment", () => {
   });
 });
 
+describe("the fixture's included app hosting relay", () => {
+  it("passes a loopback stand-in and its token through together, and neither for any other address", () => {
+    expect(childEnv({ OMB_CLOUD_HOSTING_URL: " http://127.0.0.1:4400/api/cloud/services/hosting/v1 ", OMB_CLOUD_HOSTING_TOKEN: "omb_host_fixture" }))
+      .toMatchObject({ OMB_CLOUD_HOSTING_URL: "http://127.0.0.1:4400/api/cloud/services/hosting/v1", OMB_CLOUD_HOSTING_TOKEN: "omb_host_fixture" });
+    for (const url of ["https://cloud.openmausbot.com/api/cloud/services/hosting/v1", "http://localhost:4400/api/cloud/services/hosting/v1", "http://192.0.2.1:4400", "http://127.0.0.1:4400/../x?y", ""]) {
+      const env = childEnv({ OMB_CLOUD_HOSTING_URL: url, OMB_CLOUD_HOSTING_TOKEN: "omb_host_real" });
+      expect(env, url).not.toHaveProperty("OMB_CLOUD_HOSTING_URL");
+      expect(env, url).not.toHaveProperty("OMB_CLOUD_HOSTING_TOKEN");
+    }
+    expect(childEnv({ OMB_CLOUD_HOSTING_URL: "http://127.0.0.1:4400/api/cloud/services/hosting/v1" })).not.toHaveProperty("OMB_CLOUD_HOSTING_URL");
+  });
+});
+
 describe("the fixture's X research relay", () => {
   it("passes a loopback relay stub and its token through, the token only with the stub", () => {
     expect(childEnv({ OMB_CLOUD_X_URL: " http://127.0.0.1:4200/api/cloud/services/x ", OMB_CLOUD_X_TOKEN: "omb_x_fixture" }))
@@ -57,5 +94,16 @@ describe("the fixture's X research relay", () => {
     }
     expect(childEnv({ OMB_TREG_URL: " http://127.0.0.1:4300 " })).toMatchObject({ OMB_TREG_URL: "http://127.0.0.1:4300" });
     for (const url of ["https://treg.to", "http://localhost:4300", "http://127.0.0.1:4300/x", ""]) expect(childEnv({ OMB_TREG_URL: url }), url).not.toHaveProperty("OMB_TREG_URL");
+  });
+});
+
+describe("the fixture's @devs reports", () => {
+  it("go to a loopback fake endpoint, else to a closed port: never to the MausBot team", () => {
+    const closed = "http://127.0.0.1:9/api/bug-reports";
+    expect(childEnv({ OMB_BUG_REPORT_URL: " http://127.0.0.1:4400/api/bug-reports " }).OMB_BUG_REPORT_URL).toBe("http://127.0.0.1:4400/api/bug-reports");
+    for (const url of ["https://cloud.openmausbot.com/api/bug-reports", "http://localhost:4400/api/bug-reports", "http://192.0.2.1:4400/x", "http://127.0.0.1:4400/../x?y", ""]) {
+      expect(childEnv({ OMB_BUG_REPORT_URL: url }).OMB_BUG_REPORT_URL, url).toBe(closed);
+    }
+    expect(childEnv({}).OMB_BUG_REPORT_URL).toBe(closed);
   });
 });

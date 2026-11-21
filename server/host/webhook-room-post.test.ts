@@ -135,7 +135,7 @@ describe("postWebhookToRoom", () => {
     expect(h.calls.synthesized).toEqual([{ botId: "maus-1", text: "hello there" }]);
     expect(result).toEqual({ posted: true, attachments: 2, threadId: "room-1-thread" });
     expect(h.calls.appended[0]!.content.attachments).toEqual([
-      { kind: "audio", path: "/audio/0.mp3", mime: "audio/mpeg" },
+      { kind: "audio", path: "/audio/0.mp3", mime: "audio/mpeg", text: "hello there" },
       { kind: "image", path: "/image/0.png", mime: "image/png" },
     ]);
   });
@@ -286,6 +286,26 @@ describe("createWebhookRoomPost", () => {
       expect(h.appended).toEqual([]);
       expect(stored()).toEqual([]);
     } finally {
+      restore();
+    }
+  });
+
+  it("receipts the actual thread when the room changes conversations during synthesis", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    try {
+      const h = host(chatterbox, (async () => {
+        await gate;
+        return mp3("http://fixture.invalid");
+      }) as typeof fetch);
+      const delivery = h.roomPost({ ...trigger, groupId: "room-1" } as WebhookTrigger, { text: "Deploy done", voiceNote: "deploy done" });
+      h.group.threadId = "room-1-new-thread";
+      release();
+      expect(await delivery).toEqual({ posted: true, attachments: 1, threadId: "room-1-new-thread" });
+      expect(h.appended).toHaveLength(1);
+      expect(h.appended[0]?.threadId).toBe("room-1-new-thread");
+    } finally {
+      release();
       restore();
     }
   });

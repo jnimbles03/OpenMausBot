@@ -10,7 +10,7 @@ import { approvalModeFor } from "../../shared/approval-mode.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 import type { VerbContext } from "./context.ts";
 import { Output } from "./output.ts";
-import { botPatch, reconcile, skillFilePath, teamExportVerb, type ApplyOptions } from "./team-apply.ts";
+import { botPatch, botSkillDirs, reconcile, skillFilePath, teamExportVerb, type ApplyOptions } from "./team-apply.ts";
 import { loadTeamFile, type DesiredBot, type TeamFile } from "./team-file.ts";
 
 type Rec = Record<string, any>;
@@ -77,7 +77,7 @@ function workspace(seed: { bots?: Rec[]; groups?: Rec[]; sections?: string[]; co
     throw new Error(`no route for ${method} ${path}`);
   };
   const client: HeadlessClient = {
-    baseUrl: "http://omb", explicit: true, json, raw: async () => { throw new Error("no raw reads here"); },
+    baseUrl: "http://omb", explicit: true, identity: { kind: "none" }, json, raw: async () => { throw new Error("no raw reads here"); },
     tool: async (name, args: Rec) => {
       writes.push(`tool ${name}`);
       if (name === "create_channel") state.groups.push({ id: `room-${++ids}`, name: args.name, memberIds: args.member_ids, section: args.section,
@@ -306,11 +306,34 @@ describe("botPatch", () => {
 
 describe("team export", () => {
   it("names a skill's file with /, so a file exported on Windows applies on Linux", () => {
-    expect(skillFilePath("Room Lead", "launch-report")).toBe("skills/room-lead/launch-report/SKILL.md");
-    expect(skillFilePath("!!!", "notes")).toBe("skills/bot/notes/SKILL.md");
+    expect(skillFilePath("room-lead", "launch-report")).toBe("skills/room-lead/launch-report/SKILL.md");
   });
 
-  it("takes a key written into a soul, a brief or a skill out of the file, and apply leaves those as they are", async () => {
+  it.each(["yaml", "json", "JSON"])("keeps each bot's skill files when a %s export is read back", async (extension) => {
+    expect(botSkillDirs(["Room Lead", "!!!", "Room-Lead", "Room Lead 2"])).toEqual(["room-lead", "bot", "room-lead-2", "room-lead-2-2"]);
+    const skill = (body: string) => `---\nname: common\ndescription: Shared.\n---\n${body}\n`;
+    const { client, state } = workspace({ bots: [{ id: "bot-a", name: "Dev A" }, { id: "bot-b", name: "Dev-A" }, { id: "bot-c", name: "Dev A 2" }] });
+    state.skills["bot-a"] = { common: { text: skill("first"), enabled: true } };
+    state.skills["bot-b"] = { common: { text: skill("second"), enabled: true } };
+    state.skills["bot-c"] = { common: { text: skill("third"), enabled: true } };
+    const dir = mkdtempSync(join(tmpdir(), "omb-team-export-"));
+    try {
+      const out = join(dir, `team.${extension}`);
+      const ctx = { verb: "team export", flags: { out }, positionals: [], env: {}, io: { out: () => undefined, err: () => undefined, readStdin: async () => "" },
+        output: new Output({ out: () => undefined, err: () => undefined, readStdin: async () => "" }, {}), client: async () => client,
+        signal: new AbortController().signal, defaultWaitMs: 1_000, botShell: false, saved: null, interactive: false, confirm: async () => false, openBrowser: async () => false } as VerbContext;
+      await teamExportVerb(ctx);
+      if (extension === "yaml") expect(readFileSync(out, "utf8")).toMatch(/^# Written by openmausbot team export/);
+      const back = loadTeamFile(out);
+      expect(back.bots.map((bot) => [bot.name, bot.skills.map((s) => s.text.trim().split("\n").at(-1))])).toEqual([
+        ["Dev A", ["first"]], ["Dev-A", ["second"]], ["Dev A 2", ["third"]],
+      ]);
+    } finally {
+      await removeTempDir(dir);
+    }
+  });
+
+  it.each(["yaml", "json", "JSON"])("redacts secrets in a %s export and leaves them unchanged when applied", async (extension) => {
     const KEY = "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123456789";
     const { client, writes, state } = workspace();
     await reconcile(client, file(), options());
@@ -319,10 +342,10 @@ describe("team export", () => {
     state.skills["bot-1"]!["launch-report"]!.text = `---\nname: launch-report\ndescription: Write it.\n---\nUpload with ${KEY}\n`;
     const dir = mkdtempSync(join(tmpdir(), "omb-team-export-"));
     try {
-      const out = join(dir, "team.yaml");
+      const out = join(dir, `team.${extension}`);
       const ctx = { verb: "team export", flags: { out }, positionals: [], env: {}, io: { out: () => undefined, err: () => undefined, readStdin: async () => "" },
         output: new Output({ out: () => undefined, err: () => undefined, readStdin: async () => "" }, {}), client: async () => client,
-        signal: new AbortController().signal, defaultWaitMs: 1_000 } as VerbContext;
+        signal: new AbortController().signal, defaultWaitMs: 1_000, botShell: false, saved: null, interactive: false, confirm: async () => false, openBrowser: async () => false } as VerbContext;
       const exported = await teamExportVerb(ctx);
       expect((exported.result as Rec).redacted).toEqual(['team "Launch Room" brief', 'bot "Room Lead" soul', 'bot "Room Lead" skill launch-report']);
       const written = [readFileSync(out, "utf8"), readFileSync(join(dir, "skills/room-lead/launch-report/SKILL.md"), "utf8")].join("\n");

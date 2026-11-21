@@ -1,19 +1,21 @@
-import { useMemo, useState, type DragEvent } from "react";
+import { memo, useMemo, useState, type DragEvent } from "react";
 import { GripVertical, Search, UsersRound } from "lucide-react";
 import { BotAvatar } from "@/components/Avatar";
-import type { Bot } from "@/state/store";
+import type { BotApartFromTurns } from "@/state/apart-from-turns";
 import { MiniMonth } from "./MiniMonth";
 import { t } from "@/lib/i18n";
 
 export const BOT_CALENDAR_DRAG_TYPE = "application/x-openmaus-bot";
 
 export interface CalendarSidebarProps {
-  bots: Bot[];
+  bots: readonly BotApartFromTurns[];
   anchor: number;
   onSelectDate: (at: number) => void;
+  /** Drawn again in a new language. */
+  locale?: string;
 }
 
-export function CalendarSidebar({ bots, anchor, onSelectDate }: CalendarSidebarProps) {
+export const CalendarSidebar = memo(function CalendarSidebar({ bots, anchor, onSelectDate }: CalendarSidebarProps) {
   const [query, setQuery] = useState("");
   const filteredBots = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
@@ -23,7 +25,7 @@ export function CalendarSidebar({ bots, anchor, onSelectDate }: CalendarSidebarP
     );
   }, [bots, query]);
 
-  const beginBotDrag = (event: DragEvent<HTMLDivElement>, bot: Bot) => {
+  const beginBotDrag = (event: DragEvent<HTMLDivElement>, bot: BotApartFromTurns) => {
     event.dataTransfer.effectAllowed = "copy";
     event.dataTransfer.setData(BOT_CALENDAR_DRAG_TYPE, bot.id);
     event.dataTransfer.setData("text/plain", bot.id);
@@ -61,7 +63,7 @@ export function CalendarSidebar({ bots, anchor, onSelectDate }: CalendarSidebarP
             onChange={(event) => setQuery(event.target.value)}
             type="search"
             placeholder={t("routines.sidebar.searchBots")}
-            className="h-8 w-full rounded-lg border border-hairline/45 bg-control/55 pl-8 pr-2.5 text-[11.5px] text-ink outline-none placeholder:text-ink-tertiary focus:border-accent/60 focus:bg-control"
+            className="h-8 w-full rounded-lg border border-hairline/45 bg-control/55 pl-8 pr-2.5 text-[12px] text-ink outline-none placeholder:text-ink-tertiary focus:border-accent/60 focus:bg-control"
           />
         </label>
 
@@ -83,12 +85,12 @@ export function CalendarSidebar({ bots, anchor, onSelectDate }: CalendarSidebarP
               />
               <BotAvatar bot={bot} size={27} animated={false} />
               <div className="min-w-0 flex-1">
-                <div className="truncate text-[11.5px] font-medium text-ink">{bot.name}</div>
-                <div className="truncate text-[9.5px] text-ink-tertiary">
-                  {bot.title || "BotAgent"}
+                <div className="truncate text-[12px] font-medium text-ink">{bot.name}</div>
+                <div className="truncate text-[10px] text-ink-tertiary">
+                  {bot.title || t("routines.sidebar.botFallback")}
                 </div>
               </div>
-              <span className="shrink-0 rounded-full border border-hairline/50 px-1.5 py-0.5 text-[8.5px] text-ink-tertiary opacity-0 transition-opacity group-hover:opacity-100">
+              <span className="shrink-0 rounded-full border border-hairline/50 px-1.5 py-0.5 text-[9px] text-ink-tertiary opacity-0 transition-opacity group-hover:opacity-100">
                 {t("routines.sidebar.drag")}
               </span>
             </div>
@@ -101,10 +103,10 @@ export function CalendarSidebar({ bots, anchor, onSelectDate }: CalendarSidebarP
           )}
         </div>
 
-        <p className="mt-2 px-2 text-[9.5px] leading-relaxed text-ink-tertiary">
+        <p className="mt-2 px-2 text-[10px] leading-relaxed text-ink-tertiary">
           {t("routines.sidebar.dragHint")}
         </p>
       </section>
     </aside>
   );
-}
+});

@@ -40,7 +40,7 @@ describe("spend cap and prices through real turns", () => {
     const routes = join(layerDir, "memory-replies.json");
     const dump = join(layerDir, "memory-call.json");
     writeFileSync(routes, JSON.stringify({
-      [CAPTURE_MARKER]: '[{"text":"Project codename is Bluebird","kind":"fact","confidence":0.9}]',
+      [CAPTURE_MARKER]: '[{"text":"Project codename is Bluebird","kind":"fact","evidence":"project codename is Bluebird","confidence":0.9}]',
       [ORGANIZE_MARKER]: '{"moves":[]}',
       [TIDY_MARKER]: '{"pairs":[]}',
     }));
@@ -75,7 +75,7 @@ describe("spend cap and prices through real turns", () => {
     }
     await expect.poll(rows).toHaveLength(1);
     expect(rows()[0]).toMatchObject({
-      botId: bot.id, botName: bot.name, driverKind: "claudeAgent", model: "claude-haiku-4-5",
+      botId: bot.id, botName: bot.name, driverKind: "claudeAgent", model: "claude-haiku-5-5",
       input: 15, output: 5, cachedInput: 2, costUsd: 0.01, costSource: "reported",
       trigger: { kind: "bot", botId: bot.id }, threadId: expect.stringMatching(/^memory-/),
     });
@@ -115,7 +115,7 @@ describe("spend cap and prices through real turns", () => {
   it.each([
     { name: "missing usage stays unpriced", metadata: {}, costUsd: null, costSource: undefined },
     { name: "reported zero stays reported", metadata: { total_cost_usd: 0 }, costUsd: 0, costSource: "reported" },
-    { name: "tokens without cost are estimated", metadata: { usage: { input_tokens: 10, output_tokens: 5 } }, costUsd: 0.000035, costSource: "estimated" },
+    { name: "tokens without cost are estimated", metadata: { usage: { input_tokens: 10, output_tokens: 5 } }, costUsd: 0.0000035, costSource: "estimated" },
   ])("memory helper accounting: $name", async ({ metadata, costUsd, costSource }) => {
     await session.close();
     session = await launchVerificationServer({ ...process.env,
@@ -183,8 +183,8 @@ describe("spend cap and prices through real turns", () => {
     expect((await put({ budgets: { monthlyUsd: 1 } })).status).toBe(200);
     expect((await send(botId, "fourth")).status).toBeLessThan(300);
     expect(JSON.stringify(await control(["wait", "--bot", botId, "--timeout", "30"]))).toContain("settled");
-    await expect.poll(async () => ((await (await api("/api/usage")).json()) as any).total.turns, { timeout: 10_000 }).toBe(3);
     const raised = (await (await api("/api/usage")).json()) as any;
+    expect(raised.total.turns).toBe(3);
     expect(raised.budget).toMatchObject({ monthlyUsd: 1, exceeded: false });
   }, 150_000);
 
@@ -224,12 +224,37 @@ describe("spend cap and prices through real turns", () => {
     expect(capErrors).toHaveLength(1);
     expect(JSON.stringify(page)).not.toContain("retrying once");
     expect(Number(readFileSync(replyState, "utf8"))).toBe(allowedTurns);
-    // The goal settles before the usage ledger's queued write is necessarily visible.
-    await expect.poll(async () => (await (await api("/api/usage")).json() as any).total.turns,
-      { timeout: 10_000 }).toBe(allowedTurns);
     const usage = await (await api("/api/usage")).json() as any;
     expect(usage.total.turns).toBe(allowedTurns);
     expect(usage.budget.exceeded).toBe(true);
+  }, 150_000);
+
+  it("sends no automatic title call once the workspace is at its spend cap", async () => {
+    await session.close();
+    const routes = join(layerDir, "title-replies.json");
+    const log = join(layerDir, "one-shots.jsonl");
+    writeFileSync(routes, JSON.stringify({ "Reply with only a short title": "Fixture title" }));
+    session = await launchVerificationServer({ ...process.env, FAKE_CLAUDE_TEXT_ROUTES: routes, FAKE_CLAUDE_TEXT_LOG: log },
+      undefined, undefined, undefined, { dir: layerDir, licenseKey: "fixture-key" });
+    const logged = () => { try { return readFileSync(log, "utf8"); } catch { return ""; } };
+    const titleCalls = (text: string) => logged().split("\n").filter((line) => line.includes("short title") && line.includes(text));
+    const json = (body: unknown): RequestInit => ({ method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    expect((await put({ budgets: { monthlyUsd: 0.01 } })).status).toBe(200);
+    const { bot } = await control(["new-bot", "--name", "Cap title probe"]);
+    expect((await send(bot.id, "Plan the spring offsite")).status).toBeLessThan(300);
+    await control(["wait", "--bot", bot.id, "--timeout", "30"]);
+    // Under the cap, the first message is named by the engine; the turn's $0.01 then reaches the cap.
+    await expect.poll(() => titleCalls("Plan the spring offsite").length, { timeout: 15_000 }).toBe(1);
+
+    const task = await api(`/api/bots/${bot.id}/tasks`, json({}));
+    const { threadId } = (await task.json() as any).task;
+    expect((await api(`/api/bots/${bot.id}/messages`, json({ text: "Draft the venue shortlist", threadId }))).status).toBe(409);
+    const room = await api("/api/groups", json({ name: "Capped room", memberIds: [bot.id], setup: { bulletin: "", defaultResponder: { kind: "everyone" } } }));
+    expect(room.status).toBe(201);
+    const { group } = await room.json() as { group: { id: string } };
+    expect((await api(`/api/groups/${encodeURIComponent(group.id)}/messages`, json({ text: "Book the venue for the team" }))).status).toBe(409);
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    expect([...titleCalls("Draft the venue shortlist"), ...titleCalls("Book the venue for the team")]).toEqual([]);
   }, 150_000);
 
   it("refuses the next room member at execution time once the cap is reached", async () => {

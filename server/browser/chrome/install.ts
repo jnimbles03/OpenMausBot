@@ -3,8 +3,8 @@
 import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { createWriteStream, existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
-import { once } from "node:events";
 import { dirname, join, win32 } from "node:path";
+import { pipeline } from "node:stream/promises";
 
 import { renameWithRetry } from "../../atomic.ts";
 
@@ -21,6 +21,8 @@ export interface ChromeForTestingPin {
 /** A platform without a SHA-256 here downloads nothing; scripts/pin-chrome-for-testing.ts measures new pins. */
 const PINS: Record<string, Omit<ChromeForTestingPin, "version">> = {
   "darwin-arm64": { platform: "mac-arm64", bytes: 190878359, sha256: "939ef9dc3aa74240c929d793e123edab0fda89c5a9cfeb029686c34141d2ed58" },
+  "linux-x64": { platform: "linux64", bytes: 195709628, sha256: "89778cbf7a852726b6f51649b2586b894c00737e81f8031733721560d21bbea7" },
+  "linux-arm64": { platform: "linux-arm64", bytes: 195919275, sha256: "ef3d2fea85e675ba8e9a7894c0be4595e5130659a9ac95e04c6064ed09f411da" },
 };
 
 const EXECUTABLES: Record<string, string> = {
@@ -60,36 +62,38 @@ export async function downloadArchive(
   url: string,
   destination: string,
   bytes: number,
-  options: { fetchImpl?: typeof fetch; onProgress?: (progress: DownloadProgress) => void; timeoutMs?: number } = {},
+  options: { fetchImpl?: typeof fetch; onProgress?: (progress: DownloadProgress) => void; timeoutMs?: number; label?: string } = {},
 ): Promise<string> {
+  const what = options.label ?? "Chrome";
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DOWNLOAD_TIMEOUT_MS);
   timer.unref?.();
-  const file = createWriteStream(destination, { mode: 0o600 });
-  const closed = once(file, "close");
   const hash = createHash("sha256");
   let received = 0;
   try {
     const response = await (options.fetchImpl ?? fetch)(url, { redirect: "follow", signal: controller.signal });
-    if (!response.ok || !response.body) throw new Error(`the Chrome download failed (HTTP ${response.status})`);
+    const body = response.body;
+    if (!response.ok || !body) throw new Error(`the ${what} download failed (HTTP ${response.status})`);
     const declared = Number(response.headers.get("content-length") ?? NaN);
-    if (Number.isFinite(declared) && declared !== bytes) throw new Error("the Chrome download did not match its pinned size; nothing was installed");
-    for await (const chunk of response.body) {
-      received += chunk.byteLength;
-      if (received > bytes) throw new Error("the Chrome download was larger than its pinned size; nothing was installed");
-      hash.update(chunk);
-      if (!file.write(chunk)) await once(file, "drain");
-      options.onProgress?.({ received, total: bytes });
-    }
+    if (Number.isFinite(declared) && declared !== bytes) throw new Error(`the ${what} download did not match its pinned size; nothing was installed`);
+    const file = createWriteStream(destination, { mode: 0o600 });
+    file.once("error", () => controller.abort());
+    await pipeline(async function* () {
+      for await (const chunk of body) {
+        received += chunk.byteLength;
+        if (received > bytes) throw new Error(`the ${what} download was larger than its pinned size; nothing was installed`);
+        hash.update(chunk);
+        yield chunk;
+        options.onProgress?.({ received, total: bytes });
+      }
+    }, file);
   } catch (error) {
     controller.abort();
     throw error;
   } finally {
     clearTimeout(timer);
-    file.end();
-    await closed;
   }
-  if (received !== bytes) throw new Error("the Chrome download ended early; nothing was installed");
+  if (received !== bytes) throw new Error(`the ${what} download ended early; nothing was installed`);
   return hash.digest("hex");
 }
 
@@ -102,7 +106,10 @@ export const extractZip: Extract = (archive, directory) => new Promise((resolve,
     ? [win32.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "tar.exe"), ["-xf", archive, "-C", directory]]
     : ["unzip", ["-q", archive, "-d", directory]];
   execFile(file, args, { timeout: EXTRACT_TIMEOUT_MS, windowsHide: true, maxBuffer: 16 * 1024 * 1024 }, (error) => {
-    if (error) reject(new Error(`the Chrome archive could not be unpacked: ${error.message}`));
+    if (error) {
+      const noUnzip = file === "unzip" && (error as NodeJS.ErrnoException).code === "ENOENT";
+      reject(new Error(noUnzip ? "the Chrome archive could not be unpacked: check that unzip is installed and on the server's PATH (Debian/Ubuntu: sudo apt-get install unzip)" : `the Chrome archive could not be unpacked: ${error.message}`));
+    }
     else resolve();
   });
 });

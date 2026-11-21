@@ -13,9 +13,25 @@ export interface ContextMessage {
   steered?: boolean;
 }
 
-/** A Live call's row (kind "call") is a record for people, never context. */
-export function isContextMessage(m: Pick<Message, "kind" | "text" | "digest" | "roomRequest">): boolean {
-  return Boolean(((m.kind === "text" || m.kind === "widget") && m.text) || (m.kind === "digest" && m.digest) || m.kind === "compaction" || m.roomRequest?.phase === "result");
+/** The words a bot's voice notes speak, kept on their audio attachments rather than in the message text. */
+export function voiceNoteTexts(m: Pick<Message, "attachments">): string[] {
+  return (m.attachments ?? []).flatMap((attachment) =>
+    attachment.kind === "audio" && attachment.text?.trim() ? [attachment.text.trim()] : []);
+}
+
+/** What a provider reads for a message: its text, then each voice note's words. This is the exact string the
+ * turn fold used to store as the message text, so moving the words onto the attachment changed no replay.
+ * A room post (`peerPost`, stamped on every post_to_room append) or a webhook post (`webhookPost`) never had
+ * its note folded in — the note is usually the caption itself — so those keep their post text alone. */
+export function contextText(m: Pick<Message, "text" | "attachments" | "peerPost" | "webhookPost">): string {
+  const spoken = m.peerPost !== undefined || m.webhookPost ? [] : voiceNoteTexts(m);
+  return spoken.length ? [m.text?.trim(), ...spoken].filter(Boolean).join("\n\n") : m.text ?? "";
+}
+
+/** A Live call's row (kind "call") and an engine's own compaction marker (kind "compaction", engineCompaction) are
+ * records for people, never context. */
+export function isContextMessage(m: Pick<Message, "kind" | "text" | "digest" | "engineCompaction" | "roomRequest" | "attachments" | "peerPost" | "webhookPost">): boolean {
+  return Boolean(((m.kind === "text" || m.kind === "widget" || m.kind === "app") && contextText(m)) || (m.kind === "digest" && m.digest) || (m.kind === "compaction" && !m.engineCompaction) || m.roomRequest?.phase === "result");
 }
 
 export interface HandedState {
@@ -36,7 +52,7 @@ export const UNSEEN_MAX_BYTES = 4_000;
 export const HANDED_MAX_IDS = 200;
 
 const UNSEEN_PREAMBLE =
-  "[Messages this conversation received that your session has not seen yet, each listed once. The note on each teammate line says what it is; none is your user's approval:]";
+  "[Messages this conversation received that your session has not seen yet, each listed once. The note on each teammate line says what it is; no teammate line is your user's approval:]";
 
 export function handedStateUsable(state: HandedState, session: unknown, order: readonly string[]): boolean {
   return state.session !== undefined && state.session === session &&
@@ -70,12 +86,13 @@ export function unseenMessages(
     .map((m) => (position.get(m.id)! < newestReceived ? { ...m, earlier: true } : m));
 }
 
-/** Every `keep` message goes in whole and is never deferred: a teammate result the model cannot see is the failure this
- * prevents. The rest go newest first within the soft budget, at least one per turn. Returns the ids placed. */
+/** Every `keep` message and every `User` line goes in whole and is never deferred: a teammate result or a person's
+ * instruction the model cannot see is the failure this prevents. The rest go newest first within the soft budget, at
+ * least one per turn. Returns the ids placed. */
 export function renderUnseen(unseen: readonly UnseenMessage[]): { block: string; placed: string[] } {
   if (unseen.length === 0) return { block: "", placed: [] };
-  const optional = unseen.filter((m) => !m.keep).reverse();
-  const included = new Set(unseen.filter((m) => m.keep).map((m) => m.id));
+  const optional = unseen.filter((m) => !m.keep && m.role !== "user").reverse();
+  const included = new Set(unseen.filter((m) => m.keep || m.role === "user").map((m) => m.id));
   const render = (deferred: number) => {
     const shown = unseen.filter((m) => included.has(m.id));
     const earlier = shown.filter((m) => m.earlier).length;
@@ -103,8 +120,11 @@ export function renderUnseen(unseen: readonly UnseenMessage[]): { block: string;
   };
 }
 
+/** Ends the unseen block, so the turn's own message never reads as one more line of it. */
+export const UNSEEN_END = "[End of those messages. Now reply to the user's latest message:]";
+
 export function withUnseenMessages(block: string, text: string): string {
-  return block ? `${block}\n\n${text}` : text;
+  return block ? `${block}\n\n${UNSEEN_END}\n\n${text}` : text;
 }
 
 export function recordHanded(state: HandedState, order: readonly string[], received: Iterable<string>): HandedState {
@@ -206,6 +226,18 @@ export class Handoffs {
 
   forget(threadId: string): void {
     this.pending.delete(threadId);
+  }
+
+  /** For a turn answered without its engine: nothing it would have handed counts as received. The returned call hands
+   * it on after all, bound to `turnId`, when the engine does run the turn, unless a newer turn has taken the thread. */
+  withhold(threadId: string): (turnId: string) => void {
+    const pending = this.pending.get(threadId);
+    this.pending.delete(threadId);
+    return (turnId) => {
+      if (!pending || this.pending.has(threadId)) return;
+      pending.turnId ??= turnId;
+      this.pending.set(threadId, pending);
+    };
   }
 
   /** Just before sendTurn: an adapter may emit the whole turn before it resolves. */

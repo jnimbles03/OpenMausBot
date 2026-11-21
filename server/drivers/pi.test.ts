@@ -1,18 +1,21 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { ensureDirs, NATIVE_DIR } from "../config.ts";
-import type { ProviderInstance } from "../contracts.ts";
+import { DATA_DIR, ensureDirs, NATIVE_DIR } from "../config.ts";
+import type { ProviderInstance, RuntimeEvent } from "../contracts.ts";
 import { recordEvents, type EventRecorder } from "../testing/events.ts";
+import { publishedMessages, replyProblems } from "../harness/text-items.testkit.ts";
+import { caseTokens, LIVE_REPLY_CASES, liveReplyScripts } from "../testing/live-reply-cases.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 import { encodeInjectId, localHost } from "./local-inject.ts";
+import { piSessionDir } from "./pi-session.ts";
+import { buildMcpServers } from "./pi-mcp-servers.ts";
 import {
   applyPiLocalCatalog,
-  buildMcpServers,
   decodePiFrame,
   ensurePiInjectModel,
   fetchPiModels,
@@ -327,6 +330,30 @@ describe("PiDriver catalog (fake CLI)", () => {
     }
   });
 
+  it("probes the model list with a Pi login the person makes after the instance started", async () => {
+    const home = mkdtempSync(join(tmpdir(), "omb-pi-later-login-"));
+    const dump = join(home, "launches.jsonl");
+    const instance = await PiDriver.create({
+      instanceId: "pi-later-login",
+      displayName: undefined,
+      environment: { HOME: home, FAKE_PI_DUMP: dump },
+      enabled: true,
+      config: { cli: FAKE_CLI, fullAuto: false },
+    });
+    try {
+      mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+      writeFileSync(join(home, ".pi", "agent", "auth.json"), '{"openai":{"type":"api_key","key":"sk-later"}}');
+      writeFileSync(dump, "");
+      await instance.refreshModels?.();
+      const rows = readFileSync(dump, "utf8").trim().split("\n").map((line) => JSON.parse(line) as { agentDir?: string | null });
+      const own = rows.at(-1)!.agentDir!;
+      expect(own.startsWith(join(DATA_DIR, "providers", "pi-own"))).toBe(true);
+      expect(statSync(join(own, "auth.json"), { bigint: true }).ino).toBe(statSync(join(home, ".pi", "agent", "auth.json"), { bigint: true }).ino);
+    } finally {
+      await instance.dispose();
+    }
+  });
+
   it("reports update failure without preventing a cached catalog probe", async () => {
     expect(await updatePiModelCatalog(FAKE_CLI, {
       PATH: process.env.PATH ?? "",
@@ -402,7 +429,7 @@ describe("PiDriver turns (fake CLI)", () => {
     expect(recorder.events.every((e) => e.turnId === turnId && e.provider === "piAgent")).toBe(true);
 
     const session = recorder.events.find((e) => e.type === "session.started")!;
-    expect((session as { sessionId: string }).sessionId).toMatch(/\/fake\/pi-session-\d+\.json/);
+    expect((session as { sessionId: string }).sessionId).toMatch(/pi-session-\d+-\d+\.json$/);
 
     const text = recorder.events.find(
       (e) => e.type === "item.completed" && (e as { itemType: string }).itemType === "assistant_text",
@@ -463,7 +490,7 @@ describe("PiDriver turns (fake CLI)", () => {
     const firstSession = recorder.events.find((e) => e.type === "session.started" && e.turnId === first.turnId) as
       | { sessionId: string }
       | undefined;
-    expect(firstSession?.sessionId).toMatch(/\/fake\/pi-session-\d+\.json/);
+    expect(firstSession?.sessionId).toMatch(/pi-session-\d+-\d+\.json$/);
 
     const second = await instance.adapter.sendTurn({
       threadId: "t-resume",
@@ -475,6 +502,59 @@ describe("PiDriver turns (fake CLI)", () => {
       | { sessionId: string }
       | undefined;
     expect(secondSession?.sessionId).toBe(firstSession?.sessionId);
+  });
+
+  it("starts conversation turns without --no-session and keeps catalog probes ephemeral", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-session-dir-"));
+    const dump = join(dir, "dump.jsonl");
+    await create(undefined, { FAKE_PI_DUMP: dump });
+    const { turnId } = await instance.adapter.sendTurn({ threadId: "t-pi-session-dir", text: "hi" });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    const rows = readFileSync(dump, "utf8")
+      .trim()
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { argv?: string[] });
+    const probes = rows.filter((row) => row.argv && !row.argv.includes("-e"));
+    const turns = rows.filter((row) => row.argv?.includes("-e"));
+    expect(probes.some((row) => row.argv!.join(" ") === "--mode rpc --no-session")).toBe(true);
+    expect(turns.length).toBeGreaterThan(0);
+    for (const row of turns) {
+      expect(row.argv).toEqual(["--mode", "rpc", "--session-dir", piSessionDir({ threadId: "t-pi-session-dir" }, "pi-test"), "-e", expect.any(String)]);
+      expect(row.argv).not.toContain("--no-session");
+    }
+    expect(piSessionDir({ threadId: "t-pi-session-dir" }, "pi-test")).toContain(join(DATA_DIR, "pi-sessions", "local"));
+  });
+
+  it("reads sessionFile from get_state when new_session omits it, then resumes with switch_session", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-session-state-"));
+    const dump = join(dir, "dump.jsonl");
+    await create(undefined, { FAKE_PI_DUMP: dump, FAKE_PI_SESSION_FILE_IN_STATE_ONLY: "1" });
+    const first = await instance.adapter.sendTurn({ threadId: "t-pi-state-session", text: "first" });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === first.turnId);
+    const firstSession = recorder.events.find((e) => e.type === "session.started" && e.turnId === first.turnId) as
+      | { sessionId: string }
+      | undefined;
+    expect(firstSession?.sessionId).toMatch(/pi-session-\d+-\d+\.json$/);
+
+    const second = await instance.adapter.sendTurn({
+      threadId: "t-pi-state-session",
+      text: "second",
+      resumeCursor: firstSession!.sessionId,
+    });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
+    const secondSession = recorder.events.find((e) => e.type === "session.started" && e.turnId === second.turnId) as
+      | { sessionId: string }
+      | undefined;
+    expect(secondSession?.sessionId).toBe(firstSession?.sessionId);
+
+    const rpc = readFileSync(dump, "utf8")
+      .split("\n")
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as { rpc?: string; sessionPath?: string })
+      .filter((row) => row.rpc);
+    expect(rpc.map((row) => row.rpc)).toEqual(["new_session", "switch_session"]);
+    expect(rpc[1]?.sessionPath).toBe(firstSession?.sessionId);
   });
 
   it("delivers the full prompt once per session and rides volatile changes as notes", async () => {
@@ -538,6 +618,21 @@ describe("PiDriver turns (fake CLI)", () => {
     expect(first.message).toBe("Standing rules.\n\nMemory: likes quiet hours.\n\nfirst");
     const second = await send("second", first.cursor);
     expect(second.message).toBe("Standing rules.\n\nMemory: likes quiet hours.\n\nsecond");
+    // Each turn condensed the session once; the chat marks each one.
+    const mine = recorder.events.filter((e) => e.threadId === threadId);
+    expect(mine.filter((e) => e.type === "context.compacted")).toHaveLength(2);
+    // Text streamed before the compaction is saved ahead of the marker, not joined to later text.
+    const before = mine.findIndex((e) => e.type === "item.completed" && (e as { text?: string }).text === "before");
+    expect(before).toBeGreaterThan(-1);
+    expect(before).toBeLessThan(mine.findIndex((e) => e.type === "context.compacted"));
+  });
+
+  it("adds no condensed marker when pi's compaction fails or is skipped", async () => {
+    await create("compaction", { FAKE_PI_COMPACTION_FAILS_ONLY: "1" });
+    const threadId = "t-pi-compaction-fails-" + randomUUID();
+    const { turnId } = await instance.adapter.sendTurn({ threadId, text: "first", system: "Standing rules." });
+    await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+    expect(recorder.events.filter((e) => e.type === "context.compacted" && e.threadId === threadId)).toHaveLength(0);
   });
 
   it("keeps pi alive through post-run compaction recovery and re-establishes the full prompt", async () => {
@@ -645,6 +740,8 @@ describe("PiDriver turns (fake CLI)", () => {
     expect(recorder.events.find((e) => e.type === "runtime.error")).toMatchObject({
       message: "pi prompt failed",
     });
+    const rejectedSession = recorder.events.find((event) => event.type === "session.started" && event.turnId === turnId);
+    if (rejectedSession?.type !== "session.started") throw new Error("missing rejected session");
     recorder.stop();
     await instance.dispose();
     await create(undefined, { FAKE_PI_DUMP: dump });
@@ -654,7 +751,7 @@ describe("PiDriver turns (fake CLI)", () => {
       system: "Standing rules.\n\nMemory: likes quiet hours.",
       systemStable: "Standing rules.",
       systemVolatile: "Memory: likes quiet hours.",
-      resumeCursor: "/fake/pi-session-1.json",
+      resumeCursor: rejectedSession.sessionId,
     });
     await recorder.until((e) => e.type === "turn.completed" && e.turnId === second.turnId);
     const row = readFileSync(dump, "utf8").split("\n").filter(Boolean)
@@ -679,6 +776,43 @@ describe("PiDriver turns (fake CLI)", () => {
       .map((line) => JSON.parse(line) as { prompt?: { message?: string } })
       .find((row) => row.prompt)?.prompt?.message;
     expect(message).toBe("Standing rules.\n\nMemory: likes quiet hours.\n\nbare");
+  });
+
+  it("waits for a slow new_session reply before it sends the prompt, and says so in the chat", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-session-slow-"));
+    const dump = join(dir, "dump.jsonl");
+    await create("session-slow", { FAKE_PI_DUMP: dump });
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const sent = instance.adapter.sendTurn({ threadId: "t-pi-session-slow-" + randomUUID(), text: "hi", model: "openai/gpt-4o" });
+      await recorder.until((e) => e.type === "turn.started");
+      await vi.advanceTimersByTimeAsync(20_001);
+      const { turnId } = await sent;
+      const done = await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId);
+      expect(done).toMatchObject({ ok: true });
+      const order = readFileSync(dump, "utf8").split("\n").filter(Boolean)
+        .map((line) => Object.keys(JSON.parse(line) as object)[0]).filter((key) => ["sessionReplied", "setModel", "prompt"].includes(key));
+      expect(order).toEqual(["sessionReplied", "setModel", "prompt"]);
+      expect(recorder.events.find((e) => e.type === "runtime.notice" && e.turnId === turnId)).toMatchObject({ message: expect.stringMatching(/Pi is taking longer than usual/) });
+    } finally {
+      vi.useRealTimers();
+      removeTempDir(dir);
+    }
+  });
+
+  it("stops waiting for the session reply when the turn is stopped, and sends nothing after", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-pi-session-stop-"));
+    const dump = join(dir, "dump.jsonl");
+    await create("session-slow", { FAKE_PI_DUMP: dump, FAKE_PI_SESSION_DELAY_MS: "60000" });
+    const threadId = "t-pi-session-stop-" + randomUUID();
+    const sent = instance.adapter.sendTurn({ threadId, text: "hi", model: "openai/gpt-4o" });
+    await recorder.until((e) => e.type === "turn.started");
+    await instance.adapter.interruptTurn(threadId);
+    const { turnId } = await sent;
+    expect(recorder.events.find((e) => e.type === "turn.completed" && e.turnId === turnId)).toMatchObject({ stopReason: "cancelled" });
+    const rows = readFileSync(dump, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line) as object);
+    expect(rows.some((row) => "setModel" in row || "prompt" in row)).toBe(false);
+    removeTempDir(dir);
   });
 
   it("fails promptly when the pi process exits before replying", async () => {
@@ -825,6 +959,28 @@ describe("PiDriver turns (fake CLI)", () => {
     expect(servers.composio).toMatchObject({ command: "node", args: ["connector-proxy.js"], env: { COMPOSIO_KEY: "ck" } });
   });
 
+  it("reports pi's priced cost and cached tokens summed over the whole run", async () => {
+    await create("priced");
+    await instance.adapter.sendTurn({ threadId: "t-priced", text: "run it", model: "synthetic/hf:moonshotai/Kimi-K3" });
+    const done = await recorder.until((e) => e.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: true });
+    // input counts every prompt token, cached ones included, as the other drivers do.
+    expect((done as { usage: unknown }).usage).toEqual({ input: 257, output: 3, cachedInput: 220 });
+    expect((done as { cost: number }).cost).toBeCloseTo(0.0025, 10);
+  });
+
+  it("books a model call's cost when the turn is stopped while its tool runs", async () => {
+    await create("priced-stop");
+    await instance.adapter.sendTurn({ threadId: "t-priced-stop", text: "run it", model: "synthetic/hf:moonshotai/Kimi-K3" });
+    await recorder.until((e) => e.type === "item.started");
+    await instance.adapter.interruptTurn("t-priced-stop");
+    const done = await recorder.until((e) => e.type === "turn.completed");
+
+    expect(done).toMatchObject({ ok: true, stopReason: "cancelled", usage: { input: 125, output: 1, cachedInput: 100 } });
+    expect((done as { cost: number }).cost).toBeCloseTo(0.0021, 10);
+  });
+
   it("rides the toolUse auto-continue and only settles on the final end_turn", async () => {
     await create("tooluse");
     await instance.adapter.sendTurn({ threadId: "t-tool", text: "run it" });
@@ -837,7 +993,7 @@ describe("PiDriver turns (fake CLI)", () => {
     expect(JSON.stringify(recorder.events)).not.toContain("pi-input-secret");
     expect(JSON.stringify(recorder.events)).not.toContain("pi-output-secret");
     expect(done).toMatchObject({ ok: true, stopReason: "end_turn" });
-    expect((done as { usage: { input: number; output: number } }).usage).toEqual({ input: 12, output: 2 });
+    expect((done as { usage: { input: number; output: number } }).usage).toEqual({ input: 17, output: 3 });
     const text = recorder.events.find(
       (e) => e.type === "item.completed" && (e as { itemType: string }).itemType === "assistant_text",
     ) as { text: string } | undefined;
@@ -870,7 +1026,29 @@ describe("PiDriver turns (fake CLI)", () => {
       .filter((e) => e.type === "item.completed" && (e as { itemType: string }).itemType === "assistant_text")
       .map((e) => (e as { text: string }).text);
     expect(texts).toEqual(["before one", "before two", "after"]);
+    expect(publishedMessages(recorder.events).map(({ streamed, completed }) => ({ streamed, completed }))).toEqual([
+      { streamed: "before one", completed: "before one" },
+      { streamed: "before two", completed: "before two" },
+      { streamed: "after", completed: "after" },
+    ]);
+    expect(new Set(publishedMessages(recorder.events).map((message) => message.itemId)).size).toBe(3);
   });
+
+  it.each(LIVE_REPLY_CASES.filter((entry) => entry.action === undefined || entry.action === "stop").map((entry) => ({ entry, name: entry.name })))(
+    "streams the $name reply with one id per message and nothing doubled, lost or glued", async ({ entry }) => {
+      const scripts = join(mkdtempSync(join(tmpdir(), "omb-pi-live-")), "scripts.json");
+      writeFileSync(scripts, JSON.stringify(liveReplyScripts()));
+      await create(undefined, { FAKE_STREAM_SCRIPT: scripts, FAKE_STREAM_CADENCE: entry.action === "stop" ? "6:5" : "7:0" });
+      const threadId = `t-live-${entry.name}`;
+      const { turnId } = await instance.adapter.sendTurn({ threadId, text: `Please answer ${entry.marker}`, model: "ollama-cloud/glm-5.2" });
+      if (entry.action === "stop") {
+        await recorder.until((e) => e.type === "content.delta" && e.turnId === turnId);
+        await instance.adapter.interruptTurn(threadId);
+      }
+      await recorder.until((e) => e.type === "turn.completed" && e.turnId === turnId, 30_000);
+      const events = recorder.events.filter((e) => e.turnId === turnId);
+      expect(replyProblems(events, caseTokens(entry), { stopped: entry.action === "stop" })).toEqual([]);
+    }, 60_000);
 
   it("brokers a permission ask through request.opened → respondToRequest", async () => {
     await create("permission");
@@ -1020,49 +1198,22 @@ describe("PiDriver turns (fake CLI)", () => {
     expect(rows.find((row) => row.uiResponse)?.uiResponse).toMatchObject({ id: "ask-select", cancelled: true });
   });
 
-  it("cancels an unanswered ask after 15 minutes", async () => {
+  it("keeps an unanswered question open for days and still takes the person's answer", async () => {
     const dir = mkdtempSync(join(tmpdir(), "omb-pi-timeout-"));
     const dump = join(dir, "dump.jsonl");
     await create("question-select", { FAKE_PI_DUMP: dump });
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    let opened: RuntimeEvent;
     try {
       await instance.adapter.sendTurn({ threadId: "t-pi-timeout", text: "go" });
-      const opened = await recorder.until((e) => e.type === "request.opened");
-      await vi.advanceTimersByTimeAsync(15 * 60_000);
-      const resolved = await recorder.until((e) => e.type === "request.resolved" && e.requestId === opened.requestId);
-      expect(resolved).toMatchObject({ behavior: "deny", source: "timeout" });
-      await recorder.until((e) => e.type === "turn.completed");
-      const rows = readFileSync(dump, "utf8")
-        .split("\n")
-        .filter(Boolean)
-        .map((line) => JSON.parse(line) as { uiResponse?: { id?: string; cancelled?: boolean } });
-      expect(rows.find((row) => row.uiResponse)?.uiResponse).toMatchObject({ id: "ask-select", cancelled: true });
+      opened = await recorder.until((e) => e.type === "request.opened");
+      await vi.advanceTimersByTimeAsync(72 * 60 * 60_000);
+      expect(recorder.events.some((e) => e.type === "request.resolved")).toBe(false);
     } finally {
       vi.useRealTimers();
     }
-  });
-
-  it("cancels an ask's fail-safe timer when the turn is interrupted", async () => {
-    await create("question-select");
-    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
-    const scheduled = vi.spyOn(globalThis, "setTimeout");
-    const cancelled = vi.spyOn(globalThis, "clearTimeout");
-    try {
-      await instance.adapter.sendTurn({ threadId: "t-ask-interrupt", text: "go" });
-      await recorder.until((e) => e.type === "request.opened");
-      const askIndex = scheduled.mock.calls.findIndex(([, delay]) => delay === 15 * 60_000);
-      expect(askIndex).toBeGreaterThanOrEqual(0);
-      const askTimer = scheduled.mock.results[askIndex].value;
-      expect(cancelled).not.toHaveBeenCalledWith(askTimer);
-      await instance.adapter.interruptTurn("t-ask-interrupt");
-      await recorder.until((e) => e.type === "turn.completed");
-      // This ask's timer, not all timers: killCliTree may still be polling for the real child.
-      expect(cancelled).toHaveBeenCalledWith(askTimer);
-    } finally {
-      scheduled.mockRestore();
-      cancelled.mockRestore();
-      vi.useRealTimers();
-    }
+    await instance.adapter.respondToRequest("t-pi-timeout", opened.requestId!, { behavior: "deny" });
+    expect(await recorder.until((e) => e.type === "request.resolved")).toMatchObject({ behavior: "deny", source: "user" });
   });
 
   it("respondToRequest is unavailable for an ask that is not pending", async () => {
@@ -1079,9 +1230,22 @@ describe("PiDriver turns (fake CLI)", () => {
     expect(done).toMatchObject({ ok: true, stopReason: "cancelled" });
   });
 
-  it("writes models.json and set_model for a host::model inject pick", async () => {
+  it("writes models.json and set_model for a host::model inject pick, in MausBot's own Pi folder", async () => {
     const home = mkdtempSync(join(tmpdir(), "omb-pi-turn-inject-"));
     const dump = join(home, "dump.jsonl");
+    // The person's own Pi setup: what a bot's turn must not load, and the login and providers it needs.
+    const person = join(home, ".pi", "agent");
+    mkdirSync(join(person, "extensions"), { recursive: true });
+    mkdirSync(join(person, "skills", "mine"), { recursive: true });
+    writeFileSync(join(person, "AGENTS.md"), "My own instructions\n");
+    writeFileSync(join(person, "SYSTEM.md"), "My own system prompt\n");
+    writeFileSync(join(person, "mcp.json"), '{"mcpServers":{"mine":{"command":"mine"}}}');
+    writeFileSync(join(person, "extensions", "edit.ts"), "export default () => {};\n");
+    writeFileSync(join(person, "skills", "mine", "SKILL.md"), "---\nname: mine\n---\n");
+    writeFileSync(join(person, "settings.json"), JSON.stringify({ defaultProvider: "openai", defaultModel: "gpt-4o", packages: ["npm:mine"], extensions: ["./x.ts"], skills: ["./s"] }));
+    writeFileSync(join(person, "auth.json"), '{"openai":{"type":"api_key","key":"sk-person"}}');
+    const personModels = '{"providers":{"mine":{"baseUrl":"http://127.0.0.1:9/v1","models":[{"id":"m"}]}}}';
+    writeFileSync(join(person, "models.json"), personModels);
     await create(undefined, { HOME: home, FAKE_PI_DUMP: dump });
     const { turnId } = await instance.adapter.sendTurn({
       threadId: "t-inject",
@@ -1097,11 +1261,21 @@ describe("PiDriver turns (fake CLI)", () => {
     expect(dumps.some((row) => row.setModel?.provider === "omlx" && row.setModel?.modelId === "MiniMax-M3-4bit")).toBe(
       true,
     );
-    const written = JSON.parse(readFileSync(join(home, ".pi", "agent", "models.json"), "utf8")) as {
-      providers: { omlx: { baseUrl: string; models: Array<{ id: string }> } };
+    const agentDirs = new Set(dumps.map((row) => (row as { agentDir?: string | null }).agentDir).filter((dir) => dir !== undefined));
+    expect(agentDirs.size).toBe(1);
+    const own = [...agentDirs][0]!;
+    expect(own.startsWith(join(DATA_DIR, "providers", "pi-own"))).toBe(true);
+    expect(readdirSync(own).filter((name) => !name.startsWith(".")).sort()).toEqual(["auth.json", "models.json", "settings.json"]);
+    expect(statSync(join(own, "auth.json"), { bigint: true }).ino).toBe(statSync(join(person, "auth.json"), { bigint: true }).ino);
+    expect(JSON.parse(readFileSync(join(own, "settings.json"), "utf8"))).toEqual({ defaultProvider: "openai", defaultModel: "gpt-4o" });
+    const written = JSON.parse(readFileSync(join(own, "models.json"), "utf8")) as {
+      providers: { mine: unknown; omlx: { baseUrl: string; models: Array<{ id: string }> } };
     };
+    expect(written.providers.mine).toBeDefined();
     expect(written.providers.omlx.baseUrl).toBe("http://127.0.0.1:8080/v1");
     expect(written.providers.omlx.models.some((m) => m.id === "MiniMax-M3-4bit")).toBe(true);
+    // MausBot's local model stays out of the person's own file.
+    expect(readFileSync(join(person, "models.json"), "utf8")).toBe(personModels);
   });
 });
 

@@ -38,7 +38,7 @@ const togglesFence = (line: string) => (line.match(/```/g)?.length ?? 0) % 2 ===
 /** Undated hand-written lines are not entries and upkeep never touches them. */
 export function parseMemoryEntries(text: string): MemoryEntryLine[] {
   const out: MemoryEntryLine[] = [];
-  const lines = text.split("\n");
+  const lines = text.split("\n").map((line) => line.replace(/\r$/, ""));
   for (let line = 0; line < lines.length;) {
     const raw = lines[line];
     const m = DATED.exec(raw);
@@ -68,9 +68,11 @@ export function isExpired(entry: Pick<MemoryEntryLine, "until" | "struck">, toda
 }
 
 export function withoutExpired(text: string, today: string): { text: string; hidden: number } {
-  const expired = new Set(parseMemoryEntries(text).filter((e) => isExpired(e, today)).map((e) => e.line));
-  if (!expired.size) return { text, hidden: 0 };
-  return { text: text.split("\n").filter((_, index) => !expired.has(index)).join("\n"), hidden: expired.size };
+  const expired = parseMemoryEntries(text).filter((e) => isExpired(e, today));
+  if (!expired.length) return { text, hidden: 0 };
+  const dropped = new Set<number>();
+  for (const entry of expired) for (let line = entry.line; line < entry.end; line++) dropped.add(line);
+  return { text: text.split("\n").filter((_, index) => !dropped.has(index)).join("\n"), hidden: expired.length };
 }
 
 /** Deliberately narrow: `-10` and `10`, `C++` and `C`, `API_KEY` and `api_key` stay different facts. */
@@ -100,4 +102,17 @@ export function withoutSuperseded(text: string): string {
     if (entry.struck) for (let line = entry.line; line < entry.end; line++) dropped.add(line);
   }
   return text.split("\n").filter((_, index) => !dropped.has(index)).join("\n");
+}
+
+/** Case, width, curly quotes and spacing aside, so a passage matches however the note was typed. */
+export function foldForMatch(text: string): string {
+  return text.normalize("NFKC").toLowerCase().replace(/[‘’ʼ]/g, "'").replace(/[“”]/g, "\"").replace(/\s+/g, " ").trim();
+}
+
+/** Whether a note mentions `passage` as whole words ("IST" is not in "dentist"); null for a passage too short to name anything. */
+export function passageMatcher(passage: string): ((text: string) => boolean) | null {
+  const folded = foldForMatch(passage);
+  if ((folded.match(/[\p{L}\p{N}]/gu)?.length ?? 0) < 3) return null;
+  const pattern = new RegExp(`(?<![\\p{L}\\p{N}])${folded.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?![\\p{L}\\p{N}])`, "u");
+  return (text) => pattern.test(foldForMatch(text));
 }

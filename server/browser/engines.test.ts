@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -12,14 +12,18 @@ import { BrowserEgress, OwnListeners } from "./egress/registry.ts";
 import { removeTempDir } from "../testing/cleanup.ts";
 import { ProcessRegistry } from "./chrome/processes.ts";
 import { browserRoot } from "./chrome/profile.ts";
-import { CHROME_ENGINE, ChromeEngine, chromeTarget, LiveRouter, profileKey, RuntimeRouter, type RuntimeRouterOptions } from "./engines.ts";
+import { createBrowserInputLog } from "./input-log.ts";
+import type { Backend } from "./backends.ts";
+import { PaneBackend } from "./pane/backend.ts";
+import { PaneLink } from "./pane/link.ts";
+import { backendFor, CHROME_ENGINE, ChromeEngine, chromeTarget, LiveRouter, profileKey, RuntimeRouter, type RuntimeRouterOptions } from "./engines.ts";
 
 const AGENT_BROWSER = { command: "/opt/agent-browser", args: ["--session", "s"], env: { AGENT_BROWSER_SESSION: "s" } };
 const CHROME = { command: CHROME_ENGINE, args: ["bot:a"], env: {} };
 
 function engines(options: RuntimeRouterOptions = {}) {
   const old = {
-    agentRpc: vi.fn(async () => "agent-browser"),
+    agentRpc: vi.fn(async (_session: string, _spec: unknown, _method: string, _params: unknown, beforeDispatch?: () => void) => { beforeDispatch?.(); return "agent-browser"; }),
     previewFrame: vi.fn(async (_session: string, capture: () => Promise<unknown>) => capture()),
     withSecretInput: vi.fn(async (_session: string, _spec: unknown, fn: () => Promise<unknown>) => fn()),
     heldBy: vi.fn(() => "person"),
@@ -32,7 +36,7 @@ function engines(options: RuntimeRouterOptions = {}) {
   const oldLive = { open: vi.fn(async () => undefined), action: vi.fn(async () => "agent-browser"), handBack: vi.fn(), closeForSession: vi.fn(), closeForOwner: vi.fn(), closeForBot: vi.fn(), closeAll: vi.fn() };
   const chrome = {
     service: {
-      agentRpc: vi.fn(async () => "chrome"),
+      agentRpc: vi.fn(async (_target: unknown, _method: string, _params: unknown, beforeDispatch?: () => void) => { beforeDispatch?.(); return "chrome"; }),
       previewFrame: vi.fn(async () => ({ png: "frame", format: "jpeg" })),
       withSecretInput: vi.fn(async (_target: unknown, fn: () => Promise<unknown>) => fn()),
       heldBy: vi.fn((): string | null => null),
@@ -68,6 +72,29 @@ describe("which engine runs a session", () => {
 });
 
 describe("the runtime router", () => {
+  it("logs a page action that failed on either engine by a reason code, and nothing for one that worked or for a read", async () => {
+    const lines: string[] = [];
+    const { old, chrome, runtime } = engines({ inputLog: createBrowserInputLog((line) => lines.push(line)), refusal: (_session, _spec, params) => (params as { name?: string }).name === "agent_browser_press" ? "Browser tools are paused while a person controls this browser." : null });
+    const failure = (text: string) => ({ isError: true, content: [{ type: "text", text }] });
+    old.agentRpc.mockResolvedValueOnce(failure("Element not found: #pay-now. Verify the selector.") as never);
+    await runtime.agentRpc("omb-a", AGENT_BROWSER, "tools/call", { name: "agent_browser_click", arguments: { selector: "#pay-now" } });
+    chrome.service.agentRpc.mockResolvedValueOnce(failure("No element matches #card-number.") as never);
+    await runtime.agentRpc("omb-b", CHROME, "tools/call", { name: "agent_browser_fill", arguments: { selector: "#card-number", text: "4111" } });
+    old.agentRpc.mockRejectedValueOnce(new Error("socket hang up"));
+    await expect(runtime.agentRpc("omb-a", AGENT_BROWSER, "tools/call", { name: "agent_browser_type", arguments: { text: "typed words" } })).rejects.toThrow("socket hang up");
+    await runtime.agentRpc("omb-a", AGENT_BROWSER, "tools/call", { name: "agent_browser_press", arguments: { key: "Enter" } });
+    old.agentRpc.mockResolvedValueOnce(failure("Element not found: #pay-now.") as never);
+    await runtime.agentRpc("omb-a", AGENT_BROWSER, "tools/call", { name: "agent_browser_get_text", arguments: { selector: "#pay-now" } });
+    await runtime.agentRpc("omb-a", AGENT_BROWSER, "tools/call", { name: "agent_browser_click", arguments: { selector: "#ok" } });
+    expect(lines).toEqual([
+      "browser input: bot click dropped reason=target_not_found engine=agent-browser transport=tools session=omb-a",
+      "browser input: bot fill dropped reason=target_not_found engine=chrome transport=tools session=omb-b",
+      "browser input: bot type dropped reason=threw engine=agent-browser transport=tools session=omb-a",
+      "browser input: bot press dropped reason=person_holds_control engine=agent-browser transport=tools session=omb-a",
+    ]);
+    expect(lines.join("\n")).not.toMatch(/pay-now|card-number|4111|typed words/);
+  });
+
   it("sends a new-engine session's calls to the browser service and every other to agent-browser", async () => {
     const { old, chrome, runtime } = engines();
     await expect(runtime.agentRpc("s", CHROME, "tools/call", { name: "agent_browser_open" })).resolves.toBe("chrome");
@@ -97,7 +124,7 @@ describe("the runtime router", () => {
   const onHost = (host: EgressHost) => {
     const egress = new BrowserEgress();
     egress.configure({ host, config: () => ({}), ownership: { botOwned: async () => false } as unknown as ListenerOwnership, listeners: new OwnListeners(host, { env: {}, streamPorts: () => [], devToolsPorts: () => [] }) });
-    return engines({ refusal: (spec, params) => (attachesToChrome(spec.env) ? null : egress.callRefusal(params)) });
+    return engines({ refusal: (_session, spec, params) => (attachesToChrome(spec.env) ? null : egress.callRefusal(params)) });
   };
   const OPENS_REDDIT = [
     { name: "agent_browser_open", arguments: { url: "https://www.reddit.com/r/test/" } },
@@ -132,6 +159,61 @@ describe("the runtime router", () => {
     const { runtime } = onHost("cloud");
     const myChrome = { ...AGENT_BROWSER, env: { ...AGENT_BROWSER.env, AGENT_BROWSER_AUTO_CONNECT: "1" } };
     await expect(runtime.agentRpc("s", myChrome, "tools/call", OPENS_REDDIT[0])).resolves.toBe("agent-browser");
+  });
+
+  it("refusal and afterCall see the session", async () => {
+    const refused: string[] = [];
+    const afterCall = vi.fn((_session: string, _spec: unknown, result: unknown) => ({ after: result }));
+    const { old, runtime } = engines({
+      refusal: (session) => { refused.push(session); return null; },
+      annotate: (_spec, result) => ({ annotated: result }),
+      afterCall,
+    });
+    await expect(runtime.agentRpc("s1", AGENT_BROWSER, "tools/call", { name: "agent_browser_snapshot" })).resolves.toEqual({ after: { annotated: "agent-browser" } });
+    expect(refused).toEqual(["s1"]);
+    expect(afterCall).toHaveBeenCalledWith("s1", AGENT_BROWSER, { annotated: "agent-browser" });
+    await expect(runtime.agentRpc("s1", AGENT_BROWSER, "tools/list", {}), "a listing is neither refused nor passed on").resolves.toBe("agent-browser");
+    expect(refused).toEqual(["s1"]);
+    expect(afterCall).toHaveBeenCalledOnce();
+    expect(old.agentRpc).toHaveBeenCalledTimes(2);
+  });
+
+  it("asks the server's room before an opt-in engine's tool call, and a call it has no room for never reaches it", async () => {
+    let full: string | null = "No room for another browser.";
+    const asked: string[] = [];
+    const { old, chrome, runtime } = engines({ room: async (session) => { asked.push(session); return full; } });
+    const refused = { isError: true, content: [{ type: "text", text: "No room for another browser." }] };
+    await expect(runtime.agentRpc("s", CHROME, "tools/call", { name: "agent_browser_open" })).resolves.toEqual(refused);
+    // agent-browser asks the same room through its own BrowserRoom, after its count of browsers
+    await expect(runtime.agentRpc("s1", AGENT_BROWSER, "tools/call", { name: "agent_browser_open" })).resolves.toBe("agent-browser");
+    await expect(runtime.agentRpc("s", CHROME, "tools/list", {}), "a listing opens no browser").resolves.toBe("chrome");
+    expect(asked).toEqual(["s"]);
+    expect([old.agentRpc.mock.calls.length, chrome.service.agentRpc.mock.calls.length]).toEqual([1, 1]);
+    full = null;
+    await expect(runtime.agentRpc("s", CHROME, "tools/call", { name: "agent_browser_open" })).resolves.toBe("chrome");
+    expect(asked).toEqual(["s", "s"]);
+  });
+
+  it("asks afterClaim once beforeDispatch has claimed, and its refusal reaches neither engine", async () => {
+    const order: string[] = [];
+    let refuse: string | null = null;
+    const { old, chrome, runtime } = engines({ afterClaim: (session) => { order.push(`afterClaim ${session}`); return refuse; } });
+    const claim = () => { order.push("claim"); };
+    await expect(runtime.agentRpc("s1", AGENT_BROWSER, "tools/call", { name: "agent_browser_snapshot" }, claim)).resolves.toBe("agent-browser");
+    expect(order).toEqual(["claim", "afterClaim s1"]);
+    refuse = "Not this conversation.";
+    const refused = { isError: true, content: [{ type: "text", text: "Not this conversation." }] };
+    let reached = 0;
+    old.agentRpc.mockImplementationOnce(async (_session, _spec, _method, _params, beforeDispatch) => { beforeDispatch?.(); reached++; return "agent-browser"; });
+    await expect(runtime.agentRpc("s1", AGENT_BROWSER, "tools/call", { name: "agent_browser_snapshot" }, claim)).resolves.toEqual(refused);
+    chrome.service.agentRpc.mockImplementationOnce(async (_target, _method, _params, beforeDispatch) => { beforeDispatch?.(); reached++; return "chrome"; });
+    await expect(runtime.agentRpc("s", CHROME, "tools/call", { name: "agent_browser_snapshot" }, claim)).resolves.toEqual(refused);
+    expect(reached, "nothing after the claim ran").toBe(0);
+    order.length = 0;
+    await expect(runtime.agentRpc("s1", AGENT_BROWSER, "tools/list", {}, claim), "a listing is not judged").resolves.toBe("agent-browser");
+    expect(order).toEqual(["claim"]);
+    const taken = () => { throw new Error("another thread is using this browser"); };
+    await expect(runtime.agentRpc("s1", AGENT_BROWSER, "tools/call", { name: "agent_browser_snapshot" }, taken), "beforeDispatch's own refusal is unchanged").rejects.toThrow("another thread is using this browser");
   });
 
   it("answers who holds a session and what was interrupted across both engines", () => {
@@ -238,5 +320,41 @@ describe("the new engine's minute", () => {
     exited();
     await vi.advanceTimersByTimeAsync(120_000);
     expect(closeIdle).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe("which backend a profile's browser starts on", () => {
+  const local = { kind: "local" } as Backend;
+  const pane = (available: boolean) => ({ kind: "pane", available }) as unknown as PaneBackend;
+
+  it("stays on the local Chrome unless the pane is wanted and the desktop app shows panes", () => {
+    expect(backendFor(local, undefined)).toBe(local);
+    expect(backendFor(local, { backend: pane(true), wanted: () => false })).toBe(local);
+    expect(backendFor(local, { backend: pane(false), wanted: () => true })).toBe(local);
+    const shown = pane(true);
+    expect(backendFor(local, { backend: shown, wanted: () => true })).toBe(shown);
+  });
+});
+
+describe("deleting a bot's browser on the desktop app, pane off", () => {
+  it("does what it did without the pane: nothing for a profile that never ran, and no partition", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "omb-chrome-engine-"));
+    const posted: object[] = [];
+    const link = new PaneLink({ on: () => undefined, postMessage: (message) => posted.push(message) });
+    const value = new ChromeEngine({
+      dataDir, host: "desktop", env: {}, platform: "darwin", egressPort: async () => 0, idleMs: () => 180_000, egressNotice: () => null,
+      pane: { backend: new PaneBackend(link, dataDir, async () => 0), wanted: () => false },
+    });
+    const erase = vi.spyOn(value.service, "erase");
+    try {
+      expect(await value.erase({ kind: "bot", id: "a", partitionId: "" })).toBe(true);
+      expect(await value.erase({ kind: "profile", id: "p", partitionId: "p1" })).toBe(true);
+      expect(erase).not.toHaveBeenCalled();
+      expect(existsSync(join(browserRoot(dataDir), "workspace-id"))).toBe(false);
+      expect(posted).toEqual([{ type: "openmausbot:browser-pane", op: "hello" }]);
+    } finally {
+      await value.close();
+      await removeTempDir(dataDir);
+    }
   });
 });

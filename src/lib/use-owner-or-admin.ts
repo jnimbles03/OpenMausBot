@@ -1,23 +1,44 @@
 import { useEffect, useState } from "react";
 
-import { isOwnerOrAdmin, readSessionState } from "./session";
+import { isOwnerOrAdmin } from "./session";
+import { readSharedSessionState } from "./shared-session";
 
-let pending: Promise<boolean> | null = null;
+const RETRY_MS = 10_000;
+let known: boolean | null = null;
+let looking = false;
+let retry: ReturnType<typeof setTimeout> | null = null;
+const listeners = new Set<(allowed: boolean) => void>();
 
-function ownerOrAdmin(): Promise<boolean> {
-  pending ??= readSessionState().then(isOwnerOrAdmin, () => false);
-  return pending;
+function lookUp(): void {
+  retry = null;
+  if (known !== null || looking || !listeners.size) return;
+  // A paired desktop reaches the host through its companion, which does not serve the session route; the host already
+  // treats that device as its owner, so owner controls such as New bot stay shown.
+  if (typeof window !== "undefined" && window.ogb?.remoteClient?.active === true) {
+    known = true;
+    for (const listener of listeners) listener(true);
+    return;
+  }
+  looking = true;
+  void readSharedSessionState()
+    .then((state) => state.kind === "unreachable" ? null : isOwnerOrAdmin(state), () => null)
+    .then((allowed) => {
+      looking = false;
+      if (allowed !== null) known = allowed;
+      for (const listener of listeners) listener(allowed ?? false);
+      if (allowed === null && listeners.size) retry = setTimeout(lookUp, RETRY_MS);
+    });
 }
 
 export function useOwnerOrAdmin(): boolean | null {
-  const [allowed, setAllowed] = useState<boolean | null>(null);
+  const [allowed, setAllowed] = useState<boolean | null>(known ?? (retry ? false : null));
   useEffect(() => {
-    let alive = true;
-    void ownerOrAdmin().then((value) => {
-      if (alive) setAllowed(value);
-    });
+    listeners.add(setAllowed);
+    if (known !== null) setAllowed(known);
+    else if (retry) setAllowed(false);
+    else lookUp();
     return () => {
-      alive = false;
+      listeners.delete(setAllowed);
     };
   }, []);
   return allowed;

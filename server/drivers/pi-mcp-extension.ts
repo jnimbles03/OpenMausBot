@@ -8,6 +8,7 @@ import { allowsTool, canUseMcpServer, parseToolScope, type ToolIdentity } from "
 import { ASK_USER_TOOL, formatQuestionAnswers, MAX_OPTIONS, MAX_QUESTIONS, parseAskQuestions } from "../../shared/ask-question.ts";
 import { CALL_TOOL, directoryCallTarget, isDirectoryTool } from "../mcp-directory.ts";
 import { REMOTE_MCP_STARTUP_MS } from "../mcp-http.ts";
+import { AGENTS_TOOL_TIMEOUT_SECONDS } from "./agents-tool-limit.ts";
 
 interface McpServerDef {
   command: string;
@@ -80,12 +81,14 @@ interface PiExtensionApi {
 }
 
 const MCP_STARTUP_TIMEOUT_MS = 8_000;
-const MCP_TOOL_TIMEOUT_MS = 10 * 60_000;
+const MCP_TOOL_TIMEOUT_MS = AGENTS_TOOL_TIMEOUT_SECONDS * 1000;
 const MCP_MAX_LIST_PAGES = 100;
 const MCP_MAX_FRAME_BYTES = 32 * 1024 * 1024;
 const TOOL_OUTPUT_MAX_BYTES = 50 * 1024;
 const TOOL_OUTPUT_MAX_LINES = 2_000;
 const TOOL_NAME_MAX_LENGTH = 64;
+const SHELL_DEFAULT_TIMEOUT_SECONDS = 120;
+const SHELL_MAX_TIMEOUT_SECONDS = 900;
 
 export class StdioMcp {
   private child: ChildProcessWithoutNullStreams;
@@ -592,11 +595,26 @@ export default async function (pi: PiExtensionApi): Promise<void> {
   let enforcementFailed = false;
   const clients: StdioMcp[] = [];
   const serverEntries = Object.entries(config.mcpServers ?? {}).filter(([name]) => scope === undefined || canUseMcpServer(scope, name));
+  const allowed = (name: string) => scope === undefined || (directoryTools.has(name)
+    ? canUseMcpServer(scope, directoryTools.get(name)!)
+    : allowsTool(scope, identities.get(name) ?? { kind: "native", name }));
+
+  pi.on("tool_call", (event) => {
+    if (scope !== undefined && (enforcementFailed || typeof event?.toolName !== "string" || !allowed(event.toolName))) {
+      return { block: true, reason: "Tool selection excludes this tool" };
+    }
+    if (event?.toolName !== "bash" && event?.toolName !== "powershell") return;
+    const input = event.input;
+    if (!input || typeof input !== "object" || Array.isArray(input)) return;
+    const args = input as Record<string, unknown>;
+    // Pi 1.5 runs the mutated tool_call.input; its native shell timeout is seconds and has no default.
+    if (args.timeout === undefined) args.timeout = SHELL_DEFAULT_TIMEOUT_SECONDS;
+    if (typeof args.timeout !== "number" || !Number.isFinite(args.timeout) || args.timeout <= 0 || args.timeout > SHELL_MAX_TIMEOUT_SECONDS) {
+      return { block: true, reason: `Shell timeout must be in seconds, greater than 0 and at most ${SHELL_MAX_TIMEOUT_SECONDS}. Use 90 for 90 seconds, not 90000. Run longer services in the background and check them with bounded commands.` };
+    }
+  });
 
   if (scope !== undefined) {
-    const allowed = (name: string) => directoryTools.has(name)
-      ? canUseMcpServer(scope, directoryTools.get(name)!)
-      : allowsTool(scope, identities.get(name) ?? { kind: "native", name });
     const intersect = () => {
       if (enforcementFailed) throw new Error("Pi tool selection enforcement is unavailable");
       try {
@@ -617,7 +635,6 @@ export default async function (pi: PiExtensionApi): Promise<void> {
       }
     };
     for (const event of ["session_start", "session_switch", "model_select", "before_agent_start", "context"]) pi.on(event, () => { intersect(); });
-    pi.on("tool_call", (event) => !enforcementFailed && typeof event?.toolName === "string" && allowed(event.toolName) ? undefined : { block: true, reason: "Tool selection excludes this tool" });
     // Providers serialize tools before this hook, so the final payload is filtered too.
     pi.on("before_provider_request", (event, context) => {
       let selected = new Set<string>();
@@ -695,7 +712,8 @@ export default async function (pi: PiExtensionApi): Promise<void> {
           async execute(_toolCallId, params, signal, _onUpdate, ctx) {
             const target = directoryTool ? directoryCallTarget(toolName, params) : toolName;
             if (scope !== undefined && (enforcementFailed
-              || (target !== undefined && !allowsTool(scope, { kind: "mcp", server: serverName, name: target })))) {
+              || (target !== undefined && !allowsTool(scope, { kind: "mcp", server: serverName, name: target },
+                (directoryTool && toolName === CALL_TOOL ? (params as { arguments?: unknown } | undefined)?.arguments : params) ?? {})))) {
               throw new Error("Tool selection excludes this tool");
             }
             // Host tools ask first through pi's native card (ctx.ui.confirm → extension_ui_request).

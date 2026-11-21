@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { afterAll, describe, expect, it } from "vitest";
 
 import { removeTempDir } from "../../testing/cleanup.ts";
-import { batchQuote, browserLanguage, browserTimeZone, languageList, launcherFlags, launcherPath, launcherScript, primaryScreen, writeLauncher, type LauncherSettings } from "./wrapper.ts";
+import { batchQuote, browserLanguage, browserTimeZone, HEADLESS_DISABLED_FEATURES, languageList, launcherFlags, launcherPath, launcherScript, primaryScreen, writeLauncher, type LauncherSettings } from "./wrapper.ts";
 
 const UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36";
 const posix = process.platform !== "win32";
@@ -44,10 +44,16 @@ describe("the launcher agent-browser runs instead of Chrome", () => {
     const out = join(folder, "argv");
     execFileSync(path, ENGINE_ARGS, { env: { PATH: "/usr/bin:/bin", ARGV_OUT: out, HOME: join(folder, "temporary-home") } });
     const argv = readFileSync(out, "utf8").split("\0").slice(0, -1);
-    expect(argv).toEqual([...ENGINE_ARGS, ...launcherFlags(settings, "darwin")]);
+    expect(argv).toEqual([...ENGINE_ARGS, ...launcherFlags(settings, "darwin"), HEADLESS_DISABLED_FEATURES]);
     expect(argv).toContain(`--user-agent=${UA}`);
+    // Chrome keeps the last --disable-features, so the engine's own Translate stays off.
+    expect(argv.filter((arg) => arg.startsWith("--disable-features=")).at(-1)).toBe("--disable-features=Translate,WebUIOmniboxPopup,WebUIOmniboxAimPopup,WebUIReloadButton");
     expect(readFileSync(`${out}.tz`, "utf8")).toBe("America/New_York");
     expect(readFileSync(`${out}.home`, "utf8")).toBe("/Users/ada");
+    // A browser with a window keeps Chrome's own features: its omnibox and reload button are seen.
+    const headed = ENGINE_ARGS.filter((arg) => !arg.startsWith("--headless"));
+    execFileSync(path, headed, { env: { PATH: "/usr/bin:/bin", ARGV_OUT: out, HOME: join(folder, "temporary-home") } });
+    expect(readFileSync(out, "utf8").split("\0").slice(0, -1)).toEqual([...headed, ...launcherFlags(settings, "darwin")]);
   });
 
   it("writes a shell script that execs Chrome, so agent-browser keeps Chrome's own pid and process group", () => {
@@ -56,7 +62,9 @@ describe("the launcher agent-browser runs instead of Chrome", () => {
       "#!/bin/sh",
       "TZ='Asia/Kolkata'",
       "export TZ",
-      `exec '/opt/it'\\''s/chrome' "$@" '--disable-blink-features=AutomationControlled' '--user-agent=${UA}' '--screen-info={1512x982}' '--lang=en-IN' '--password-store=basic'`,
+      "headless=",
+      `for arg in "$@"; do case "$arg" in --headless|--headless=*) headless='${HEADLESS_DISABLED_FEATURES}' ;; esac; done`,
+      `exec '/opt/it'\\''s/chrome' "$@" '--disable-blink-features=AutomationControlled' '--user-agent=${UA}' '--screen-info={1512x982}' '--lang=en-IN' '--password-store=basic' $headless`,
       "",
     ]);
   });
@@ -75,6 +83,42 @@ describe("the launcher agent-browser runs instead of Chrome", () => {
   });
 });
 
+describe("the launcher of a Team Cloud's boxed browsers", () => {
+  const settings: LauncherSettings = { chrome: "/opt/chrome/chrome", userAgent: UA, screen: { width: 1920, height: 1080 } };
+
+  it.skipIf(!posix)("starts Chrome through bubblewrap with only the profile it was given, the seccomp filter on descriptor 9 and HOME private", () => {
+    const folder = mkdtempSync(join(tmpdir(), "omb-boxed-launcher-"));
+    folders.push(folder);
+    const bwrap = join(folder, "bwrap");
+    // A stand-in for bubblewrap: what it was asked, and whether descriptor 9 holds the filter.
+    writeFileSync(bwrap, `#!/bin/sh\nprintf '%s\\0' "$@" > "$ARGV_OUT"\ncat <&9 > "$ARGV_OUT.fd9" 2>/dev/null || printf none > "$ARGV_OUT.fd9"\nps -o args= -p $PPID > "$ARGV_OUT.parent"\n`, { mode: 0o755 });
+    const filter = join(folder, "seccomp.bpf");
+    writeFileSync(filter, "FILTER");
+    const path = launcherPath(join(folder, "data"), "linux");
+    writeLauncher(path, { ...settings, box: { bwrap, options: ["--unshare-user", "--seccomp", "9", "--ro-bind", "/usr", "/usr"], seccomp: filter } }, "linux");
+    const out = join(folder, "argv");
+    const profile = join(folder, "profiles", "ada's profile");
+    const engine = ["--remote-debugging-port=0", "--headless=new", `--user-data-dir=${profile}`, "--x=it's $HOME"];
+    execFileSync(path, engine, { env: { PATH: "/usr/bin:/bin", ARGV_OUT: out } });
+    const argv = readFileSync(out, "utf8").split("\0").slice(0, -1);
+    expect(argv).toEqual(["--unshare-user", "--seccomp", "9", "--ro-bind", "/usr", "/usr", "--bind", profile, profile, "--setenv", "HOME", "/tmp", "--", "/opt/chrome/chrome", ...engine, ...launcherFlags(settings, "linux"), HEADLESS_DISABLED_FEATURES]);
+    expect(statSync(profile).isDirectory(), "the profile exists before bubblewrap binds it").toBe(true);
+    expect(readFileSync(`${out}.fd9`, "utf8")).toBe("FILTER");
+    // bubblewrap's --die-with-parent follows the thread that started it; the launcher, not agent-browser's thread, is its parent.
+    expect(readFileSync(`${out}.parent`, "utf8"), "the launcher stays bubblewrap's parent").toContain("chrome-launcher.sh");
+    // Without a profile (the launcher's own check), still boxed, binding nothing of the disk.
+    execFileSync(path, ["--version"], { env: { PATH: "/usr/bin:/bin", ARGV_OUT: out } });
+    const bare = readFileSync(out, "utf8").split("\0").slice(0, -1);
+    expect(bare.slice(0, 10)).toEqual(["--unshare-user", "--seccomp", "9", "--ro-bind", "/usr", "/usr", "--setenv", "HOME", "/tmp", "--"]);
+    expect(bare).not.toContain("--bind");
+  });
+
+  it("is the plain launcher off a team", () => {
+    expect(launcherScript(settings, "linux")).not.toContain("bwrap");
+    expect(launcherScript(settings, "linux").split("\n").at(-2)).toMatch(/^exec '\/opt\/chrome\/chrome' "\$@" /u);
+  });
+});
+
 describe("the display, language and time zone the launcher gives Chrome", () => {
   const answer = (output: string) => async () => output;
   const fail = async () => { throw new Error("no display"); };
@@ -89,14 +133,20 @@ describe("the display, language and time zone the launcher gives Chrome", () => 
     expect(await primaryScreen("darwin", { OMB_BROWSER_SCREEN: "2560x1440" }, fail)).toEqual({ width: 2560, height: 1440 });
   });
 
-  it("takes the language only when it is known, never guessing over Chrome's own", () => {
+  it("uses the app or system language and falls back to English for a C locale", () => {
     expect(browserLanguage({ OMB_BROWSER_LANG: "de-DE", LANG: "en_US.UTF-8" })).toBe("de-DE");
+    expect(browserLanguage({}, "ko-KR")).toBe("ko-KR");
+    expect(browserLanguage({}, "ko")).toBe("ko-KR");
+    expect(browserLanguage({ LANG: "fr_FR.UTF-8" }, "ko-KR")).toBe("ko-KR");
+    expect(browserLanguage({ OMB_BROWSER_LANG: "ja-JP" }, "ko-KR")).toBe("ja-JP");
+    expect(browserLanguage({ LANG: "fr_FR.UTF-8" }, "not a locale")).toBe("fr-FR");
     expect(browserLanguage({ LANG: "en_GB.UTF-8" })).toBe("en-GB");
     expect(browserLanguage({ LC_ALL: "fr_FR@euro", LANG: "en_US.UTF-8" })).toBe("fr-FR");
-    expect(browserLanguage({ LANG: "C.UTF-8" })).toBeUndefined();
-    expect(browserLanguage({ LANG: "POSIX" })).toBeUndefined();
+    expect(browserLanguage({ LANG: "C.UTF-8" })).toBe("en-US");
+    expect(browserLanguage({ LANG: "POSIX" })).toBe("en-US");
     expect(browserLanguage({})).toBeUndefined();
     expect(browserLanguage({ OMB_BROWSER_LANG: "en US; rm" })).toBeUndefined();
+    expect(browserLanguage({ OMB_BROWSER_LANG: "en US; rm" }, "ko")).toBe("ko-KR");
   });
 
   it("gives Chrome the server's time zone, where Chrome reads TZ", () => {

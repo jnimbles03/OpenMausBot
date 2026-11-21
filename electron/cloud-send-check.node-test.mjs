@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { checkChats, checkPassed, checkSecrets, manifestGaps, missingAttachments, noGaps } from "./cloud-send-check.mjs";
+import { checkChats, checkPassed, checkSecrets, manifestGaps, missingAttachments, noGaps, roomsRemovedThere, roomsThatGo } from "./cloud-send-check.mjs";
 
 const manifest = (extra = {}) => ({
   v: 1, appVersion: "0.1.120",
@@ -17,6 +17,20 @@ const manifest = (extra = {}) => ({
   conversations: [{ threadId: "t-ember", bot: "ember", rows: 4, newest: "e4" }, { threadId: "t-juno", bot: "juno", rows: 1, newest: "j1" }, { threadId: "t-room", room: "r1", rows: 2, newest: "r2" }],
   attachments: [],
   ...extra,
+});
+
+test("a saved secret's check: a Cloud that can't keep secrets by id is never held to them, and a Cloud that can is", async () => {
+  const secret = { key: "secret:s1", kind: "secret", label: "Stripe", id: "s1", parts: { saved: "1" } };
+  const here = manifest({ items: [...manifest().items, secret] });
+  const there = manifest();
+  assert.equal(noGaps(manifestGaps(here, there)), true, "an older Cloud without saved secrets is not short");
+  assert.deepEqual(manifestGaps(here, { ...there, vault: 1 }).items, [{ key: "secret:s1", kind: "secret", label: "Stripe" }]);
+  assert.equal(noGaps(manifestGaps(here, { ...there, vault: 1, items: [...there.items, { ...secret, parts: { saved: "9" } }] })), true, "compared by fingerprint, not by when it changed");
+
+  const answerFrom = (secrets, vault) => ({ handoff: async () => ({ secrets: { "secret:s1": "f1" } }), session: { call: async () => ({ ok: true, body: { secrets, ...(vault ? { vault: 1 } : {}) } }) } });
+  assert.deepEqual(await checkSecrets(answerFrom({}, false)), { equal: [], differs: [], missing: [] });
+  assert.deepEqual(await checkSecrets(answerFrom({}, true)), { equal: [], differs: [], missing: ["secret:s1"] });
+  assert.deepEqual(await checkSecrets(answerFrom({ "secret:s1": "f1" }, true)), { equal: ["secret:s1"], differs: [], missing: [] });
 });
 
 test("a move's check finds nothing missing when My Cloud holds all this computer sent, its own way of holding a part included", () => {
@@ -54,6 +68,39 @@ test("a move's check names what My Cloud lacks: items, parts, memory, rooms, con
   const gaps = manifestGaps(here, there, { removed, skip: new Set(["mcp:docs", "skill:ember:notes"]) });
   assert.deepEqual([gaps.items, gaps.rooms, gaps.connections, gaps.conversations], [[], [], [], ["t-ember"]], "a bot removed there takes its conversations with it");
   assert.equal(manifestGaps(null, there), null);
+});
+
+test("a room none of whose bots goes is left out of the check with its conversations, as My Cloud never makes it; one with a bot that goes is not", () => {
+  const here = manifest({ rooms: [
+    { id: "r1", name: "Launch", members: ["ember"], threads: ["t-room"] },
+    { id: "r-orphan", name: "Orphan", members: [], threads: ["t-orphan"] },
+    { id: "r-juno", name: "Juno's", members: ["juno"], threads: ["t-juno-room"] },
+  ], conversations: [...manifest().conversations, { threadId: "t-orphan", room: "r-orphan", rows: 1, newest: "o1" }, { threadId: "t-juno-room", room: "r-juno", rows: 1, newest: "j9" }] });
+  const there = manifest({ rooms: [], conversations: manifest().conversations.filter((head) => !head.room) });
+  const gaps = manifestGaps(here, there, { removed: new Set(["bot:juno"]) });
+  assert.deepEqual(gaps.rooms, [{ id: "r1", name: "Launch" }], "the bots of Orphan were deleted here, and Juno was removed on My Cloud");
+  assert.deepEqual(gaps.conversations, ["t-room"]);
+  assert.deepEqual([...roomsThatGo(here, new Set(["ember", "juno"]))], ["r1", "r-juno"]);
+});
+
+test("a room My Cloud had once and lacks now counts as removed there, once nothing here would make it again", () => {
+  const rooms = [
+    { id: "r-gone", name: "Gone", members: ["ember"], threads: ["t-gone", "t-gone-2"] },
+    { id: "r-quiet", name: "Quiet", members: ["ember"], threads: ["t-quiet"] },
+    { id: "r-new", name: "New", members: ["ember"], threads: ["t-new-1", "t-new-2"] },
+    { id: "r-held", name: "Held", members: ["ember"], threads: ["t-held"] },
+    { id: "r-never", name: "Never", members: ["ember"], threads: ["t-never"] },
+  ];
+  const conversations = [{ threadId: "t-gone", room: "r-gone", rows: 2, newest: "g2" }, { threadId: "t-new-1", room: "r-new", rows: 1, newest: "n1" },
+    { threadId: "t-new-2", room: "r-new", rows: 1, newest: "n2" }, { threadId: "t-held", room: "r-held", rows: 1, newest: "h1" }, { threadId: "t-never", room: "r-never", rows: 1, newest: "v1" }];
+  const here = manifest({ rooms, conversations });
+  const there = manifest({ rooms: [{ id: "r-held", name: "Held", members: ["ember"], threads: ["t-held"] }], conversations: [conversations[3]] });
+  const chats = { "t-gone": "removed", "t-quiet": { after: 0, id: "" }, "t-new-1": { after: 1, id: "n1" }, "t-held": { after: 1, id: "h1" } };
+  const removed = roomsRemovedThere(here, there, chats);
+  assert.deepEqual(removed, ["room:r-gone", "room:r-quiet"], "r-new has a conversation that never went, which makes it again; r-held is there; r-never never went");
+  const gaps = manifestGaps(here, there, { removed: new Set(removed) });
+  assert.deepEqual(gaps.rooms.map((room) => room.id), ["r-new", "r-never"]);
+  assert.deepEqual(gaps.conversations, ["t-new-1", "t-new-2", "t-never"], "a room removed there takes its conversations with it");
 });
 
 /** This computer's rows and path for `thread`, and a My Cloud that checks them against its own `cloudPath`/`cloudRows`;
@@ -163,4 +210,9 @@ test("a move's check finds what only a move carries: memory pieces, journal rows
   });
   const full = { bot: "ember", ids: Array.from({ length: 500 }, (_, i) => `mine-${i}`) };
   assert.deepEqual(manifestGaps(here, { ...there, journal: [full] }, { removed }).journal, [], "a journal showing its latest 500 rows of My Cloud's own may no longer show older ones");
+});
+
+test("an answer about the attachments that names no list is never read as nothing missing", async () => {
+  const session = { call: async () => ({ ok: true, status: 200, body: {} }) };
+  await assert.rejects(missingAttachments(session, ["00000001.png"]), /did not check the attachments/u);
 });

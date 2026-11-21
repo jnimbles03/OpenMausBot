@@ -46,6 +46,54 @@ function plan(bots: Array<{ id: string }>) {
 
 type App = Awaited<ReturnType<typeof openApp>>;
 
+(enabled ? it : it.skip)("explains an old automation notification and keeps it cleared after restart", async () => {
+  const server = await launchRestartableServer({ scripted: true, dataDirRoot: SHORT_TMP });
+  let app: App | undefined;
+  try {
+    const api = async (method: string, path: string, body?: unknown) => {
+      const response = await fetch(`${server.url}${path}`, { method, headers: { "content-type": "application/json", origin: server.url }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+      expect(response.ok).toBe(true);
+      return response.json();
+    };
+    const bot = (await api("GET", "/api/bots?messages=0")).bots[0];
+    const setReply = (fail: boolean) => writeFileSync(server.planPath, JSON.stringify({ [bot.id]: { script: [{ key: "check", match: ["Check notification history."], repeat: true, steps: [], ...(fail ? { failWith: "Provider disconnected." } : { reply: "Nothing new." }) }] } }));
+    const { routine } = await api("POST", "/api/routines", { name: "Keep an eye on my day", prompt: "Check notification history.", botId: bot.id, schedule: { type: "interval", everyMinutes: 1440, anchorAt: Date.now() + 86_400_000 } });
+    let failedId = "";
+    for (let index = 0; index < 7; index++) {
+      setReply(index === 0);
+      const { run } = await api("POST", `/api/routines/${routine.id}/run`);
+      if (index === 0) failedId = run.id;
+      await expect.poll(async () => (await api("GET", "/api/routines")).runs.find((candidate: { id: string }) => candidate.id === run.id)?.status, { timeout: 30_000 }).toBe(index === 0 ? "failed" : "completed");
+    }
+    await server.stop();
+    await server.start();
+    app = await openApp(server, { shots: join(SHOTS, "notification"), bots: { [bot.name]: bot.id } });
+    await app.openAutomations();
+    await expect.poll(() => app!.rowText(routine.name)).toContain("Provider disconnected.");
+    expect(await app.evaluate('Boolean(document.querySelector(\'[data-testid="routines-attention"]\'))')).toBe(true);
+    await app.screenshot("unread-failure-explained");
+    await app.openRow(routine.name);
+    await expect.poll(app.panel).toContain("Provider disconnected.");
+    await expect.poll(async () => Boolean((await api("GET", "/api/routines")).runs.find((run: { id: string }) => run.id === failedId)?.seenAt)).toBe(true);
+    await expect.poll(() => app!.evaluate('Boolean(document.querySelector(\'[data-testid="routines-attention"]\'))')).toBe(false);
+    await app.screenshot("failure-read");
+    await app.close();
+    app = undefined;
+    await server.stop();
+    await server.start();
+    app = await openApp(server, { shots: join(SHOTS, "notification-restarted"), bots: { [bot.name]: bot.id } });
+    await app.openAutomations();
+    await expect.poll(() => app!.rowText(routine.name)).toContain("Keep an eye on my day");
+    expect(await app.rowText(routine.name)).not.toContain("Provider disconnected.");
+    expect(await app.evaluate('Boolean(document.querySelector(\'[data-testid="routines-attention"]\'))')).toBe(false);
+    await app.screenshot("notification-cleared-after-restart");
+  } finally {
+    await app?.close();
+    console.info(JSON.stringify({ logPath: server.logPath, screenshots: join(SHOTS, "notification") }));
+    await server.close();
+  }
+}, 240_000);
+
 /** The real renderer on `server` in headless Chrome, and what a person does with it. */
 async function openApp(server: { url: string; port: number; dataDir: string; logPath: string }, options: { shots: string; bots: Record<string, string>; proxyHeaders?: Record<string, string> }) {
   mkdirSync(options.shots, { recursive: true });
@@ -76,6 +124,11 @@ async function openApp(server: { url: string; port: number; dataDir: string; log
   const rowStatus = (sentence: string) => evaluate(`${row(sentence)}?.dataset.automationStatus ?? "gone"`) as Promise<string>;
   const flip = (sentence: string) => evaluate(`(() => { const toggle = ${row(sentence)}?.querySelector("[role=switch]"); toggle?.click(); return toggle?.getAttribute("aria-checked") ?? null; })()`);
   const switchState = (sentence: string) => evaluate(`${row(sentence)}?.querySelector("[role=switch]")?.getAttribute("aria-checked") ?? null`) as Promise<string | null>;
+  /** Opens an automation from its row: the row's title is its name, with the sentence beneath. */
+  const openRow = async (sentence: string) => {
+    const found = await evaluate(`(() => { const button = ${row(sentence)}?.querySelector("button"); button?.click(); return Boolean(button); })()`);
+    expect(found, sentence).toBe(true);
+  };
   const panel = () => text('aside[aria-label="Automation"]');
   const card = (sentence: string) => `[...document.querySelectorAll("[data-trigger-card]")].find((item) => item.innerText.includes(${JSON.stringify(sentence)}))`;
   const cardText = (sentence: string) => evaluate(`${card(sentence)}?.innerText ?? ""`) as Promise<string>;
@@ -103,7 +156,7 @@ async function openApp(server: { url: string; port: number; dataDir: string; log
     await browser("close").catch(() => {});
     await preview.close();
   };
-  return { ui, evaluate, click, screenshot, text, clickIn, fill, select, rowText, rowStatus, flip, switchState, panel, card, cardText, clickCard, reload, openAutomations, openChat, say, noOverflow, browser, close };
+  return { ui, evaluate, click, screenshot, text, clickIn, fill, select, rowText, rowStatus, flip, switchState, openRow, panel, card, cardText, clickCard, reload, openAutomations, openChat, say, noOverflow, browser, close };
 }
 
 (enabled ? it : it.skip)("a person sets up, uses, pauses, edits, breaks, deletes and restarts automations in the real app", async () => {
@@ -126,7 +179,7 @@ async function openApp(server: { url: string; port: number; dataDir: string; log
     writeFileSync(live.planPath, JSON.stringify(plan([{ id: starter.id }, { id: scout }, { id: ledger }])));
 
     app = await openApp(live, { shots: SHOTS, bots: { Scout: scout, Ledger: ledger } });
-    const { ui, evaluate, click, screenshot, text, clickIn, fill, select, rowText, rowStatus, flip, switchState, panel, card, cardText, clickCard, reload, openAutomations, openChat, say, noOverflow, browser } = app;
+    const { ui, evaluate, click, screenshot, text, clickIn, fill, select, rowText, rowStatus, flip, switchState, openRow, panel, card, cardText, clickCard, reload, openAutomations, openChat, say, noOverflow, browser } = app;
     const MAIN = "every morning, summarize my inbox";
     const state = async () => ({ ...(await api("GET", "/api/routines")), ...(await api("GET", "/api/webhooks")) }) as { routines: any[]; runs: any[]; webhooks: any[]; attempts: any[] };
 
@@ -166,7 +219,7 @@ async function openApp(server: { url: string; port: number; dataDir: string; log
     expect(wrong.status).toBe(401);
     await openAutomations();
     await expect.poll(() => rowText(FORM)).toMatch(/Working · last ran today/);
-    await click(FORM);
+    await openRow(FORM);
     await expect.poll(panel).toMatch(/recent runs/i);
     await evaluate(`document.querySelector('aside[aria-label="Automation"] details summary').click(); true`);
     await expect.poll(() => text('aside[aria-label="Automation"] details')).toContain("Recent calls");
@@ -206,14 +259,14 @@ async function openApp(server: { url: string; port: number; dataDir: string; log
     expect((await state()).routines[0]).toMatchObject({ enabled: true });
     expect((await state()).webhooks[0]).toMatchObject({ enabled: true });
 
-    await click(SCHEDULE);
+    await openRow(SCHEDULE);
     await clickIn('aside[aria-label="Automation"]', "Pause");
     await expect.poll(panel).toMatch(/^.+\nPaused\n/);
     await expect.poll(() => rowText(SCHEDULE)).toMatch(/Paused · /);
     await screenshot("panel-paused");
     await reload();
     await openAutomations();
-    await click(SCHEDULE);
+    await openRow(SCHEDULE);
     expect(await panel()).toMatch(/^.+\nPaused\n/);
     await clickIn('aside[aria-label="Automation"]', "Resume");
     await expect.poll(panel).toMatch(/^.+\nWorking\n/);
@@ -236,7 +289,7 @@ async function openApp(server: { url: string; port: number; dataDir: string; log
 
     // 4. Run now; Edit the time and the instructions; the sentence follows.
     await openAutomations();
-    await click(SCHEDULE);
+    await openRow(SCHEDULE);
     await clickIn('aside[aria-label="Automation"]', "Run now");
     await expect.poll(panel, { timeout: 30_000 }).toMatch(/Today [^\n]*\n✓\nInbox: 3 new emails, nothing urgent\./);
     await expect.poll(() => rowText(SCHEDULE)).toMatch(/Working · last ran today [^·]+ · next: /);
@@ -268,7 +321,7 @@ async function openApp(server: { url: string; port: number; dataDir: string; log
     await say("Scout", "every day at 5pm, check the sales inbox", MAIN);
     await expect.poll(() => cardText(FAILING), { timeout: 30_000 }).toContain("Next:");
     await openAutomations();
-    await click(FAILING);
+    await openRow(FAILING);
     await clickIn('aside[aria-label="Automation"]', "Run now");
     await expect.poll(panel, { timeout: 30_000 }).toContain("Needs you");
     expect(await panel()).toContain("It's signed out. Sign in again so it can run.");
@@ -286,7 +339,7 @@ async function openApp(server: { url: string; port: number; dataDir: string; log
     await click("List");
 
     // 7. Delete one from its panel; Undo one a bot just made from its card.
-    await click(FAILING);
+    await openRow(FAILING);
     await evaluate("window.confirm = () => true; true");
     await clickIn('aside[aria-label="Automation"]', "Delete");
     await expect.poll(() => rowStatus(FAILING)).toBe("gone");
@@ -347,7 +400,7 @@ async function openApp(server: { url: string; port: number; dataDir: string; log
     await openAutomations();
     await expect.poll(() => rowStatus(EDITED)).toBe("working");
     await screenshot("advanced-list");
-    await click(FORM);
+    await openRow(FORM);
     await expect.poll(panel).toContain("Copy address");
     await screenshot("advanced-panel");
     await click("Close");
@@ -357,7 +410,7 @@ async function openApp(server: { url: string; port: number; dataDir: string; log
     await noOverflow("the narrow list");
     expect(await evaluate(`(() => { const menu = document.querySelector('button[aria-label="Open bot list"]').getBoundingClientRect(); const back = document.querySelector('main header button[aria-label="Back"]').getBoundingClientRect(); return back.left >= menu.right; })()`), "the Back button sits clear of the menu button").toBe(true);
     await screenshot("narrow-list");
-    await click(EDITED);
+    await openRow(EDITED);
     await expect.poll(panel).toMatch(/recent runs/i);
     await noOverflow("the narrow panel");
     expect(await evaluate(`(() => { const box = document.querySelector('aside[aria-label="Automation"]').getBoundingClientRect(); return box.left >= 0 && box.right <= window.innerWidth + 1; })()`)).toBe(true);
@@ -408,7 +461,7 @@ process.env.FAKE_CLAUDE_MODE ??= "happy";
 await import(${JSON.stringify(pathToFileURL(join(ROOT, "server", "testing", "fake-claude-cli.ts")).href)});
 `, { mode: 0o755 });
   writeFileSync(join(dataDir, "config.json"), JSON.stringify({ language: "en", instances: {
-    ...Object.fromEntries(["cursor", "openaiCompat", "qwen", "hermes", "pi"].map((id) => [id, { driver: "not-a-real-driver" }])),
+    ...Object.fromEntries(["cursor", "githubCopilot", "openaiCompat", "qwen", "hermes", "pi"].map((id) => [id, { driver: "not-a-real-driver" }])),
     claude: { driver: "claudeAgent", displayName: "Claude", config: { cli: claude }, environment: { FAKE_CLAUDE_ROOM_PLAN: planPath } },
   } }));
   const port = await freePortBlock([0, 1]);

@@ -58,6 +58,17 @@ export function createSyncClient({ origin, fetch: fetchImpl, power = null, chunk
     trash: () => json("GET", "/api/sync/trash").then((result) => result.entries),
     restore: (entryId) => json("POST", "/api/sync/trash/restore", { body: { entryId } }),
     bots: () => json("GET", "/api/bots?messages=0").then((result) => ({ bots: result?.bots ?? [], groups: result?.groups ?? [] })),
+    // Lent folders (electron/lent-folders.mjs): what this computer lends, a copy in step, and bots' changes waiting for it.
+    lent: (report) => json("POST", "/api/sync/lent", { body: report }),
+    synced: (folderId) => json("POST", `/api/sync/folders/${id(folderId)}/synced`, { body: {} }),
+    staged: (folderId) => json("GET", `/api/sync/folders/${id(folderId)}/staged`).then((result) => result?.staged ?? []),
+    stagedDone: (folderId, changeId, sha256) => json("POST", `/api/sync/folders/${id(folderId)}/staged/${id(changeId)}`, { body: { sha256 } }),
+    async stagedFile(folderId, changeId, temporary) {
+      const response = await call("GET", `/api/sync/folders/${id(folderId)}/staged/${id(changeId)}`);
+      if (!response.ok) throw new SyncHttpError(response.status, await response.json().catch(() => null));
+      await pipeline(Readable.fromWeb(response.body), createWriteStream(temporary, { flags: "w", mode: 0o600 }));
+      return { sha256: response.headers.get("x-omb-sha256") };
+    },
     async upload({ folderId, path, file, size, sha256, baseSha256 }) {
       let begun;
       try {
@@ -72,7 +83,12 @@ export function createSyncClient({ origin, fetch: fetchImpl, power = null, chunk
         while (received < size) {
           const length = Math.min(chunk, size - received);
           const buffer = Buffer.alloc(length);
-          if (readSync(fd, buffer, 0, length, received) !== length) throw new Error("The file changed while it was being sent.");
+          let filled = 0;
+          while (filled < length) {
+            const count = readSync(fd, buffer, filled, length - filled, received + filled);
+            if (count === 0) throw new Error("The file changed while it was being sent.");
+            filled += count;
+          }
           let response;
           try {
             response = await call("PUT", `/api/sync/uploads/${begun.uploadId}?offset=${received}`, { raw: buffer, timeoutMs: 30_000 + Math.ceil(length / SLOWEST) });

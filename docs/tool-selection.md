@@ -9,8 +9,9 @@ its model. This is useful for local models with a small context window.
 - Uncheck **Only allow listed tools** to keep the current catalog except for
   tools in Exclude. Exclude always wins.
 
-Enter one selector per line, then choose **Save tool selection**. Changes take
-effect on the next turn. Finish the bot's active tasks before saving. A failed
+Enter one selector per line, then choose **Save tool selection**. You can save while
+the bot works. Added tools appear from its next turn; removed tools may stop
+sooner. Stop its turns to remove access from tools it already loaded. A failed
 save never grants newly enabled tools. Changes that remove tool access can
 remain active in the running app even if saving fails; retry the save to keep
 them after a restart. Duplicating a bot preserves its selection from the moment
@@ -69,6 +70,29 @@ mcp:mail:read_notes
 Grok uses those two helpers to discover and call the selected MCP tools.
 Their results and calls are checked against the same original selectors.
 Pi sends the selected MCP schemas directly to the model.
+
+**OpenMausBot's own tools** sit on the server named `agents`. A few of them do
+several things, and each of those things has a name of its own, which a
+selector can use. `trigger`, `delete_trigger` and `trigger_info` also cover
+everything they do by their own names; for the other tools, the tool's name
+means what the table lists for it:
+
+| Tool | Names of what it does |
+| --- | --- |
+| `trigger_info` | `list_triggers`, `list_trigger_events` (`action: "events"`) |
+| `trigger` | `create_trigger` (`action: "create"`), `manage_trigger` (every other action) |
+| `delete_trigger` | `manage_trigger` (its delete) |
+| `manage_room` | `create_room` (`action: "create"`), `manage_room` (every other action) |
+| `session_search` | `session_read` (with `thread_id` and `message_id`), `session_search` |
+| `show_widget` | `update_widget` (with `widget_id`), `show_widget` |
+| `show_html` | `update_html` (with `app_id`), `show_html` |
+| `x_search` | `x_user_posts`, `x_post`, `x_profile` (by `action`), `x_search` |
+
+So `mcp:agents:trigger` in Exclude removes every change to a trigger but
+deleting, which `mcp:agents:delete_trigger` removes; `mcp:agents:create_trigger`
+only stops creating one, and `mcp:agents:manage_trigger` still stops every other
+change, deleting included. A tool is listed when the selection allows any of what it does; each call is
+checked against what it does.
 
 ## Engine support
 

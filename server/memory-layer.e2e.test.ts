@@ -15,10 +15,10 @@ it("recalls, captures, suggests, forgets and tidies a bot's memory", async () =>
   const future = new Date(Date.now() + 3 * 86_400_000).toISOString().slice(0, 10);
   writeFileSync(routes, JSON.stringify({
     [CAPTURE_MARKER]: JSON.stringify([
-      { text: "The person is vegetarian", kind: "preference", aboutUser: true, confidence: 0.9 },
-      { text: "The person has exams this weekend", kind: "fact", until: future, aboutUser: true, confidence: 0.9 },
-      { text: "The account balance is -10", kind: "fact", confidence: 0.9 },
-      { text: "The person loves Irani cafes", kind: "preference", topic: "food", topicAliases: ["restaurants", "cafes"], confidence: 0.9 },
+      { text: "The person is vegetarian", kind: "preference", evidence: "I'm vegetarian", aboutUser: true, confidence: 0.9 },
+      { text: "The person has exams this weekend", kind: "fact", evidence: "I have exams this weekend", until: future, aboutUser: true, confidence: 0.9 },
+      { text: "The account balance is -10", kind: "fact", evidence: "The account balance is -10", confidence: 0.9 },
+      { text: "The person loves Irani cafes", kind: "preference", evidence: "I love Irani cafes", topic: "food", topicAliases: ["restaurants", "cafes"], confidence: 0.9 },
     ]),
     [TIDY_MARKER]: '{"pairs": []}',
   }));
@@ -75,6 +75,15 @@ it("recalls, captures, suggests, forgets and tidies a bot's memory", async () =>
     expect(sentSince(before)).toContain("Bluebird");
     expect(sentSince(before)).toMatch(/your main chat|chat \\"[^"\\]+\\"/);
 
+    await api(`/api/bots/${bot.id}/memory/file`, "PUT", { path: "memory/home.md", text: "- 净水器的滤芯每六个月更换一次，上次是五月初换的。\n" });
+    before = sentCount();
+    await turn(bot.id, second, "滤芯多久要换一次？");
+    expect(sentSince(before)).toContain("滤芯每六个月更换一次");
+    await turn(bot.id, bot.threadId, "备忘：周三下午三点去社区图书馆还书。");
+    before = sentCount();
+    await turn(bot.id, second, "借的书哪天去图书馆还？");
+    expect(sentSince(before)).toContain("社区图书馆还书");
+
     await api(`/api/bots/${bot.id}`, "PATCH", { memoryEnabled: false });
     before = sentCount();
     await turn(bot.id, second, "Can you suggest some restaurants for Friday?");
@@ -93,13 +102,13 @@ it("recalls, captures, suggests, forgets and tidies a bot's memory", async () =>
     expect(withExpired).toContain("Prefers short replies");
 
     await api(`/api/bots/${bot.id}/memory/tidy`, "POST", undefined, 409);
-    await turn(bot.id, bot.threadId, "Just so you know, I'm vegetarian and I have exams this weekend.");
+    await turn(bot.id, bot.threadId, "Just so you know, I'm vegetarian and I have exams this weekend. The account balance is -10. I love Irani cafes.");
     await new Promise((resolve) => setTimeout(resolve, 2_500));
     expect((await memoryFile(bot.id)).text).not.toContain("The person is vegetarian");
 
     await api("/api/config", "PUT", { memory: { captureQuietMs: 5_000 } });
     await api(`/api/bots/${bot.id}`, "PATCH", { memoryUpkeep: true });
-    await turn(bot.id, bot.threadId, "Just so you know, I'm vegetarian and I have exams this weekend.");
+    await turn(bot.id, bot.threadId, "Just so you know, I'm vegetarian and I have exams this weekend. The account balance is -10. I love Irani cafes.");
     expect((await memoryFile(bot.id)).text).not.toContain("The person is vegetarian");
     await api(`/api/bots/${bot.id}`, "PATCH", { memoryUpkeep: false, browser: "invalid" }, 400);
     expect(await api(`/api/bots/${bot.id}/memory/upkeep`)).toMatchObject({ enabled: true });
@@ -119,12 +128,12 @@ it("recalls, captures, suggests, forgets and tidies a bot's memory", async () =>
 
     writeFileSync(routes, JSON.stringify({
       [CAPTURE_MARKER]: JSON.stringify([
-        { text: "The account balance is -10", kind: "fact" },
-        { text: "The account balance is 10", kind: "fact" },
+        { text: "The account balance is -10", kind: "fact", evidence: "The account balance is -10" },
+        { text: "The account balance is 10", kind: "fact", evidence: "the account balance is 10" },
       ]),
       [TIDY_MARKER]: '{"pairs": []}',
     }));
-    await turn(bot.id, bot.threadId, "The balance changed today.");
+    await turn(bot.id, bot.threadId, "The balance changed today: the account balance is 10.");
     await expect.poll(async () => (await memoryFile(bot.id)).text, { timeout: 20_000 }).toContain("The account balance is 10\n");
     expect((await memoryFile(bot.id)).text.match(/The account balance is -10/g)).toHaveLength(1);
 

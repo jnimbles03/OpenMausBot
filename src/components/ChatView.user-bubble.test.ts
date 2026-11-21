@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Bot, InstanceInfo } from "@/state/store";
 
-const fixture = vi.hoisted(() => ({ colorMine: false }));
+const fixture = vi.hoisted(() => ({ colorMine: false, advanced: false }));
 
 vi.mock("@/state/store", async (importOriginal) => {
   const original = await importOriginal<typeof import("@/state/store")>();
@@ -15,7 +15,7 @@ vi.mock("./DesktopCapabilities", () => ({
 }));
 vi.mock("@/lib/analytics", () => ({ track: vi.fn() }));
 vi.mock("@/lib/thread-preferences", () => ({ useShowThreads: () => false, useShowThreadsChoice: () => false, setShowThreads: vi.fn() }));
-vi.mock("@/lib/interface-mode", () => ({ useAdvancedMode: () => false, setAdvancedMode: vi.fn() }));
+vi.mock("@/lib/interface-mode", () => ({ useAdvancedMode: () => fixture.advanced, setAdvancedMode: vi.fn() }));
 vi.mock("@/lib/cloud-guest", () => ({ useCanWriteIn: () => true, useReactor: () => "user" }));
 vi.mock("./CitationUI", () => ({ CitationSelectionToolbar: () => null, SentCitations: () => null }));
 vi.mock("./ModelPicker", () => ({ ModelPicker: () => null }));
@@ -35,7 +35,7 @@ const bot: Bot = {
   tasks: [{ threadId: "selected", title: "Selected", createdAt: 1, busy: false, activity: "idle", modelSelection: { instanceId: "test", model: "thread-model" }, approvalMode: "ask" }],
 };
 
-afterEach(() => { fixture.colorMine = false; vi.unstubAllGlobals(); });
+afterEach(() => { fixture.colorMine = false; fixture.advanced = false; vi.unstubAllGlobals(); });
 
 beforeEach(() => {
   vi.stubGlobal("window", {});
@@ -49,13 +49,14 @@ describe("bot-colored user bubbles", () => {
     expect(html).toContain("hello from me");
   });
 
-  it("paints the person's bubble with a gradient of the bot and readable text", () => {
+  it("paints the person's bubble in one flat tone of the bot, with readable text", () => {
     fixture.colorMine = true;
     const tone = userBubbleTone("yellow");
     const html = renderToStaticMarkup(createElement(ChatView, { bot }));
     expect(html).toContain("user-bubble-colored");
     expect(html).toContain(`background-color:${tone.background}`);
-    expect(html).toContain(`background-image:${tone.gradient}`);
+    expect(html).toContain("background-image:none");
+    expect(html).not.toContain(tone.gradient);
     expect(html).toContain(`--color-ink:${tone.ink}`);
     expect(html).toContain("hello from me");
     const mine = html.indexOf("user-bubble-colored");
@@ -63,4 +64,23 @@ describe("bot-colored user bubbles", () => {
     expect(mine).toBeGreaterThan(-1);
     expect(html.slice(reply - 80, reply)).not.toContain(tone.background);
   });
+});
+
+it("marks a steered message as sent mid-turn without claiming the bot read it", () => {
+  const steered: Bot = {
+    ...bot,
+    messages: [{ ...bot.messages[0]!, steered: true }, bot.messages[1]!],
+  };
+  const html = renderToStaticMarkup(createElement(ChatView, { bot: steered }));
+
+  expect(html).toContain(">sent mid-turn</div>");
+  expect(html).not.toContain("It saw this before its next step");
+});
+
+it.each([["Simple", false], ["Advanced", true]] as const)("finishes the bot's bubble with the sheen and inset line in %s mode, and not the person's", (_mode, advanced) => {
+  fixture.advanced = advanced;
+  const html = renderToStaticMarkup(createElement(ChatView, { bot }));
+  const classOf = (look: string) => html.match(new RegExp(`<div[^>]*data-look="${look}"[^>]*>`))?.[0].match(/class="([^"]*)"/)?.[1]?.split(" ") ?? [];
+  expect(classOf("bot-bubble")).toEqual(expect.arrayContaining(["bg-card", "bubble-finish"]));
+  expect(classOf("user-bubble")).not.toContain("bubble-finish");
 });

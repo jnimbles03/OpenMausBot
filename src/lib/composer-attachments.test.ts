@@ -5,16 +5,19 @@ import {
   attachmentAudioUrl,
   attachmentBasename,
   attachmentImageUrl,
+  clipboardFilesToAttach,
   clipboardHasImages,
   clipboardImageFiles,
   composeMessage,
   documentMime,
+  FILE_MAX_BYTES,
   fileAttachment,
   fileAttachmentFromFile,
   handoffAttachmentImagePreview,
   imageAttachmentFromFile,
   isImageFile,
   optimisticImageAttachment,
+  PREVIEW_MAX_BYTES,
   releaseAttachmentImagePreview,
   splitTranscriptAttachments,
   type ImageAttachment,
@@ -22,7 +25,23 @@ import {
   composerTakesFocusOnOpen,
   replyTargetTakesFocus,
   dataContextFor,
+  discardUnsentUpload,
 } from "./composer-attachments";
+
+describe("discardUnsentUpload", () => {
+  it("asks the server to drop an uploaded file taken off the message, and nothing else", () => {
+    const fetchMock = vi.fn(async () => new Response("{}"));
+    vi.stubGlobal("fetch", fetchMock);
+    try {
+      discardUnsentUpload(fileAttachment("notes.txt", "/home/a/.openmausbot/attachments/0f1e2d3c-aaaa-4bbb-8ccc-123456789abc.txt", 3));
+      discardUnsentUpload({ kind: "paste", id: "p", text: "hi", size: 2, lines: 1 });
+      discardUnsentUpload({ kind: "image", id: "i", path: "", name: "x.png", size: 0, mime: "image/png", uploading: true });
+      expect(fetchMock.mock.calls).toEqual([["/api/attachments/0f1e2d3c-aaaa-4bbb-8ccc-123456789abc.txt", { method: "DELETE" }]]);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
 
 describe("the viewed Data result and the words", () => {
   it("rides as its own field of the send (shared/data-context.ts), so the transcript keeps every typed line", () => {
@@ -449,6 +468,23 @@ describe("clipboardImageFiles", () => {
   });
 });
 
+describe("clipboardFilesToAttach", () => {
+  it("attaches a copied archive or document, with any pictures copied beside it", () => {
+    const zip = new File([new Uint8Array([0x50, 0x4b])], "Project.ZIP", { type: "application/x-zip-compressed" });
+    const tarball = new File([new Uint8Array([0x1f, 0x8b])], "logs.tar.gz", { type: "" });
+    const png = new File(["image"], "shot.png", { type: "image/png" });
+    expect(clipboardFilesToAttach({ files: [zip] })).toEqual([zip]);
+    expect(clipboardFilesToAttach({ files: [tarball, png] })).toEqual([tarball, png]);
+  });
+
+  it("leaves pictures alone and plain text to the text paste", () => {
+    const png = new File(["image"], "shot.png", { type: "image/png" });
+    expect(clipboardFilesToAttach({ files: [png] })).toEqual([]);
+    expect(clipboardFilesToAttach({ files: [] })).toEqual([]);
+    expect(clipboardFilesToAttach(null)).toEqual([]);
+  });
+});
+
 describe("clipboardHasImages", () => {
   it("detects images in items", () => {
     expect(clipboardHasImages({
@@ -495,12 +531,29 @@ describe("private document intake", () => {
     }
   });
 
+  /** A file that reports a size without holding the bytes in the test. */
+  const sized = (name: string, type: string, size: number) => Object.defineProperty(new File([new Uint8Array(3)], name, { type }), "size", { value: size });
+
   it("rejects oversized audio before uploading", async () => {
     const fetch = vi.spyOn(globalThis, "fetch");
     try {
-      const file = new File([new Uint8Array(25 * 1024 * 1024 + 1)], "large.opus", { type: "audio/opus" });
-      await expect(fileAttachmentFromFile(file)).rejects.toMatchObject({ status: 413 });
+      await expect(fileAttachmentFromFile(sized("large.opus", "audio/opus", FILE_MAX_BYTES + 1))).rejects.toMatchObject({
+        status: 413, problem: { kind: "too-large", name: "large.opus", limitMb: 100 },
+      });
       expect(fetch).not.toHaveBeenCalled();
+    } finally {
+      fetch.mockRestore();
+    }
+  });
+
+  it("sends a file over the preview size: the composer takes what the server keeps", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      path: "/private/attachments/big.pdf", name: "Scan.pdf", bytes: PREVIEW_MAX_BYTES + 1,
+    }), { status: 201, headers: { "content-type": "application/json" } }));
+    try {
+      const file = sized("Scan.pdf", "application/pdf", PREVIEW_MAX_BYTES + 1);
+      await expect(fileAttachmentFromFile(file)).resolves.toMatchObject({ kind: "file", name: "Scan.pdf", size: PREVIEW_MAX_BYTES + 1 });
+      expect(fetch).toHaveBeenCalledWith(expect.stringMatching(/^\/api\/files\?/), expect.objectContaining({ method: "POST", body: file }));
     } finally {
       fetch.mockRestore();
     }
@@ -510,6 +563,27 @@ describe("private document intake", () => {
     expect(documentMime({ name: "notes.bin", type: "text/markdown; charset=utf-8" })).toBe("text/markdown");
     expect(documentMime({ name: "REPORT.PDF", type: "" })).toBe("application/pdf");
     expect(documentMime({ name: "archive.zip", type: "application/zip" })).toBeNull();
+  });
+
+  it("uploads archives as plain files, typed by their filename", async () => {
+    const fetch = vi.spyOn(globalThis, "fetch").mockImplementation(async () => new Response(JSON.stringify({
+      path: "/private/attachments/1.zip", name: "x", bytes: 3,
+    }), { status: 201, headers: { "content-type": "application/json" } }));
+    try {
+      for (const [name, type, mime] of [
+        ["Project.zip", "application/x-zip-compressed", "application/zip"],
+        ["logs.TAR.GZ", "", "application/gzip"],
+        ["src.tgz", "application/octet-stream", "application/x-compressed-tar"],
+        ["dump.7z", "", "application/x-7z-compressed"],
+      ] as const) {
+        const file = new File([new Uint8Array([1, 2, 3])], name, { type });
+        await expect(fileAttachmentFromFile(file)).resolves.toMatchObject({ kind: "file", path: "/private/attachments/1.zip" });
+        expect(fetch).toHaveBeenLastCalledWith(expect.stringMatching(/^\/api\/files\?/), expect.objectContaining({ headers: { "content-type": mime } }));
+      }
+      await expect(fileAttachmentFromFile(new File([new Uint8Array([1])], "zip-renamed.bin", { type: "application/zip" }))).resolves.toBeNull();
+    } finally {
+      fetch.mockRestore();
+    }
   });
 
   it("uses the server path and safe name returned by the private store", async () => {

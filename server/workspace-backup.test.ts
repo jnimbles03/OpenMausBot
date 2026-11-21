@@ -3,6 +3,7 @@ import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, 
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { createServer as createNetServer } from "node:net";
 import { gzipSync } from "node:zlib";
 import { Header } from "tar";
 import { browserProfilesRoot } from "./browser-engine.ts";
@@ -13,7 +14,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
   applyPendingWorkspaceRestore, commitPendingWorkspaceRestore, createWorkspaceBackup,
   readLastWorkspaceRestore, readPendingWorkspaceRestoreMetadata, readStagedWorkspaceBackup,
-  removeWorkspaceBackupJob, stageWorkspaceBackup,
+  omittedFromWorkspaceBackup, removeWorkspaceBackupJob, stageWorkspaceBackup,
 } from "./workspace-backup.ts";
 
 const PASSWORD = "correct horse battery staple";
@@ -54,6 +55,7 @@ function fixture(root: string): DatabaseSync {
   json(join(root, "webhooks.json"), { version: 1, webhooks: [{ id: "hook", endpointId: "endpoint", enabled: true, secretHash: "a".repeat(64), sealedSecret: "sealed-webhook-secret" }], deliveries: [{ id: "delivery" }],
     deleted: [{ at: 1, webhook: { id: "gone", endpointId: "gone-endpoint", secretHash: "c".repeat(64), sealedSecret: "sealed-deleted-secret" } }] });
   json(join(root, "calendar-calls.json"), { version: 1, calls: [{ id: "call", nextRunAt: 100 }] });
+  json(join(root, "app-triggers.json"), { version: 1, pollerId: "poller-source-0001", cursor: 4, triggers: [{ id: "trigger", botId: "bot", enabled: true }], attempts: [], deleted: [] });
   json(join(root, "delegations.json"), { thread: [{ id: "pending" }] });
   const runtime = openRuntimeStore(join(root, "runtime.db"));
   try {
@@ -64,6 +66,7 @@ function fixture(root: string): DatabaseSync {
   json(join(root, "sessions.json"), { identity: "source-session" });
   json(join(root, "cloud-owner.json"), { identity: "source-owner-record" });
   writeFileSync(join(root, "environment-id"), "source-environment");
+  json(join(root, "data-format.json"), { format: 2, writtenBy: "99.0.0", writtenAt: "2027-01-01T00:00:00.000Z" });
   mkdirSync(join(root, "tools"));
   writeFileSync(join(root, "tools", "downloaded"), "reinstallable");
   mkdirSync(join(root, "decider-log"));
@@ -113,6 +116,30 @@ function caseSensitiveTempFolder(): boolean {
 afterEach(() => { for (const root of scratch.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 describe("encrypted full workspace backups", () => {
+  it("leaves waits out of backups and Cloud sends", () => expect(omittedFromWorkspaceBackup("waits.json")).toBe(true));
+
+  it("carries no waits, and a restore ends the waits already here, keeping them in the safety copy", async () => {
+    const source = directory();
+    writeFileSync(join(source, "waits.json"), JSON.stringify({ version: 1, waits: [{ id: "from-the-backup" }] }));
+    writeFileSync(join(source, "notes.md"), "kept");
+    const exported = await createWorkspaceBackup(source, { password: PASSWORD });
+    expect(exported.summary.exclusions).toContain("Waits bots set up: they end within a week, so ask the bot again after restoring.");
+    expect(exported.summary.warnings.some((warning) => warning.startsWith("Restoring pauses routines, webhooks and calendar calls, ends every wait,"))).toBe(true);
+    const target = directory();
+    const here = JSON.stringify({ version: 1, waits: [{ id: "made-before-the-restore" }] });
+    writeFileSync(join(target, "waits.json"), here);
+    const staged = await stageWorkspaceBackup(target, exported.path, { password: PASSWORD });
+    const manifest = readJson(join(target, ".backups", staged.id, "staged", "manifest.json"));
+    expect(manifest.entries.map((entry: { path: string }) => entry.path)).toContain("notes.md");
+    expect(manifest.entries.map((entry: { path: string }) => entry.path)).not.toContain("waits.json");
+    commitPendingWorkspaceRestore(target, staged.id);
+    const result = applyPendingWorkspaceRestore(target);
+    expect(result).toMatchObject({ restored: true });
+    expect(readFileSync(join(target, "notes.md"), "utf8")).toBe("kept");
+    expect(existsSync(join(target, "waits.json"))).toBe(false);
+    expect(readFileSync(join(result.safetyCopyPath!, "data", "waits.json"), "utf8")).toBe(here);
+  });
+
   it("leaves Sync with My Cloud's own records out of a backup", async () => {
     const source = directory();
     mkdirSync(join(source, "sync", "trash"), { recursive: true });
@@ -155,6 +182,7 @@ describe("encrypted full workspace backups", () => {
       const targetComputers = { version: 1, environmentId: "target-environment", computers: [{ id: "target-computer", name: "Destination desktop", section: null }] };
       json(join(target, "team-computers.json"), targetComputers);
       writeFileSync(join(target, "environment-id"), "target-environment");
+      json(join(target, "data-format.json"), { format: 1, writtenBy: "0.1.151", writtenAt: "2026-11-01T00:00:00.000Z" });
       writeFileSync(join(target, "openmausbot-server.lease"), "live-lease");
       writeFileSync(join(target, "messages.db-wal"), "old database WAL must not enter the new DB");
       writeFileSync(join(target, "messages.db-shm"), "old database shared memory");
@@ -167,6 +195,7 @@ describe("encrypted full workspace backups", () => {
       expect(existsSync(join(data, "bots.json"))).toBe(true);
       expect(existsSync(join(data, "runtime.db"))).toBe(true);
       expect(existsSync(join(data, "cloud-owner.json"))).toBe(false);
+      expect(existsSync(join(data, "data-format.json"))).toBe(false);
       expect(readJson(join(data, "config.json"))).toEqual({ language: "ja" });
       expect(readJson(join(data, "webhooks.json")).webhooks[0]).not.toHaveProperty("secretHash");
       expect(readFileSync(join(data, "webhooks.json"), "utf8")).not.toContain("sealed-");
@@ -185,6 +214,7 @@ describe("encrypted full workspace backups", () => {
       expect(readJson(join(target, "cloud-owner.json"))).toEqual({ identity: "target-owner-record" });
       expect(readJson(join(target, "team-computers.json"))).toEqual(targetComputers);
       expect(readFileSync(join(target, "environment-id"), "utf8")).toBe("target-environment");
+      expect(readJson(join(target, "data-format.json"))).toMatchObject({ format: 1, writtenBy: "0.1.151" });
       expect(readFileSync(join(target, "openmausbot-server.lease"), "utf8")).toBe("live-lease");
       expect(existsSync(join(target, "messages.db-wal"))).toBe(false);
       expect(readFileSync(join(result.safetyCopyPath!, "data", "messages.db-wal"), "utf8")).toBe("old database WAL must not enter the new DB");
@@ -210,10 +240,13 @@ describe("encrypted full workspace backups", () => {
         expect(followup).not.toHaveProperty("prompt");
       } finally { restoredDb.close(); }
       expect(readJson(join(target, "routines.json"))).toMatchObject({ routines: [{ enabled: false }], runs: [{ status: "failed" }, { status: "completed" }] });
+      // A restore counts as a change to each routine, so nothing later reads an old stamp as the moment something else switched it off.
+      expect(Date.now() - readJson(join(target, "routines.json")).routines[0].updatedAt).toBeLessThan(5 * 60_000);
       expect(readJson(join(target, "webhooks.json"))).toMatchObject({ webhooks: [{ enabled: false }], deliveries: [{ id: "delivery" }] });
       expect(readJson(join(target, "webhooks.json")).webhooks[0].secretHash).toMatch(/^[a-f0-9]{64}$/);
       expect(readJson(join(target, "webhooks.json")).webhooks[0].secretHash).not.toBe("a".repeat(64));
       expect(readJson(join(target, "calendar-calls.json")).calls[0].nextRunAt).toBeNull();
+      expect(readJson(join(target, "app-triggers.json")).triggers).toEqual([{ id: "trigger", botId: "bot", enabled: false }]);
       expect(readJson(join(target, "delegations.json"))).toEqual({});
       expect(existsSync(join(target, "runtime.db-wal"))).toBe(false);
       const restoredRuntime = new DatabaseSync(join(target, "runtime.db"), { readOnly: true });
@@ -343,7 +376,7 @@ describe("encrypted full workspace backups", () => {
       "vm-home/.browser-profiles/chrome/Cookies", "vm-homes/abc/.browser-profiles/chromium/Cookies",
       "tmp/omb-mcp-123/mcp.json", ".tmp/secret",
       "logins.json.enc", "logins-key", "logins.json.enc.123.05a7b3e0-1234.tmp",
-      "highlevel.json.enc", "highlevel-key", "connected-apps-installation.json", "webhook-key",
+      "connected-apps-installation.json", "webhook-key",
     ];
     for (const root of [source, target]) {
       for (const path of authPaths) {
@@ -393,6 +426,27 @@ describe("encrypted full workspace backups", () => {
     for (const path of paths) {
       if (statSync(join(staging, "data", path)).isFile()) expect(readFileSync(join(staging, "data", path), "utf8")).not.toContain("SOURCE_TURN_BEARER");
     }
+  });
+
+  it("leaves the bot box's live sockets and filter out, so a Cloud home with the box on can still be backed up and brought home", async () => {
+    // Seen in the real app on Oct 22: a Cloud that ended could not bring its chats home, because its export stopped at
+    // "Cannot back up special or live runtime file: box/broker.sock" (the T0 credential broker's socket).
+    const source = directory();
+    mkdirSync(join(source, "box"), { mode: 0o700 });
+    writeFileSync(join(source, "box", "seccomp.bpf"), Buffer.from([0x20, 0, 0, 0]), { mode: 0o600 });
+    // The live socket is the Linux box's (a Cloud home): Windows refuses a unix socket at a file path, so there the
+    // folder holds only the filter, and must still be left out.
+    const broker = process.platform === "win32" ? null : createNetServer();
+    if (broker) await new Promise<void>((resolve) => broker.listen(join(source, "box", "broker.sock"), resolve));
+    try {
+      mkdirSync(join(source, "attachments"));
+      writeFileSync(join(source, "attachments", "note.txt"), "ordinary user file");
+      const exported = await createWorkspaceBackup(source, { password: PASSWORD });
+      const staged = await stageWorkspaceBackup(source, exported.path, { password: PASSWORD });
+      const paths: string[] = readJson(join(source, ".backups", staged.id, "staged", "manifest.json")).entries.map((entry: { path: string }) => entry.path);
+      expect(paths).toContain("attachments/note.txt");
+      expect(paths.filter((path) => path === "box" || path.startsWith("box/"))).toEqual([]);
+    } finally { if (broker) await new Promise<void>((resolve) => broker.close(() => resolve())); }
   });
 
   it("leaves the Organization library's downloaded catalog and release files out, and keeps what the runtime added", async () => {
@@ -616,6 +670,36 @@ describe("encrypted full workspace backups", () => {
     expect(exported.summary.warnings.some((warning) => warning.includes("1 managed skill"))).toBe(true);
   });
 
+  it("saves links inside one workspace as copies of what they point to, and refuses loops and links to other workspaces", async () => {
+    const root = directory();
+    const project = join(root, "workspaces", "ws", "project");
+    mkdirSync(join(project, ".agents", "skills", "review"), { recursive: true });
+    mkdirSync(join(project, ".claude"), { recursive: true });
+    writeFileSync(join(project, ".agents", "skills", "review", "SKILL.md"), "# Review");
+    writeFileSync(join(project, "AGENTS.md"), "Be brief.");
+    symlinkSync(join("..", ".agents", "skills"), join(project, ".claude", "skills"), process.platform === "win32" ? "junction" : "dir");
+    symlinkSync("AGENTS.md", join(project, "CLAUDE.md"));
+    const exported = await createWorkspaceBackup(root, { password: PASSWORD });
+    expect(exported.summary.warnings.some((warning) => warning.startsWith("2 symbolic link(s) inside a workspace were saved as copies"))).toBe(true);
+    const target = directory();
+    const staged = await stageWorkspaceBackup(target, exported.path, { password: PASSWORD });
+    const data = join(target, ".backups", staged.id, "staged", "data", "workspaces", "ws", "project");
+    expect(readFileSync(join(data, ".claude", "skills", "review", "SKILL.md"), "utf8")).toBe("# Review");
+    expect(readFileSync(join(data, "CLAUDE.md"), "utf8")).toBe("Be brief.");
+
+    symlinkSync(".", join(project, "loop"), process.platform === "win32" ? "junction" : "dir");
+    await expect(createWorkspaceBackup(root, { password: PASSWORD })).rejects.toMatchObject({
+      message: "Cannot back up a symbolic link to the folder that contains it: workspaces/ws/project/loop",
+      errorKey: "serverError.backup.recursiveLink",
+      errorParams: { path: "workspaces/ws/project/loop" },
+    });
+    rmSync(join(project, "loop"));
+    mkdirSync(join(root, "workspaces", "other"), { recursive: true });
+    writeFileSync(join(root, "workspaces", "other", "notes.md"), "theirs");
+    symlinkSync(join(root, "workspaces", "other", "notes.md"), join(project, "borrowed.md"));
+    await expect(createWorkspaceBackup(root, { password: PASSWORD })).rejects.toThrow(/user-created symbolic link/);
+  });
+
   it("leaves out node_modules and links in conversation work folders, and says so", async () => {
     const root = directory();
     const outside = directory();
@@ -700,7 +784,87 @@ describe("encrypted full workspace backups", () => {
     expect(readFileSync(join(data, "imported-skills", "pdf", "scripts", "run.sh"), "utf8")).toBe("echo run\n");
   });
 
-  it("recovers an interrupted top-level swap before any application state is loaded", async () => {
+  it.each([
+    "safety directory", "data directory", "partial manifest", "manifest",
+    "partial previous receipt", "previous receipt", "partial journal", "journal",
+  ])("cancels an interrupted restore preparation after %s without changing original data", async (step) => {
+    const source = directory();
+    writeFileSync(join(source, "note.txt"), "new workspace");
+    const exported = await createWorkspaceBackup(source, { password: PASSWORD });
+    const target = directory();
+    const original = join(target, "note.txt");
+    writeFileSync(original, "original workspace");
+    const before = statSync(original);
+    const staged = await stageWorkspaceBackup(target, exported.path, { password: PASSWORD });
+    commitPendingWorkspaceRestore(target, staged.id);
+    const root = join(target, ".backups");
+    const safety = join(root, `safety-${staged.id}`);
+    const receipt = { restored: true, id: "00000000-0000-4000-8000-000000000000", clientState: {} };
+    json(join(root, "last-restore.json"), receipt);
+    const journal = { id: staged.id, phase: "applying", existing: ["note.txt"], incoming: ["note.txt"] };
+    const steps = ["safety directory", "data directory", "partial manifest", "manifest", "partial previous receipt", "previous receipt", "partial journal", "journal"];
+    const reached = (name: string) => steps.indexOf(step) >= steps.indexOf(name);
+    mkdirSync(safety);
+    if (reached("data directory")) mkdirSync(join(safety, "data"));
+    if (step === "partial manifest") writeFileSync(join(safety, "manifest.json.123.crash.tmp"), '{"id":');
+    if (reached("manifest")) json(join(safety, "manifest.json"), { id: staged.id, originalEntries: ["note.txt"] });
+    if (step === "partial previous receipt") writeFileSync(join(safety, "previous-restore.json.123.crash.tmp"), '{"restored":');
+    if (reached("previous receipt")) json(join(safety, "previous-restore.json"), receipt);
+    if (step === "partial journal") writeFileSync(join(root, "restore-journal.json.123.crash.tmp"), '{"id":');
+    if (step === "journal") json(join(root, "restore-journal.json"), journal);
+
+    expect(applyPendingWorkspaceRestore(target)).toMatchObject({ restored: false, rolledBack: true, id: staged.id });
+    expect(readFileSync(original, "utf8")).toBe("original workspace");
+    expect(statSync(original).ino).toBe(before.ino);
+    expect(statSync(original).mtimeMs).toBe(before.mtimeMs);
+    expect(readFileSync(join(root, staged.id, "apply", "data", "note.txt"), "utf8")).toBe("new workspace");
+    expect(readJson(join(root, "last-restore.json"))).toEqual(receipt);
+    expect(readPendingWorkspaceRestoreMetadata(target)).toBeNull();
+    expect(applyPendingWorkspaceRestore(target)).toEqual({ restored: false });
+  });
+
+  it("preserves moved originals and prepared files when the recovery journal is missing", async () => {
+    const source = directory();
+    writeFileSync(join(source, "note.txt"), "new workspace");
+    const exported = await createWorkspaceBackup(source, { password: PASSWORD });
+    const target = directory();
+    writeFileSync(join(target, "note.txt"), "original workspace");
+    const staged = await stageWorkspaceBackup(target, exported.path, { password: PASSWORD });
+    commitPendingWorkspaceRestore(target, staged.id);
+    const root = join(target, ".backups");
+    const saved = join(root, `safety-${staged.id}`, "data");
+    mkdirSync(saved, { recursive: true });
+    renameSync(join(target, "note.txt"), join(saved, "note.txt"));
+    const prepared = join(root, staged.id, "apply", "data", "note.txt");
+    writeFileSync(prepared, "prepared recovery copy");
+    for (let attempt = 0; attempt < 2; attempt++) {
+      expect(() => applyPendingWorkspaceRestore(target)).toThrow(/safety copy already exists/i);
+      expect(readFileSync(join(saved, "note.txt"), "utf8")).toBe("original workspace");
+      expect(readFileSync(prepared, "utf8")).toBe("prepared recovery copy");
+      expect(existsSync(join(target, "note.txt"))).toBe(false);
+      expect(readPendingWorkspaceRestoreMetadata(target)?.id).toBe(staged.id);
+    }
+  });
+
+  it.each(["safety", "data"])("refuses an unjournaled restore with a linked %s directory", async (linked) => {
+    const source = directory();
+    writeFileSync(join(source, "note.txt"), "new workspace");
+    const exported = await createWorkspaceBackup(source, { password: PASSWORD });
+    const target = directory();
+    writeFileSync(join(target, "note.txt"), "original workspace");
+    const staged = await stageWorkspaceBackup(target, exported.path, { password: PASSWORD });
+    commitPendingWorkspaceRestore(target, staged.id);
+    const safety = join(target, ".backups", `safety-${staged.id}`);
+    const outside = directory();
+    if (linked === "data") mkdirSync(safety);
+    symlinkSync(outside, linked === "safety" ? safety : join(safety, "data"), process.platform === "win32" ? "junction" : "dir");
+    expect(() => applyPendingWorkspaceRestore(target)).toThrow(/safety copy already exists/i);
+    expect(readFileSync(join(target, "note.txt"), "utf8")).toBe("original workspace");
+    expect(readPendingWorkspaceRestoreMetadata(target)?.id).toBe(staged.id);
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
+  it.each([false, true])("recovers an interrupted top-level swap with incoming moved=%s before any application state is loaded", async (incomingMoved) => {
     const source = directory();
     json(join(source, "bots.json"), []);
     const exported = await createWorkspaceBackup(source, { password: PASSWORD });
@@ -715,7 +879,7 @@ describe("encrypted full workspace backups", () => {
     mkdirSync(saved, { recursive: true });
     json(join(root, "restore-journal.json"), { id: staged.id, phase: "applying", existing: ["bots.json"], incoming: ["bots.json"] });
     renameSync(join(target, "bots.json"), join(saved, "bots.json"));
-    renameSync(join(apply, "bots.json"), join(target, "bots.json"));
+    if (incomingMoved) renameSync(join(apply, "bots.json"), join(target, "bots.json"));
     expect(applyPendingWorkspaceRestore(target)).toMatchObject({ restored: false, rolledBack: true, id: staged.id });
     expect(readJson(join(target, "bots.json"))).toEqual([{ id: "original" }]);
     expect(applyPendingWorkspaceRestore(target)).toEqual({ restored: false });

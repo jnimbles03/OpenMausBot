@@ -68,7 +68,7 @@ function resolve(role: string, name: unknown, columns: DataColumn[]): Resolved {
       candidates,
     });
   }
-  return { column, cls: columnClass(column.type), id: quoteIdentifier(column.name) };
+  return { column, cls: columnClass(column.type), id: `src.${quoteIdentifier(column.name)}` };
 }
 
 type Encoding = Record<string, unknown>;
@@ -76,6 +76,12 @@ type Reduction = CompiledChart["reduction"];
 type VegaType = "quantitative" | "temporal" | "nominal";
 
 const vegaType = (c: Resolved): VegaType => (c.cls === "numeric" ? "quantitative" : c.cls === "temporal" ? "temporal" : "nominal");
+
+/** Dates as people write them ("Sep 8", "Oct", "2026"), never Vega's default weekday labels ("Tue 15"). */
+const TIME_AXIS = {
+  formatType: "time",
+  format: { year: "%Y", quarter: "%b", month: "%b", week: "%b %-d", date: "%b %-d", hours: "%-I %p", minutes: "%-I:%M %p", seconds: "%-I:%M:%S", milliseconds: "%-I:%M:%S.%L" },
+};
 
 interface Cte {
   name: string;
@@ -102,17 +108,24 @@ function categorical(x: Resolved, channel: string, spec: OmbChartSpec): Dimensio
   };
 }
 
+const INTEGER_TYPE = /^U?(TINYINT|SMALLINT|INTEGER|INT\d*|BIGINT|HUGEINT)$/;
+
+/** Whole numbers bin by whole steps, so a column like week 36…44 draws one bar per value, not 30 slivers. */
 function binned(x: Resolved, channel: string, bins: number, bars: boolean): Dimension {
   const v = `CAST(${x.id} AS DOUBLE)`;
+  const whole = INTEGER_TYPE.test(x.column.type.trim().toUpperCase());
+  const width = whole
+    ? `greatest(1, ceil((max(${v}) - min(${v}) + 1) / ${bins}))`
+    : `CASE WHEN max(${v}) = min(${v}) THEN 1 ELSE (max(${v}) - min(${v})) / ${bins} END`;
   const cte: Cte = {
     name: `bins_${channel}`,
     body: `
   SELECT min(${v}) AS lo,
-         CASE WHEN max(${v}) = min(${v}) THEN 1 ELSE (max(${v}) - min(${v})) / ${bins} END AS width
+         ${width} AS width
   FROM src
 `,
   };
-  const bin = `least(floor((${v} - ${cte.name}.lo) / ${cte.name}.width), ${bins - 1})`;
+  const bin = `CASE WHEN ${x.id} IS NULL THEN NULL ELSE least(floor((${v} - ${cte.name}.lo) / ${cte.name}.width), ${bins - 1}) END`;
   const start = `${cte.name}.lo + ${bin} * ${cte.name}.width`;
   const end = `${channel}2`;
   return bars
@@ -120,7 +133,7 @@ function binned(x: Resolved, channel: string, bins: number, bars: boolean): Dime
         expr: start,
         end: { channel: end, expr: `${cte.name}.lo + (${bin} + 1) * ${cte.name}.width` },
         cte,
-        encoding: { field: channel, type: "quantitative", title: x.column.name, bin: "binned" },
+        encoding: { field: channel, type: "quantitative", title: x.column.name, bin: "binned", ...(whole ? { axis: { format: "d" } } : {}) },
         endEncoding: { field: end },
         tooltip: [
           { field: channel, type: "quantitative", title: `${x.column.name} from`, format: ".4~g" },
@@ -146,23 +159,30 @@ function timeBucketed(x: Resolved, channel: string, spec: OmbChartSpec, bars: bo
   } else {
     cte = { name: `span_${channel}`, body: "" };
     unit = `${cte.name}.unit`;
-    const seconds = `epoch(max(CAST(${x.id} AS TIMESTAMP)) - min(CAST(${x.id} AS TIMESTAMP)))`;
-    const steps: Array<[string, number]> = [
-      ["INTERVAL 1 HOUR", 3600],
-      ["INTERVAL 1 DAY", 86400],
-      ["INTERVAL 1 WEEK", 604800],
-      ["INTERVAL 1 MONTH", 2629800],
-      ["INTERVAL 3 MONTH", 7889400],
+    // The smallest unit that keeps under the target count and is at least the data's own step: weekly rows get week
+    // buckets, never seven one-day slivers. `next` is the shortest length of the following unit.
+    const steps: Array<{ interval: string; seconds: number; next: number }> = [
+      { interval: "INTERVAL 1 HOUR", seconds: 3600, next: 86400 },
+      { interval: "INTERVAL 1 DAY", seconds: 86400, next: 7 * 86400 },
+      { interval: "INTERVAL 1 WEEK", seconds: 604800, next: 28 * 86400 },
+      { interval: "INTERVAL 1 MONTH", seconds: 2629800, next: 89 * 86400 },
+      { interval: "INTERVAL 3 MONTH", seconds: 7889400, next: 365 * 86400 },
     ];
     const whens = steps
-      .filter(([interval]) => !(isDate && interval === "INTERVAL 1 HOUR"))
-      .map(([interval, s]) => `    WHEN ${seconds} <= ${TIME_BUCKETS_TARGET * s} THEN ${interval}`)
+      .filter(({ interval }) => !(isDate && interval === "INTERVAL 1 HOUR"))
+      .map(({ interval, seconds, next }) => `    WHEN span <= ${TIME_BUCKETS_TARGET * seconds} AND step < ${next} THEN ${interval}`)
       .join("\n");
     cte.body = `
   SELECT CASE
 ${whens}
     ELSE INTERVAL 1 YEAR END AS unit
-  FROM src
+  FROM (
+    SELECT epoch(max(v) - min(v)) AS span, coalesce(min(gap), 0) AS step
+    FROM (
+      SELECT v, epoch(v - lag(v) OVER (ORDER BY v)) AS gap
+      FROM (SELECT DISTINCT CAST(${x.id} AS TIMESTAMP) AS v FROM src WHERE ${x.id} IS NOT NULL)
+    )
+  )
 `;
   }
   const bucket = `time_bucket(${unit}, ${x.id})`;
@@ -172,7 +192,7 @@ ${whens}
     expr: bucket,
     ...(bars ? { end: { channel: end, expr: `${bucket} + ${unit}` }, endEncoding: { field: end } } : {}),
     cte,
-    encoding: { field: channel, type: "temporal", title: x.column.name },
+    encoding: { field: channel, type: "temporal", title: x.column.name, axis: TIME_AXIS },
     tooltip: [{ field: channel, type: "temporal", title: x.column.name }],
     reduction: { method: "timeBucket", note: `${x.column.name} bucketed ${unitNote}` },
   };
@@ -222,12 +242,14 @@ interface Plan {
 }
 
 function vegaLiteSpec(mark: string, encoding: Encoding, tooltip: Encoding[]): Record<string, unknown> {
+  // Vega-Lite reads a bar with x and x2 but no binned x as a horizontal range at each y, which draws a stack as ticks.
+  const ranged = mark === "bar" && encoding.x2 !== undefined;
   return {
     $schema: "https://vega.github.io/schema/vega-lite/v6.json",
     width: "container",
     height: 280,
     data: { name: "table" },
-    mark: { type: mark },
+    mark: ranged ? { type: mark, orient: "vertical" } : { type: mark },
     encoding: { ...encoding, tooltip },
   };
 }
@@ -249,6 +271,41 @@ function checkSpec(spec: OmbChartSpec): void {
   if (spec.stack !== undefined && typeof spec.stack !== "boolean") fail("chart.stack must be true or false");
 }
 
+function topNCtes(xExpr: string, measureExpr: string, n: number): Cte[] {
+  return [
+    {
+      name: "kept",
+      body: `
+  SELECT ${xExpr} AS x
+  FROM src
+  GROUP BY ALL
+  ORDER BY ${measureExpr} DESC NULLS LAST, x
+  LIMIT ${n}
+`,
+    },
+    {
+      name: "other_bucket",
+      // At most n labels are retained, so n + 1 candidates guarantee a free name.
+      // Keep the usual "other" label unless it would merge into a real category.
+      body: `
+  SELECT label
+  FROM (
+    SELECT i, CASE WHEN i = 0 THEN 'other' ELSE 'other (' || CAST(i + 1 AS VARCHAR) || ')' END AS label
+    FROM range(${n + 1}) candidates(i)
+  ) labels
+  WHERE NOT EXISTS (SELECT 1 FROM kept WHERE x = label)
+  ORDER BY i
+  LIMIT 1
+`,
+    },
+  ];
+}
+
+function foldToOther(xExpr: string): string {
+  // NULL retains the existing behavior of joining the folded tail.
+  return `CASE WHEN ${xExpr} IN (SELECT x FROM kept) THEN ${xExpr} ELSE (SELECT label FROM other_bucket) END`;
+}
+
 function planCartesian(spec: OmbChartSpec, x: Resolved, y: Resolved | undefined, color: Resolved | undefined): Plan {
   const bars = spec.type === "bar" || spec.type === "histogram";
   const mark = bars ? "bar" : spec.type;
@@ -263,20 +320,10 @@ function planCartesian(spec: OmbChartSpec, x: Resolved, y: Resolved | undefined,
   let xExpr = dim.expr;
   let reduction = dim.reduction;
   if (x.cls === "categorical" || x.cls === "boolean") {
-    // `IN (subquery)` is NULL for a NULL category, so NULL lands in "other" with the tail.
     const n = spec.limit ?? TOP_N_DEFAULT;
-    ctes.push({
-      name: "kept",
-      body: `
-  SELECT ${xExpr} AS x
-  FROM src
-  GROUP BY ALL
-  ORDER BY ${m.expr} DESC NULLS LAST, x
-  LIMIT ${n}
-`,
-    });
-    xExpr = `CASE WHEN ${xExpr} IN (SELECT x FROM kept) THEN ${xExpr} ELSE 'other' END`;
-    reduction = { method: "topN", note: `top ${n} of ${x.column.name} by ${m.title}, the rest as "other"` };
+    ctes.push(...topNCtes(xExpr, m.expr, n));
+    xExpr = foldToOther(xExpr);
+    reduction = { method: "topN", note: `top ${n} of ${x.column.name} by ${m.title}, the rest grouped separately` };
   }
 
   const selects = [`${xExpr} AS x`];
@@ -336,7 +383,7 @@ function planM4(x: Resolved, y: Resolved, color: Resolved | undefined, mark: str
   const body = `SELECT x, y${color ? ", color" : ""}\nFROM px\nQUALIFY ${windows}\nORDER BY ${color ? "color, x" : "x"}`;
 
   const encoding: Encoding = {
-    x: { field: "x", type: "temporal", title: x.column.name },
+    x: { field: "x", type: "temporal", title: x.column.name, axis: TIME_AXIS },
     y: { field: "y", type: "quantitative", title: y.column.name, ...(mark === "area" ? { stack: null } : {}) },
   };
   const tooltip: Encoding[] = [
@@ -359,31 +406,21 @@ function planPie(spec: OmbChartSpec, x: Resolved, y: Resolved | undefined): Plan
   const m = measure(spec, y);
   const n = spec.limit ?? TOP_N_DEFAULT;
   const xExpr = `CAST(${x.id} AS VARCHAR)`;
-  const ctes: Cte[] = [
-    {
-      name: "kept",
-      body: `
-  SELECT ${xExpr} AS x
-  FROM src
-  GROUP BY ALL
-  ORDER BY ${m.expr} DESC NULLS LAST, x
-  LIMIT ${n}
-`,
-    },
-  ];
-  const folded = `CASE WHEN ${xExpr} IN (SELECT x FROM kept) THEN ${xExpr} ELSE 'other' END`;
+  const ctes = topNCtes(xExpr, m.expr, n);
+  const folded = foldToOther(xExpr);
   const orderBy = spec.sort === "y" ? "y" : spec.sort === "-x" ? "x DESC" : spec.sort === "x" ? "x" : "y DESC";
+  const categoryOrder = spec.sort === "x" || spec.sort === "-x";
   const body = `SELECT ${folded} AS x,\n       ${m.expr} AS y\nFROM src\nGROUP BY ALL\nORDER BY ${orderBy}`;
   const encoding: Encoding = {
     theta: { field: "y", type: "quantitative", title: m.title },
     color: { field: "x", type: "nominal", title: x.column.name },
-    order: { field: "y", type: "quantitative", sort: spec.sort === "y" ? "ascending" : "descending" },
+    order: { field: categoryOrder ? "x" : "y", type: categoryOrder ? "nominal" : "quantitative", sort: spec.sort === "x" || spec.sort === "y" ? "ascending" : "descending" },
   };
   const tooltip: Encoding[] = [
     { field: "x", type: "nominal", title: x.column.name },
     { field: "y", type: "quantitative", title: m.title, format: money },
   ];
-  return { ctes, body, vegaLite: vegaLiteSpec("arc", encoding, tooltip), reduction: { method: "topN", note: `top ${n} of ${x.column.name} by ${m.title}, the rest as "other"` } };
+  return { ctes, body, vegaLite: vegaLiteSpec("arc", encoding, tooltip), reduction: { method: "topN", note: `top ${n} of ${x.column.name} by ${m.title}, the rest grouped separately` } };
 }
 
 function planScatter(x: Resolved, y: Resolved | undefined, color: Resolved | undefined, size: Resolved | undefined): Plan {
@@ -392,7 +429,9 @@ function planScatter(x: Resolved, y: Resolved | undefined, color: Resolved | und
   const selects = [`${x.id} AS x`, `${y.id} AS y`];
   if (color) selects.push(`${color.id} AS color`);
   if (size) selects.push(`${size.id} AS size`);
-  const body = `SELECT ${selects.join(",\n       ")}\nFROM src USING SAMPLE reservoir(${DATA_LIMITS.chartMaxMarks} ROWS) REPEATABLE (${SAMPLE_SEED})`;
+  const required = [x, y].filter((axis) => axis.cls === "numeric" || axis.cls === "temporal");
+  const source = required.length ? `(SELECT * FROM src WHERE ${required.map((axis) => `${axis.id} IS NOT NULL`).join(" AND ")}) AS src` : "src";
+  const body = `SELECT ${selects.join(",\n       ")}\nFROM ${source} USING SAMPLE reservoir(${DATA_LIMITS.chartMaxMarks} ROWS) REPEATABLE (${SAMPLE_SEED})`;
   const encoding: Encoding = {
     x: { field: "x", type: vegaType(x), title: x.column.name },
     y: { field: "y", type: vegaType(y), title: y.column.name },

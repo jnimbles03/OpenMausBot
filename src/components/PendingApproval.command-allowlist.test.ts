@@ -62,7 +62,7 @@ describe("remembering exact command approvals", () => {
     const result = view();
     expect(result.html).toContain("Always allow this command");
     expect(result.html).toContain("/work/project");
-    expect(result.html).not.toContain("Always allow this session");
+    expect(result.html).not.toContain("Allow for this session");
     result.buttons.find((button) => button.props["aria-label"] === "Always allow this command")!.props.onClick!();
     expect(fixture.dispatch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       type: "decideRequest", threadId: "thread-1", requestId: "request-1", behavior: "allow", rememberCommand: true,
@@ -84,15 +84,32 @@ describe("remembering exact command approvals", () => {
     fixture.admin = admin;
     const result = view();
     expect(result.html).not.toContain("Always allow this command");
-    expect(result.html).toContain("Always allow this session");
+    expect(result.html).toContain("Allow for this session");
     expect(result.html).toContain("Allow once");
   });
 
   it("preserves session approval for requests without an exact command", () => {
-    view({ commandAllowlist: undefined }).buttons.find((button) => button.props["aria-label"] === "Always allow this session")!.props.onClick!();
+    view({ commandAllowlist: undefined }).buttons.find((button) => button.props["aria-label"] === "Allow for this session")!.props.onClick!();
     expect(fixture.dispatch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
       behavior: "allow", always: true, rememberCommand: undefined,
     }));
+  });
+
+  it("says Always allow only when the grant is saved, and names the session when it lasts no longer than that", () => {
+    const quiet = (extra: Parameters<typeof view>[0]) => view(extra).buttons.find((button) => button.props.onClick && !["Allow once", "Deny", "Cancel turn"].includes(String(button.props.children)))!;
+    const saved = quiet({ commandAllowlist: undefined, allowKey: "provider-tool:claude:linear:list_issues:0123456789abcdef" });
+    expect(saved.props.children).toBe("Always allow");
+    const command = quiet({});
+    expect(command.props.children).toBe("Always allow");
+    expect(command.props["aria-label"]).toBe("Always allow this command");
+    const session = view({ commandAllowlist: undefined });
+    const button = quiet({ commandAllowlist: undefined });
+    expect(button.props.children).toBe("Allow for this session");
+    expect(button.props["aria-label"]).toBe("Allow for this session");
+    expect(session.html).not.toContain("Always allow");
+    expect(session.html).toContain("until the session ends");
+    button.props.onClick!();
+    expect(fixture.dispatch).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ behavior: "allow", always: true, alwaysAllow: undefined, rememberCommand: undefined }));
   });
 
   it("keeps peer grants separate from provider command rules", () => {
@@ -136,26 +153,31 @@ describe("remembering exact command approvals", () => {
     }
   });
 
-  it("keeps the answers flat, with a ring only for keyboard focus", () => {
+  it("keeps the answers flat and finger-sized: a quiet extra, a neutral Deny and the one primary, a ring only for keyboard focus", () => {
     const tree = PendingApprovalActions({ pending: pendingApprovals([message()])[0]!, bot, threadId: "thread-1", onCancelTurn: vi.fn(), part: "primary" });
     const classes = nodes(tree).filter((node) => node.type === "button").map((node) => String((node.props as { className?: string }).className));
     expect(classes).toHaveLength(3);
     for (const name of classes) {
       expect(name).not.toMatch(/(^|\s)(border|shadow|ring-\d)/);
       expect(name).toContain("focus-visible:ring-2");
-      expect(name).toContain("h-7");
-      expect(name).toContain("text-[13px] font-medium");
-      expect(name).toMatch(/(^|\s)bg-/);
+      expect(name).toContain("min-h-9");
+      expect(name).toContain("pointer-coarse:min-h-11");
+      expect(name).toContain("text-[14px] font-medium");
     }
-    expect(classes[0]).toContain("text-danger");
+    const [always, deny, allow] = classes;
+    expect(always).toContain("text-ink-secondary");
+    expect(always).not.toMatch(/(^|\s)bg-/);
+    expect(deny).toContain("bg-ink/[0.07]");
+    expect(deny).not.toContain("danger");
+    expect(allow).toContain("ui-button-primary");
   });
 
-  it("lines the row up on the text baseline with the command in a 28px mono pill", () => {
+  it("shows the command whole, in a quiet mono block above the answers", () => {
     const pending = pendingApprovals([message()])[0]!;
     const html = renderToStaticMarkup(createElement(PendingApprovalPanel, { pending, count: 1, index: 0, botName: "Scout" }));
     const row = html.slice(0, html.indexOf('id="approval-details-'));
-    expect(row).toContain("flex flex-wrap items-baseline gap-x-2");
-    expect(row).toMatch(/<code class="[^"]*font-mono text-\[12\.5px\] leading-5[^"]*pb-\[3px\] pt-\[5px\][^"]*"[^>]*><span class="truncate">git status --short<\/span><\/code>/);
-    expect(row).toMatch(/<svg[^>]*class="[^"]*self-center[^"]*"/);
+    expect(row).toContain("Scout wants to run a command");
+    expect(row).toMatch(/<div dir="auto"[^>]*class="[^"]*font-mono[^"]*"[^>]*>git status --short<\/div>/);
+    expect(row).not.toContain("<pre");
   });
 });

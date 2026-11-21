@@ -18,7 +18,7 @@ const POLL_MS = 100;
 export const MAX_TYPED_KEYS = 500;
 const DRAG_LEAD_PX = 12;
 
-/** A ref from a snapshot, a selector, or a point in the 1280x720 viewport (CSS pixels). */
+/** A ref from a snapshot, a selector, or a point in the viewport as it is laid out now (CSS pixels). */
 export type Target = { ref: string } | { selector: string } | Point;
 
 export interface ActionContext {
@@ -116,7 +116,7 @@ async function receivesClick(context: ActionContext, handle: NodeHandle, local: 
         functionDeclaration: RECEIVES,
         arguments: [hitId ? { objectId: hitId } : { value: null }, { value: wantEnabled }],
         returnByValue: true,
-      });
+      }, { readOnly: true });
       if (exceptionDetails || !result.value) return { disabled: false, covering: null };
       // A hit in a frame this element hosts lands inside it.
       if (!sameFrame && hit.backendNodeId !== handle.backendNodeId) {
@@ -183,9 +183,19 @@ async function untilDialog(context: ActionContext, action: Promise<void>): Promi
 /** Shown to people watching before the agent's pointer acts there; the action waits for it. */
 export type PointerReporter = (point: Point, phase: "move" | "click") => Promise<void>;
 
+/** A point the bot passed, refused outside the viewport as it is now: a person's panel can resize it between two calls. */
+async function inViewport(context: ActionContext, point: Point): Promise<Point> {
+  const size = await valueInWorld<[number, number]>(context.frames, context.frames.mainFrameId, "[innerWidth, innerHeight]").catch(() => null);
+  if (size && (point.x >= size[0] || point.y >= size[1])) {
+    throw new DriverError("refused", `${Math.round(point.x)},${Math.round(point.y)} is outside the page's viewport, which is ${size[0]}x${size[1]} CSS pixels now. Take a new screenshot and aim inside it.`);
+  }
+  return point;
+}
+
 /** Where to act: found, shown to people watching, then found again, since the page may have moved meanwhile. */
 async function pointAfterShowing(context: ActionContext, at: Point | (NodeHandle & { ref?: string }), deadline: number, phase: "move" | "click", pointer: PointerReporter | undefined, options: { wantEnabled?: boolean } = {}): Promise<Point> {
   if ("x" in at) {
+    await inViewport(context, at);
     await pointer?.(at, phase);
     return at;
   }
@@ -250,14 +260,14 @@ const notEditable = () => new DriverError("not-editable", "The target is not an 
 async function focusEditable(context: ActionContext, handle: NodeHandle & { ref?: string }): Promise<"text" | "value" | "contenteditable"> {
   let editable: { kind: "text" | "value" | "contenteditable" } | null;
   try {
-    editable = await callOnNode<{ kind: "text" | "value" | "contenteditable" } | null>(context.frames, handle, EDITABLE);
+    editable = await callOnNode<{ kind: "text" | "value" | "contenteditable" } | null>(context.frames, handle, EDITABLE, [], { readOnly: true });
   } catch (error) {
     if (isGone(error) || (error instanceof DriverError && error.code === "not-found")) throw gone(handle);
     throw error;
   }
   if (!editable) throw notEditable();
   await handle.session.send("DOM.focus", { backendNodeId: handle.backendNodeId });
-  if (!(await callOnNode<boolean>(context.frames, handle, FOCUSED))) throw notEditable();
+  if (!(await callOnNode<boolean>(context.frames, handle, FOCUSED, [], { readOnly: true }))) throw notEditable();
   return editable.kind;
 }
 
@@ -326,7 +336,7 @@ export async function select(context: ActionContext, target: Exclude<Target, Poi
   await context.bringToFront();
   refuseErrorPage(context);
   const handle = await element(context, target);
-  const info = await callOnNode<SelectInfo | null>(context.frames, handle, SELECT_INFO).catch((error: unknown) => {
+  const info = await callOnNode<SelectInfo | null>(context.frames, handle, SELECT_INFO, [], { readOnly: true }).catch((error: unknown) => {
     if (isGone(error) || (error instanceof DriverError && error.code === "not-found")) throw gone(handle);
     throw error;
   });
@@ -347,7 +357,7 @@ export async function select(context: ActionContext, target: Exclude<Target, Poi
     if (typeable) {
       await handle.session.send("DOM.focus", { backendNodeId: handle.backendNodeId });
       await context.keyboard.type(option.label);
-      const after = await callOnNode<SelectInfo | null>(context.frames, handle, SELECT_INFO);
+      const after = await callOnNode<SelectInfo | null>(context.frames, handle, SELECT_INFO, [], { readOnly: true });
       if (after?.value === option.value) return { selected: [option.value] };
     }
   }
@@ -370,13 +380,13 @@ type CheckState = { kind: "checkbox" | "radio"; checked: boolean | "mixed" } | n
 /** Clicks only when the state differs, then confirms the page took it. */
 export async function check(context: ActionContext, target: Exclude<Target, Point>, checked = true, options: { timeoutMs?: number } = {}): Promise<{ checked: boolean; changed: boolean }> {
   const handle = await element(context, target);
-  const state = await callOnNode<CheckState>(context.frames, handle, CHECK_STATE);
+  const state = await callOnNode<CheckState>(context.frames, handle, CHECK_STATE, [], { readOnly: true });
   if (!state) throw new DriverError("not-editable", "This element is not a checkbox, radio button or switch.");
   if (state.checked === checked) return { checked, changed: false };
   if (!checked && state.kind === "radio") throw new DriverError("refused", "A radio button cannot be unchecked; choose another option instead.");
   const ref = handle.ref ?? context.refs.refFor(handle);
   await click(context, { ref }, options);
-  const after = await callOnNode<CheckState>(context.frames, handle, CHECK_STATE);
+  const after = await callOnNode<CheckState>(context.frames, handle, CHECK_STATE, [], { readOnly: true });
   if (after?.checked !== checked) throw new DriverError("execution", `Clicking did not ${checked ? "check" : "uncheck"} the element.`);
   return { checked, changed: true };
 }
@@ -394,7 +404,7 @@ export async function drag(context: ActionContext, from: Target, to: Target, { t
   const deadline = Date.now() + timeoutMs;
   const source = isPoint(from) ? null : await element(context, from);
   const start = await pointAfterShowing(context, source ?? (from as Point), deadline, "move", pointer);
-  const end = isPoint(to) ? to : await actionablePoint(context, await element(context, to), deadline, { hitTest: false });
+  const end = isPoint(to) ? await inViewport(context, to) : await actionablePoint(context, await element(context, to), deadline, { hitTest: false });
   const sourceFrame = source?.frameId ?? context.frames.mainFrameId;
   const session = context.session;
   const intercepted: { data: Record<string, unknown> | null } = { data: null };
@@ -403,7 +413,7 @@ export async function drag(context: ActionContext, from: Target, to: Target, { t
   });
   await session.send("Input.setInterceptDrags", { enabled: true });
   try {
-    await valueInWorld(context.frames, sourceFrame, DRAG_PROBE);
+    await valueInWorld(context.frames, sourceFrame, DRAG_PROBE, { readOnly: false });
     await context.mouse.move(start.x, start.y);
     await context.mouse.down();
     // Past Chrome's drag threshold, toward the target.
@@ -440,7 +450,7 @@ export async function scroll(context: ActionContext, target: Target | null, delt
   await context.bringToFront();
   const point = target === null
     ? await valueInWorld<Point>(context.frames, context.frames.mainFrameId, VIEWPORT_CENTER)
-    : isPoint(target) ? target : await actionablePoint(context, await element(context, target), Date.now() + timeoutMs, { hitTest: false });
+    : isPoint(target) ? await inViewport(context, target) : await actionablePoint(context, await element(context, target), Date.now() + timeoutMs, { hitTest: false });
   await context.mouse.move(point.x, point.y);
   await context.mouse.wheel(deltaX, deltaY);
   await valueInWorld(context.frames, context.frames.mainFrameId, NEXT_FRAME, { awaitPromise: true }).catch(() => {});

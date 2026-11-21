@@ -30,7 +30,7 @@ it("takes cron through the real routine tools, applying the bot's own routine at
     const proposal = async (tool: string, args: unknown, text: string, expectError = false) => {
       const previousTurns = providerEvidence().length;
       writeFileSync(planPath, JSON.stringify({ [bot.id]: {
-        expectSystemIncludes: ["five-field cron expression", "Never replace a calendar rule with daily AI date checking", "including its VPS"],
+        expectSystemIncludes: ["a five-field cron with an explicit IANA timezone", "never daily AI date checks or an approximate weekly schedule", "configured computer (its VPS too)"],
         steps: [{ tool: "list_triggers", arguments: {} }, { tool, arguments: args, expectError }],
         reply: expectError ? "That invalid schedule was refused." : "The routine change is applied.",
       } }));
@@ -53,7 +53,7 @@ it("takes cron through the real routine tools, applying the bot's own routine at
       name: "Monthly report", instructions: "Summarize last month's fixture activity; no external services.", schedule, overlap: "queue", run_on_startup: true,
     }, "Schedule a report at 9am New York time on the first of each month, and also whenever the app starts.");
     expect(create.routineRequest).toMatchObject({ version: 1, operation: { action: "create", routine: { schedule } }, undo: { name: "Monthly report", schedule } });
-    expect(create.subtitle).toContain("Next 3 runs (America/New_York)");
+    expect(create.subtitle).toContain("Next 3 runs (Eastern time)");
     expect(create.subtitle).toContain("Cron: 0 9 1 * *");
     const { resultId: routineId } = applied(create);
     const current = async () => (await api("GET", "/api/routines")).routines.find((routine: any) => routine.id === routineId);
@@ -92,7 +92,7 @@ it("takes cron through the real routine tools, applying the bot's own routine at
     applied(pause);
     expect(await current()).toMatchObject({ enabled: false, nextRunAt: null, schedule: lastDay });
     const resume = await proposal("manage_trigger", { action: "resume", trigger_id: routineId }, "Resume the monthly report.");
-    expect(resume.subtitle).toContain("Next 3 runs (America/New_York)");
+    expect(resume.subtitle).toContain("Next 3 runs (Eastern time)");
     applied(resume);
     expect(await current()).toMatchObject({ enabled: true, schedule: lastDay });
 

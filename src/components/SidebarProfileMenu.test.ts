@@ -3,9 +3,19 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 
 import {
-  phoneMenuItems,
+  cloudUsageSummary,
+  phoneDevicesItem,
+  phoneDevicesSubtitle,
+  placeMenuItems,
+  planUsageSummary,
   profileInitials,
   profileMenuItems,
+  resetsIn,
+  simpleUpdateTop,
+  accountDot,
+  accountLabel,
+  toolMenuItems,
+  type PlanUsageWindows,
   selectPhoneDestination,
   profileLabel,
   updateBusy,
@@ -13,19 +23,21 @@ import {
   updateLabel,
   updatePhase,
 } from "./SidebarProfileMenu";
-import { ANDROID_APK_URL, DOCS_URL, FEEDBACK_URL, HELP_CENTER_URL, IOS_APP_STORE_URL, platformLabel } from "@/lib/app-links";
+import { DOCS_URL, FEEDBACK_URL, HELP_CENTER_URL, platformLabel } from "@/lib/app-links";
+import { profileForSession } from "@/lib/session";
 import {
   cloudPhoneDestination,
   connectPhoneEntry,
   phoneDestinations,
   phonePairingSettingsAction,
-  type PhonePairingAccess,
-  type PhonePairingTarget,
 } from "@/lib/phone-pairing";
 import type { CloudAccountState } from "../../electron/cloud-account.mjs";
-import type { CloudMachine } from "../../electron/cloud-home.mjs";
-import { PHONE_APPS, PhoneAppDialog, type PhoneAppConnect } from "./PhoneAppDialog";
+import { PhoneAppDialog, type PhoneAppConnect } from "./PhoneAppDialog";
 import type { UpdaterState } from "@/lib/updater";
+import type { SidebarMenuItem } from "./SidebarPopoverMenu";
+import { moveMenuItems } from "./AccountMove";
+import { moveLine } from "@/lib/cloud-send";
+import { InitialsAvatar } from "./Avatar";
 
 const state = (patch: Partial<UpdaterState>): UpdaterState => ({ status: "idle", ...patch }) as UpdaterState;
 
@@ -54,6 +66,28 @@ describe("profileLabel", () => {
   });
 });
 
+describe("the sidebar profile for a signed-in visitor", () => {
+  it("uses the fallback while the session identity is still loading", () => {
+    const visible = profileForSession(
+      { name: "Owner", email: "owner@example.test", avatarUrl: "/owner.png" },
+      null,
+    );
+    expect(profileLabel(visible)).toBe("You");
+    expect(profileInitials(visible)).toBe("?");
+    expect(visible?.avatarUrl).toBeUndefined();
+  });
+
+  it("shows the verified email and initials without the configured owner's name or avatar", () => {
+    const visible = profileForSession(
+      { name: "Owner", email: "owner@example.test", avatarUrl: "/owner.png" },
+      { kind: "session", id: "s", label: "Ada's iPad", email: "ada@example.test", scopes: ["client"], expiresAt: 1 },
+    );
+    expect(profileLabel(visible)).toBe("ada@example.test");
+    expect(profileInitials(visible)).toBe("A");
+    expect(visible?.avatarUrl).toBeUndefined();
+  });
+});
+
 describe("updatePhase", () => {
   it("reports the bridge's own in-flight states", () => {
     expect(updatePhase(state({ status: "checking" }), false)).toBe("checking");
@@ -75,7 +109,7 @@ describe("updatePhase", () => {
 describe("updateLabel", () => {
   it("names the version it is ready to install", () => {
     expect(updateLabel("downloaded", state({ status: "downloaded", version: "0.2.0" }))).toBe(
-      "OpenMausBot 0.2.0 ready — restart",
+      "Restart to update to MausBot 0.2.0",
     );
   });
 
@@ -89,7 +123,7 @@ describe("updateLabel", () => {
     expect(updateLabel("installing", state({ status: "installing", message: "Restart is taking longer than expected." })))
       .toBe("Restart is taking longer than expected.");
     expect(updateLabel("downloaded", state({ status: "downloaded", version: "0.2.0", installMode: "handoff" })))
-      .toBe("OpenMausBot 0.2.0 ready — install");
+      .toBe("Install MausBot 0.2.0");
     expect(updateLabel("installing", state({ status: "installing", installMode: "handoff" })))
       .toBe("Opening a terminal…");
   });
@@ -98,7 +132,7 @@ describe("updateLabel", () => {
     expect(updateLabel("error", state({ status: "error", message: "Network unreachable" }))).toBe(
       "Network unreachable",
     );
-    expect(updateLabel("error", state({ status: "error" }))).toBe("Update failed — try again");
+    expect(updateLabel("error", state({ status: "error" }))).toBe("The update didn't finish. Try again.");
   });
 
   it("points a hand-off at the terminal that finishes it", () => {
@@ -171,91 +205,30 @@ describe("outward links", () => {
   });
 });
 
-describe("the phone entries", () => {
-  const admin: PhonePairingAccess = { session: { kind: "session", id: "s", label: "Mac", scopes: ["admin", "client"], expiresAt: 1 }, pairingCodes: true };
-  const chatOnly: PhonePairingAccess = { session: { kind: "session", id: "s", label: "Phone", scopes: ["client"], expiresAt: 1 }, pairingCodes: true };
-  const signedIn = { status: "connected", account: { id: "a", email: "p@example.test" } } as const;
-  const paid = (tier: string, machine?: CloudMachine): CloudAccountState => ({ ...signedIn, entitlement: { plan: "pro", tier, status: "active", expiresAt: null, version: 1 }, ...(machine ? { machine } : {}) });
-  const ready: CloudMachine = { status: "ready", origin: "https://home-7f3k2.fly.dev" };
-  const free: CloudAccountState = { ...signedIn, entitlement: { plan: "free", status: "inactive", expiresAt: null, version: 1 } };
-  const items = (target: PhonePairingTarget, access: PhonePairingAccess | null, account: CloudAccountState | null = null, connected = false) => {
-    const onConnect = vi.fn(), onGetApp = vi.fn();
-    const destinations = phoneDestinations(connectPhoneEntry(target, access), cloudPhoneDestination(account));
-    return { list: phoneMenuItems({ destinations, connected, onConnect, onGetApp }), onConnect, onGetApp };
-  };
-  const shown = (...args: Parameters<typeof items>) => items(...args).list.map((item) => [item.label, item.subtitle ?? null, ...(item.note ? [item.note] : [])]);
-  const APP = ["Get the phone app", null];
+describe("the Phone & devices row", () => {
+  const sub = (state: Parameters<typeof phoneDevicesSubtitle>[0], place = "This computer") => phoneDevicesSubtitle(state, place);
 
-  it("on this computer: Connect your phone, to this computer, then Get the phone app", () => {
-    expect(shown("computer", null)).toEqual([["Connect your phone", "to this computer"], APP]);
+  it("names the place the phone joins, and how it is doing there", () => {
+    expect(sub({ kind: "none" })).toBe("Not set up on This computer");
+    expect(sub({ kind: "checking" }, "My Cloud")).toBe("Not set up on My Cloud");
+    expect(sub({ kind: "paired", count: 2, connected: false })).toBe("2 paired with This computer");
+    expect(sub({ kind: "attention", count: 1 })).toBe("Needs attention on This computer");
   });
 
-  it("on this computer with a paid Cloud that is Ready: both, the Cloud first", () => {
-    for (const tier of ["personal", "pro", "max"]) {
-      expect(shown("computer", null, paid(tier, ready))).toEqual([
-        ["Connect your phone", "to the Cloud (always on)"],
-        ["Connect your phone", "to this computer"],
-        APP,
-      ]);
-    }
+  it("says each blocked state in a few words", () => {
+    expect(sub({ kind: "managed", organization: "Acme" }, "Acme team")).toBe("Managed by Acme");
+    expect(sub({ kind: "chat-only" }, "studio.example.com")).toBe("Chat and approvals only");
+    expect(sub({ kind: "portal" }, "studio.example.com")).toBe("Signed in through your organization");
   });
 
-  it("on this computer, free or signed out: only this computer", () => {
-    for (const account of [free, { status: "signed-out" } as CloudAccountState, null]) {
-      expect(shown("computer", null, account)).toEqual([["Connect your phone", "to this computer"], APP]);
-    }
-    expect(shown("computer", null, { ...paid("pro", ready), entitlement: { plan: "pro", status: "inactive", expiresAt: null, version: 2 } }))
-      .toEqual([["Connect your phone", "to this computer"], APP]);
-    expect(shown("computer", null, { status: "unavailable", lastPlan: { tier: "pro", active: true }, machine: ready }))
-      .toEqual([["Connect your phone", "to this computer"], APP]);
-  });
-
-  it("on this computer with a paid Cloud that is not Ready: only this computer, and a hint", () => {
-    for (const machine of [undefined, { status: "provisioning" }, { status: "stopped", origin: ready.origin }, { status: "failed", origin: ready.origin }] as Array<CloudMachine | undefined>) {
-      expect(shown("computer", null, paid("pro", machine))).toEqual([
-        ["Connect your phone", "to this computer", "The Cloud shows here once it's ready."],
-        APP,
-      ]);
-    }
-  });
-
-  it("on the person's own Cloud: unchanged, one Connect your phone to My Cloud", () => {
-    expect(shown("cloud", admin)).toEqual([["Connect your phone", "to the Cloud"], APP]);
-    expect(shown("cloud", admin, paid("max", ready))).toEqual([["Connect your phone", "to the Cloud"], APP]);
-    expect(shown("cloud", admin, paid("max"))).toEqual([["Connect your phone", "to the Cloud"], APP]);
-  });
-
-  it("on another server: to this server, and gone for a session that cannot make a pairing code", () => {
-    expect(shown("server", admin, paid("pro", ready))).toEqual([["Connect your phone", "to the bots here"], APP]);
-    expect(shown("server", chatOnly)).toEqual([APP]);
-    expect(shown("server", { ...admin, pairingCodes: false })).toEqual([APP]);
-    expect(shown("cloud", chatOnly)).toEqual([APP]);
-  });
-
-  it("never offers the iOS-only entry it replaced", () => {
-    for (const target of ["computer", "server"] as const) {
-      expect(items(target, null).list.map((item) => item.label)).not.toContain("Get OpenMausBot for iOS");
-    }
-  });
-
-  it("each line hands on its own destination", () => {
-    const { list, onConnect, onGetApp } = items("computer", null, paid("pro", ready));
-    list[0]!.onSelect();
-    expect(onConnect).toHaveBeenLastCalledWith(expect.objectContaining({ id: "cloud" }));
-    list[1]!.onSelect();
-    expect(onConnect).toHaveBeenLastCalledWith(expect.objectContaining({ id: "here", target: "computer" }));
-    expect(onGetApp).not.toHaveBeenCalled();
-    list[2]!.onSelect();
-    expect(onGetApp).toHaveBeenCalledOnce();
-  });
-
-  it("shows this computer's live phone on this computer's line only", () => {
-    expect(items("computer", null, null, true).list[0]!.trailing).toBeTruthy();
-    expect(items("computer", null, null, false).list[0]!.trailing).toBeUndefined();
-    const both = items("computer", null, paid("pro", ready), true).list;
-    expect(both[0]!.trailing).toBeUndefined();
-    expect(both[1]!.trailing).toBeTruthy();
-    expect(items("cloud", admin, null, true).list[0]!.trailing).toBeUndefined();
+  it("is one row, dotted green while a phone is connected, that opens Phone & devices", () => {
+    const open = vi.fn();
+    const row = phoneDevicesItem({ kind: "paired", count: 1, connected: true }, "This computer", open);
+    expect([row.key, row.label]).toEqual(["phone-devices", "Phone & devices"]);
+    expect(row.trailing).toBeTruthy();
+    expect(phoneDevicesItem({ kind: "none" }, "This computer", open).trailing).toBeUndefined();
+    row.onSelect();
+    expect(open).toHaveBeenCalledOnce();
   });
 });
 
@@ -290,13 +263,7 @@ describe("choosing where the phone connects", () => {
   });
 });
 
-describe("Get the phone app", () => {
-  it("offers iPhone and Android with the links the website and Cloud page use", () => {
-    expect(PHONE_APPS.map((app) => [app.id, app.url])).toEqual([["ios", IOS_APP_STORE_URL], ["android", ANDROID_APK_URL]]);
-    expect(IOS_APP_STORE_URL).toBe("https://apps.apple.com/in/app/mausbot/id6803387923");
-    expect(ANDROID_APK_URL).toBe("https://github.com/milind-soni/OpenMausBot/releases/download/android-v1.5.0/OpenMausBot.apk");
-  });
-
+describe("the Connect your phone choice", () => {
   const render = (connect?: PhoneAppConnect[]) => {
     vi.stubGlobal("window", { addEventListener: () => {}, removeEventListener: () => {} });
     try {
@@ -307,17 +274,12 @@ describe("Get the phone app", () => {
   };
   const to = (key: string, subtitle: string): PhoneAppConnect => ({ key, subtitle, onSelect: () => {} });
 
-  it("draws a code to scan for each, and points on to Connect your phone where this window can pair", () => {
-    const html = render([to("here", "to this computer")]);
-    expect(html).toContain('data-phone-app="ios"');
-    expect(html).toContain('data-phone-app="android"');
-    expect(html.match(/<svg/g)?.length).toBe(2);
-    expect(html).toContain("Open in the App Store");
-    expect(html).toContain("Download the APK");
+  it("offers only places to pair with: no store link, download or code", () => {
+    const html = render([to("cloud", "to the Cloud (always on)"), to("here", "to this computer")]);
     expect(html).toContain("Connect your phone");
     expect(html).toContain("to this computer");
-    expect(render()).not.toContain("Connect your phone");
-    expect(render([])).not.toContain("Connect your phone");
+    expect(html).not.toMatch(/App Store|Google Play|apps\.apple\.com|play\.google\.com|\.apk|<svg|<a /);
+    expect(render([])).not.toContain("data-phone-app-connect");
   });
 
   it("offers every destination the menu does, in the same order", () => {
@@ -334,39 +296,293 @@ describe("Get the phone app", () => {
 describe("profileMenuItems", () => {
   const noop = () => {};
   const build = (patch: Partial<Parameters<typeof profileMenuItems>[0]> = {}) => profileMenuItems({
-    phone: [{ key: "phone-app", label: "Get the phone app", onSelect: noop }],
-    usage: true,
+    phone: { key: "phone-devices", label: "Phone & devices", onSelect: noop },
     update: null,
-    account: "OpenMausBot Cloud",
-    onUsage: noop, onSettings: noop, onShortcuts: noop, onAbout: noop, onHelp: noop, onFeedback: noop, onAccount: noop,
+    header: { name: "Ada Lovelace", line: "Pro · ada@example.com", avatar: null, onOpen: noop },
+    plan: { key: "plan", label: "Plan & billing", onSelect: noop },
+    onSettings: noop, onShortcuts: noop, onAbout: noop, onHelp: noop, onFeedback: noop,
     ...patch,
   });
 
-  it("groups usage and the phone, then help and settings, then the account under a divider", () => {
+  it("starts with your account, then Phone & devices, Settings and Plan & billing, then Help after a divider", () => {
     const items = build();
-    expect(items.map((item) => item.key)).toEqual(["usage", "phone-app", "support", "settings", "account"]);
-    expect(items.filter((item) => item.separatorBefore).map((item) => item.key)).toEqual(["account"]);
-    expect(items.find((item) => item.key === "support")!.submenu!.map((item) => item.key)).toEqual(["help", "feedback", "shortcuts", "about"]);
-    expect(items.find((item) => item.key === "account")!.label).toBe("OpenMausBot Cloud");
+    expect(items.map((item) => item.key)).toEqual(["account", "phone-devices", "settings", "plan", "support"]);
+    expect(items.filter((item) => item.separatorBefore).map((item) => item.key)).toEqual(["phone-devices", "support"]);
+    expect(items.find((item) => item.key === "support")!.submenu!.map((item) => item.key)).toEqual(["help", "shortcuts", "feedback", "about"]);
+    expect(items[0]).toMatchObject({ label: "Ada Lovelace", subtitle: "Pro · ada@example.com", large: true, chevron: true });
   });
 
-  it("only offers what this window has: no usage on a remote server, no account without one", () => {
-    const items = build({ usage: false, account: null });
-    expect(items.map((item) => item.key)).toEqual(["phone-app", "support", "settings"]);
-    expect(items.some((item) => item.separatorBefore)).toBe(false);
+  it("only offers what this window has: no Phone & devices for a paired client, no Plan & billing without a plan", () => {
+    expect(build({ phone: null, plan: null }).map((item) => item.key)).toEqual(["account", "settings", "support"]);
   });
 
-  it("keeps the update entry beside settings", () => {
+  it("keeps Check for updates in Help in both modes, and raises a ready update to the top", () => {
     const update = { key: "update", label: "Check for updates", onSelect: noop };
-    expect(build({ update }).map((item) => item.key)).toEqual(["usage", "phone-app", "support", "settings", "update", "account"]);
+    expect(build({ update }).find((item) => item.key === "support")!.submenu!.map((item) => item.key)).toEqual(["help", "shortcuts", "feedback", "update", "about"]);
+    const raised = build({ update, updateTop: { label: "Update ready", action: "Restart" } });
+    expect(raised[0]!.key).toBe("update");
+    expect(raised[0]!.label).toBe("Update ready");
+    expect(raised.find((item) => item.key === "support")!.submenu!.map((item) => item.key)).not.toContain("update");
   });
 
-  it("opens the Usage and account pages of Settings", () => {
-    const onUsage = vi.fn(), onAccount = vi.fn();
-    const items = build({ onUsage, onAccount });
-    items.find((item) => item.key === "usage")!.onSelect();
-    items.find((item) => item.key === "account")!.onSelect();
-    expect(onUsage).toHaveBeenCalledOnce();
-    expect(onAccount).toHaveBeenCalledOnce();
+  it("opens Your account from the header, whether signed in or not", () => {
+    const onOpen = vi.fn();
+    for (const line of ["Pro · ada@example.com", "Not signed in"]) build({ header: { name: "Ada", line, avatar: null, onOpen } })[0]!.onSelect();
+    expect(onOpen).toHaveBeenCalledTimes(2);
+  });
+
+  it("ends with the other accounts and Sign out, under a divider", () => {
+    const accounts = [{ key: "accounts-sign-out", label: "Sign out", onSelect: noop }];
+    const items = build({ accounts });
+    expect(items.at(-1)).toMatchObject({ key: "accounts-sign-out", separatorBefore: true });
+  });
+});
+
+describe("Announcements in the profile menu", () => {
+  const noop = () => {};
+  const build = (patch: Partial<Parameters<typeof profileMenuItems>[0]> = {}) => profileMenuItems({
+    phone: { key: "phone-devices", label: "Phone & devices", onSelect: noop },
+    update: null,
+    header: { name: "Ada", line: "Not signed in", avatar: null, onOpen: noop },
+    plan: { key: "plan", label: "Plan & billing", onSelect: noop },
+    onSettings: noop, onShortcuts: noop, onAbout: noop, onHelp: noop, onFeedback: noop,
+    ...patch,
+  });
+
+  it("sits first in Help's group, in Simple and in Advanced, red-dotted while one is new, lit while its page is open", () => {
+    const open = vi.fn();
+    const advanced = build({ announcements: { unread: true, active: false, onSelect: open } });
+    expect(advanced.map((item) => item.key)).toEqual(["account", "phone-devices", "settings", "plan", "announcements", "support"]);
+    expect(advanced.find((item) => item.key === "announcements")).toMatchObject({ label: "Announcements", attention: true, active: false, separatorBefore: true });
+    advanced.find((item) => item.key === "announcements")!.onSelect();
+    expect(open).toHaveBeenCalledOnce();
+    const simple = build({ simple: { tools: toolMenuItems({ activeView: "announcements", automationsNeedYou: false, onAutomations: noop, onTeamMap: noop }) },
+      announcements: { unread: false, active: true, onSelect: noop } });
+    expect(simple.map((item) => item.key)).toEqual(["account", "phone-devices", "settings", "automations", "team-map", "plan", "announcements", "support"]);
+    expect(simple.find((item) => item.key === "announcements")).toMatchObject({ attention: false, active: true, separatorBefore: true });
+  });
+
+  it("raises the avatar's dot red, and names it on the button, while an announcement is new", () => {
+    expect(accountDot({ automationsNeedYou: false, update: null, move: null, announcements: true })).toBe("danger");
+    expect(accountDot({ automationsNeedYou: false, update: "news", move: null, announcements: true })).toBe("danger");
+    expect(accountDot({ automationsNeedYou: false, update: null, move: null, announcements: false })).toBeNull();
+    expect(accountLabel("Ada", { automationsNeedYou: false, update: null, announcements: true })).toBe("Ada · New announcements");
+    expect(accountLabel("Ada", { automationsNeedYou: false, update: null })).toBe("Ada");
+  });
+});
+
+describe("Simple mode's account menu", () => {
+  const noop = () => {};
+  const tools = toolMenuItems({ activeView: "routines", automationsNeedYou: true, onAutomations: noop, onTeamMap: noop });
+  const place = (patch: Partial<Parameters<typeof placeMenuItems>[0]> = {}) => ({
+    bridge: { state: async () => ({ local: true, name: "This computer" }), menu: async () => {} },
+    current: { local: true, name: "This computer" },
+    cloudHome: false,
+    onLine: "",
+    openMenu: vi.fn(),
+    switchable: true,
+    ...patch,
+  });
+  const build = (patch: Partial<Parameters<typeof profileMenuItems>[0]> = {}) => profileMenuItems({
+    phone: { key: "phone-devices", label: "Phone & devices", onSelect: noop },
+    update: { key: "update", label: "Check for updates", onSelect: noop },
+    header: { name: "Ada", line: "Not signed in", avatar: null, onOpen: noop },
+    plan: { key: "plan", label: "Plan & billing", onSelect: noop },
+    simple: { tools },
+    onSettings: noop, onShortcuts: noop, onAbout: noop, onHelp: noop, onFeedback: noop,
+    ...patch,
+  });
+  const groups = (items: SidebarMenuItem[]) => items.reduce<string[][]>((all, item) => {
+    if (item.separatorBefore || all.length === 0) all.push([]);
+    all[all.length - 1]!.push(item.key);
+    return all;
+  }, []);
+
+  it("is the same menu as Advanced, with Automations and Team map in their own group between Settings and Plan & billing, and Help on its own", () => {
+    const items = build();
+    expect(groups(items)).toEqual([
+      ["account"],
+      ["phone-devices", "settings"],
+      ["automations", "team-map"],
+      ["plan"],
+      ["support"],
+    ]);
+    expect(items.find((item) => item.key === "support")!.submenu!.map((item) => item.key)).toEqual(["help", "shortcuts", "feedback", "update", "about"]);
+  });
+
+  it("raises an update that is ready or failed to its own top row with a pill, and keeps it out of support", () => {
+    const update = { key: "update", label: "Restart to update to MausBot 0.2.0", subtitle: "notes", attention: true, onSelect: noop };
+    const items = build({ update, updateTop: { label: "Update ready", action: "Restart" } });
+    expect(groups(items)[0]).toEqual(["update"]);
+    expect(items[0]).toMatchObject({ label: "Update ready", subtitle: undefined, attention: false });
+    expect(renderToStaticMarkup(createElement("div", null, items[0]!.trailing))).toContain(">Restart</span>");
+    expect(items[1]!.separatorBefore).toBe(true);
+    expect(items.find((item) => item.key === "support")!.submenu!.map((item) => item.key)).not.toContain("update");
+  });
+
+  it("raises a downloaded or failed app update and a newer server, and nothing else", () => {
+    expect(simpleUpdateTop({ source: "desktop", phase: "downloaded" })).toEqual({ label: "Update ready", action: "Restart" });
+    expect(simpleUpdateTop({ source: "desktop", phase: "downloaded", installMode: "handoff" })).toEqual({ label: "Update ready", action: "Install" });
+    expect(simpleUpdateTop({ source: "desktop", phase: "error" })).toEqual({ label: "Update failed", action: "Retry" });
+    expect(simpleUpdateTop({ source: "server", phase: "available" })).toEqual({ label: "Update ready", action: "Install" });
+    expect(simpleUpdateTop({ source: "server", phase: "reload" })).toEqual({ label: "Update ready", action: "Restart" });
+    for (const phase of ["idle", "checking", "downloading", "up-to-date"] as const) expect(simpleUpdateTop({ source: "desktop", phase })).toBeNull();
+    expect(simpleUpdateTop({ source: "server", phase: "error" })).toBeNull();
+    expect(simpleUpdateTop(null)).toBeNull();
+  });
+
+  it("adds Files once My Cloud's files are ready and Archived bots while there are any, after Team map", () => {
+    const open = vi.fn();
+    const items = toolMenuItems({ activeView: "files", automationsNeedYou: false, onAutomations: noop, onTeamMap: noop, onFiles: noop, archived: { count: 3, open } });
+    expect(items.map((item) => [item.key, item.active, item.value])).toEqual([["automations", false, undefined], ["team-map", false, undefined], ["files", true, undefined], ["archived", undefined, "3"]]);
+    items[3]!.onSelect();
+    expect(open).toHaveBeenCalledOnce();
+    expect(toolMenuItems({ activeView: "chat", automationsNeedYou: false, onAutomations: noop, onTeamMap: noop, archived: { count: 0, open } }).map((item) => item.key)).toEqual(["automations", "team-map"]);
+  });
+
+  it("has Published apps among the tools, after Files and before Archived bots, lit while its page is open", () => {
+    const openApps = vi.fn();
+    const items = toolMenuItems({ activeView: "published-apps", automationsNeedYou: false, onAutomations: noop, onTeamMap: noop, onFiles: noop, onPublishedApps: openApps, archived: { count: 1, open: noop } });
+    expect(items.map((item) => [item.key, item.label, item.active])).toEqual([["automations", "Automations", false], ["team-map", "Team map", false], ["files", "Files", false],
+      ["published-apps", "Published apps", true], ["archived", "Archived bots", undefined]]);
+    items[3]!.onSelect();
+    expect(openApps).toHaveBeenCalledOnce();
+  });
+
+  it("names the account button after the person and whatever its dot is raised for", () => {
+    expect(accountLabel("You", { automationsNeedYou: false, update: null })).toBe("You");
+    expect(accountLabel("Ada", { automationsNeedYou: true, update: "Update failed. Try again." })).toBe("Ada · Automations need you · Update failed. Try again.");
+  });
+
+  it("adds the move to My Cloud: a short warning once failing, shared with automations, and a quiet segment on its way", () => {
+    expect(accountLabel("Omkar", { automationsNeedYou: false, update: null, move: "failed" })).toBe("Omkar · My Cloud move needs you");
+    expect(accountLabel("Omkar", { automationsNeedYou: true, update: null, move: "failed" })).toBe("Omkar · My Cloud move and automations need you");
+    expect(accountLabel("Omkar", { automationsNeedYou: true, update: "Update ready", move: "failed" })).toBe("Omkar · My Cloud move and automations need you · Update ready");
+    expect(accountLabel("Omkar", { automationsNeedYou: false, update: null, move: "sending" })).toBe("Omkar · Moving to My Cloud…");
+    expect(accountLabel("Omkar", { automationsNeedYou: true, update: null, move: "sending" })).toBe("Omkar · Automations need you · Moving to My Cloud…");
+    expect(accountLabel("Omkar", { automationsNeedYou: false, update: null, move: "done" })).toBe("Omkar");
+    expect(accountLabel("Omkar", { automationsNeedYou: true, update: null, move: "done" })).toBe("Omkar · Automations need you");
+    expect(accountLabel("Omkar", { automationsNeedYou: false, update: null, move: null })).toBe("Omkar");
+  });
+
+  it("raises the avatar's dot red for a failing move like automations, and none on its way or once done", () => {
+    expect(accountDot({ automationsNeedYou: false, update: null, move: "failed" })).toBe("danger");
+    expect(accountDot({ automationsNeedYou: true, update: null, move: "failed" })).toBe("danger");
+    expect(accountDot({ automationsNeedYou: false, update: "news", move: "failed" })).toBe("danger");
+    expect(accountDot({ automationsNeedYou: false, update: null, move: "sending" })).toBeNull();
+    expect(accountDot({ automationsNeedYou: false, update: null, move: "done" })).toBeNull();
+    expect(accountDot({ automationsNeedYou: false, update: "news", move: "done" })).toBe("accent");
+    expect(accountDot({ automationsNeedYou: false, update: null, move: null })).toBeNull();
+    expect(accountDot({ automationsNeedYou: true, update: null, move: null })).toBe("danger");
+    expect(accountDot({ automationsNeedYou: false, update: "failed", move: null })).toBe("danger");
+    expect(accountDot({ automationsNeedYou: false, update: "news", move: "sending" })).toBe("accent");
+  });
+
+  it("puts the move's row first, in its own group, above a raised update", () => {
+    const move = [{ key: "cloud-move", label: "Try My Cloud move again", title: "My Cloud did not answer.", onSelect: noop }];
+    const update = { key: "update", label: "OpenMausBot 0.2.0 ready, restart", onSelect: noop };
+    expect(groups(build({ move }))).toEqual([
+      ["cloud-move"],
+      ["account"],
+      ["phone-devices", "settings"],
+      ["automations", "team-map"],
+      ["plan"],
+      ["support"],
+    ]);
+    expect(groups(build({ move, update, updateTop: { label: "Update ready", action: "Restart" } })).slice(0, 2)).toEqual([["cloud-move"], ["update"]]);
+    expect(groups(build({ move: [] }))[0]).toEqual(["account"]);
+  });
+
+  it("gives a moving move one plain row, and a failing one the reason written under its Try again", () => {
+    const shape = (item: SidebarMenuItem) => ({ lines: [item.subtitle, item.note].filter(Boolean).length, wrap: item.wrap === true, icon: Boolean(item.icon) });
+    const failing = moveMenuItems(moveLine({ phase: "copy", failing: { error: "Some of this computer's things did not reach My Cloud." } }, "local"), { onOpen: noop, onRetry: noop, onClose: noop });
+    const moving = moveMenuItems(moveLine({ phase: "copy", chats: { done: 34, total: 120 } }, "local"), { onOpen: noop, onRetry: noop, onClose: noop });
+    const items = build({ move: moving });
+    expect(groups(items)[0]).toEqual(["cloud-move"]);
+    expect(shape(items[0]!)).toEqual({ lines: 0, wrap: false, icon: true });
+    const failed = build({ move: failing });
+    expect(groups(failed)[0]).toEqual(["cloud-move"]);
+    expect(shape(failed[0]!)).toEqual({ lines: 1, wrap: true, icon: true });
+    expect(failed[0]!.note).toBe("Some of this computer's things did not reach My Cloud.");
+  });
+
+  it("puts the move's row first in Advanced's account menu too, under its own divider", () => {
+    const move = [{ key: "cloud-move", label: "Moving to My Cloud…", title: "Moving your bots to My Cloud… 34 of 120 chats", onSelect: noop }];
+    expect(groups(build({ simple: undefined, move }))).toEqual([["cloud-move"], ["account"], ["phone-devices", "settings", "plan"], ["support"]]);
+    expect(groups(build({ simple: undefined }))).toEqual([["account"], ["phone-devices", "settings", "plan"], ["support"]]);
+  });
+
+  it("draws a person instead of a question mark for someone with no name, at the trigger's own size", () => {
+    const glyph = createElement("svg", { "data-glyph": "" });
+    const nameless = renderToStaticMarkup(createElement(InitialsAvatar, { initials: profileInitials({}), size: 36, fallback: glyph, fontSize: 14 }));
+    expect(nameless).toContain("data-glyph");
+    expect(nameless).not.toContain("?");
+    expect(nameless).toContain("font-size:14px");
+    expect(renderToStaticMarkup(createElement(InitialsAvatar, { initials: "AL", size: 50 }))).toContain("font-size:19px");
+  });
+
+  it("marks Automations open and needing attention, and Team map plain", () => {
+    expect(tools.map((item) => [item.key, item.active, item.attention])).toEqual([["automations", true, true], ["team-map", false, undefined]]);
+  });
+
+  it("ticks the current place and switches through the same native menu as the server pill", () => {
+    const here = place();
+    const items = placeMenuItems(here, { owner: null, onCloudSettings: noop });
+    expect(items.map((item) => [item.key, item.label])).toEqual([["place", "This computer"], ["switch-place", "Switch to…"]]);
+    expect(items[0]!.trailing).toBeTruthy();
+    items[0]!.onSelect();
+    items[1]!.onSelect();
+    expect(here.openMenu).toHaveBeenCalledTimes(2);
+  });
+
+  it("names My Cloud and opens its settings when it is the window's only place, and offers nothing without either", () => {
+    const onCloudSettings = vi.fn();
+    const home = placeMenuItems(place({ switchable: false, cloudHome: true, onLine: "always on" }), { owner: "ada@example.test", onCloudSettings });
+    expect(home.map((item) => [item.label, item.subtitle])).toEqual([["My Cloud", "always on · ada@example.test’s Cloud"]]);
+    home[0]!.onSelect();
+    expect(onCloudSettings).toHaveBeenCalledOnce();
+    expect(placeMenuItems(place({ bridge: undefined, switchable: false }), { owner: null, onCloudSettings })).toEqual([]);
+  });
+
+  it("names a team's Cloud by the team", () => {
+    const team = placeMenuItems(place({ switchable: false, cloudHome: true, onLine: "" }), { owner: null, name: "Acme Labs", onCloudSettings: noop });
+    expect(team.map((item) => item.label)).toEqual(["Acme Labs"]);
+  });
+});
+
+describe("the usage meta", () => {
+  const now = Date.parse("2026-10-27T12:00:00Z");
+  const window = (usedPercent: number | null, resetsAt: string | null = null) => ({ available: usedPercent !== null, usedPercent, resetsAt });
+  const provider = (patch: Partial<PlanUsageWindows["providers"][number]> = {}) => ({ ok: true, plan: null, weekly: window(null), fiveHour: window(null), ...patch });
+
+  it("reads the tightest weekly window, then the 5-hour one, with when it resets", () => {
+    const report = { providers: [provider({ weekly: window(12, "2026-10-30T12:00:00Z") }), provider({ weekly: window(31.6, "2026-10-28T12:00:00Z") }), provider({ ok: false, weekly: window(90) })] };
+    expect(planUsageSummary(report, now)).toEqual({ value: "32% used", weekly: true, resets: "Resets tomorrow" });
+    expect(planUsageSummary({ providers: [provider({ fiveHour: window(40, "2026-10-27T15:00:00Z") })] }, now)).toEqual({ value: "40% used", weekly: false, resets: "Resets in 3 hours" });
+  });
+
+  it("falls back to a plan's monthly budget when it has no rolling window", () => {
+    const report = { providers: [provider({ extra: [{ label: "Monthly spend", usedPercent: 9.3 }, { label: "Other", usedPercent: 80 }] })] };
+    expect(planUsageSummary(report, now)).toEqual({ value: "9% used" });
+    expect(planUsageSummary({ providers: [provider({ extra: [{ label: "Other", usedPercent: 80 }] })] }, now)).toBeNull();
+  });
+
+  it("shows nothing without a percent, not even the plan's name", () => {
+    expect(planUsageSummary({ providers: [provider({ plan: "Max" })] }, now)).toBeNull();
+    expect(planUsageSummary({ providers: [provider()] }, now)).toBeNull();
+    expect(planUsageSummary(null, now)).toBeNull();
+  });
+
+  it("says when a reset is days away, and nothing once it has passed", () => {
+    expect(resetsIn(now + 3 * 86_400_000, now)).toBe("Resets in 3 days");
+    expect(resetsIn(now - 1, now)).toBeUndefined();
+    expect(resetsIn(null, now)).toBeUndefined();
+  });
+
+  it("reads a paid Cloud's tightest meter, and nothing without one", () => {
+    const usage = { tier: "pro", resetsAt: Date.parse("2026-11-01T00:00:00Z"), meters: [{ kind: "voice", used: 30, max: 100 }, { kind: "decisions", used: 85, max: 100 }] };
+    expect(cloudUsageSummary({ status: "paid", tier: "pro", usage } as never)).toMatchObject({ value: "85% used" });
+    expect(cloudUsageSummary({ status: "paid", tier: "pro" } as never)).toBeNull();
+    expect(cloudUsageSummary({ status: "none" } as never)).toBeNull();
   });
 });

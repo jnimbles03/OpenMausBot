@@ -2,7 +2,8 @@ import { Children, createElement, isValidElement, type ReactElement, type ReactN
 import { renderToStaticMarkup } from "react-dom/server";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ConfigStatus } from "@/state/store";
-import { DecisionModelSettings, deciderFailureText } from "./DecisionModelSettings";
+import { setLocale } from "@/lib/i18n";
+import { DecisionModelSettings, deciderFailureText, helpersStatusLine } from "./DecisionModelSettings";
 import { Switch } from "./SettingsPrimitives";
 
 const fixture = vi.hoisted(() => ({
@@ -46,6 +47,7 @@ function render() {
     job: byTestId("decider-job-roomRouting")[0]!,
     provider: byTestId("decider-provider")[0],
     model: byTestId("decider-model")[0],
+    customApi: byTestId("decider-custom-api")[0],
     save: byTestId("decider-save")[0]!,
     test: byTestId("decider-test")[0]!,
     manage: byTestId("decider-manage-keys")[0],
@@ -79,12 +81,13 @@ beforeEach(() => {
   vi.stubGlobal("window", {});
 });
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { setLocale("en"); vi.unstubAllGlobals(); });
 
 describe("DecisionModelSettings", () => {
   it("explains itself, then the switch, the key, and what it decides", () => {
     const view = render();
-    const order = ["A fast decision model that picks things for your bots", "Use Jev for fast decisions", "Jev API key", "What it decides", "Who answers in rooms"]
+    const order = ["Small, fast models that sort and read things for your bots", "Use fast decisions and extraction", "Decisions: not set up · Extraction: not set up",
+      "Cloudflare Workers AI (free tier)", "Jev API key", "What it decides", "Who answers in rooms"]
       .map((text) => view.html.indexOf(text));
     expect(order.every((at) => at >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
@@ -95,10 +98,15 @@ describe("DecisionModelSettings", () => {
     expect(view.html).toContain("Save a key below to turn this on.");
   });
 
-  it("offers both providers, with Jev selected for an existing install and no model picker", () => {
+  it("uses an invariable status for missing decisions and extraction in pt-BR", () => {
+    setLocale("pt-br");
+    expect(helpersStatusLine(null)).toBe("Decisões: sem configuração · Extração: sem configuração");
+  });
+
+  it("offers every provider, with Jev selected for an existing install and no model picker", () => {
     const view = render();
     expect(view.provider!.props.value).toBe("jev");
-    expect(optionsOf(view.provider!)).toEqual(["jev", "openrouter"]);
+    expect(optionsOf(view.provider!)).toEqual(["jev", "openrouter", "custom"]);
     expect(view.html).toContain("TypeSafe Jev");
     expect(view.model).toBeUndefined();
     expect(fixture.effects).toHaveLength(1);
@@ -106,10 +114,38 @@ describe("DecisionModelSettings", () => {
     expect(fixture.api).not.toHaveBeenCalled();
   });
 
-  it("lists the coming-soon jobs with no switch", () => {
+  it("asks a custom endpoint for its base URL, model and protocol, and saves its key in its own slot", async () => {
+    fixture.config = status({ provider: "custom", model: "m-1", api: "decisions", baseUrl: "https://gw.example.com/v1", configured: false, enabled: false, jobs: { roomRouting: true } });
+    let view = render();
+    expect(view.html).toContain('value="https://gw.example.com/v1"');
+    expect(view.html).toContain('value="m-1"');
+    expect(view.html).toContain("Endpoint API key");
+    expect(view.html).not.toContain("typesafe.ai");
+    fixture.api.mockResolvedValue(fixture.config);
+    type(view.input, "gw-key");
+    view = render();
+    click(view.save);
+    await flush();
+    expect(fixture.api).toHaveBeenCalledWith("/api/config", { method: "PUT", body: JSON.stringify({ decider: { customKey: "gw-key" } }) });
+    expect(deciderFailureText({ reason: "malformed" }, false, "custom")).toContain("Check the protocol and model ID.");
+    expect(deciderFailureText({ reason: "http_error", status: 500 }, false, "custom")).toBe("Your endpoint sent back an error (500).");
+  });
+
+  it("offers OpenAI-compatible chat as a custom endpoint protocol and saves it", async () => {
+    fixture.config = status({ provider: "custom", model: "gemini-2.5-flash", api: "chat", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", configured: true, enabled: true, jobs: { roomRouting: true } });
     const view = render();
-    for (const label of ["Browser clicks", "Tool selection", "Where work runs"]) expect(view.html).toContain(label);
-    expect(view.html.match(/Coming soon/g)).toHaveLength(3);
+    expect(optionsOf(view.customApi!)).toEqual(["systemone", "decisions", "chat"]);
+    expect(view.customApi!.props.value).toBe("chat");
+    expect(view.html).toContain("OpenAI-compatible chat");
+    fixture.api.mockResolvedValue(fixture.config);
+    change(view.customApi!, "chat");
+    await flush();
+    expect(fixture.api).toHaveBeenCalledWith("/api/config", { method: "PUT", body: JSON.stringify({ decider: { customApi: "chat" } }) });
+  });
+
+  it("lists only the jobs that work: no coming-soon rows", () => {
+    const view = render();
+    for (const label of ["Browser clicks", "Tool selection", "Where work runs", "Coming soon"]) expect(view.html).not.toContain(label);
     expect(view.switches).toHaveLength(2);
   });
 
@@ -176,6 +212,28 @@ describe("DecisionModelSettings", () => {
     expect(view.test.props.disabled).toBe(false);
   });
 
+  it("a Gemini key saved for speech or images is switchable here, but has no key to clear", () => {
+    fixture.config = status({ provider: "gemini", configured: true, enabled: false, jobs: { roomRouting: true } });
+    const view = render();
+    expect(view.master.props.disabled).toBe(false);
+    expect(view.save.props.disabled).toBe(true);
+    expect(view.html).not.toContain("Clear");
+  });
+
+  it("Test names Gemini when the saved Gemini key answers, and keeps a picked OpenRouter selected", async () => {
+    fixture.config = status({ provider: "gemini", chosen: "openrouter", configured: true, enabled: true, jobs: { roomRouting: true } });
+    expect(render().provider!.props.value).toBe("openrouter");
+    fixture.api.mockResolvedValueOnce({ ok: true, latencyMs: 410 });
+    click(render().test);
+    await flush();
+    expect(fixture.api).toHaveBeenCalledWith("/api/decider/test", { method: "POST", body: "{}" });
+    expect(render().html).toContain("Gemini answered in 410 ms with your saved Gemini key.");
+    fixture.api.mockResolvedValueOnce({ ok: false, reason: "rejected", status: 400 });
+    click(render().test);
+    await flush();
+    expect(render().html).toContain("Google rejected your saved Gemini key. Check it under API keys.");
+  });
+
   it("with an own key saved as well, shows Connected and offers Clear, as without Cloud Pro", () => {
     fixture.config = status({ provider: "jev", configured: true, enabled: true, jobs: { roomRouting: true } });
     const view = render();
@@ -232,7 +290,7 @@ describe("DecisionModelSettings", () => {
   it("maps every failure to a fixed sentence", () => {
     expect(deciderFailureText({ reason: "rejected" }, false, "jev")).toBe("Jev rejected this key. Check it at typesafe.ai.");
     expect(deciderFailureText({ reason: "overloaded" })).toBe("Jev is overloaded right now. Try again shortly.");
-    expect(deciderFailureText({ reason: "http_error", status: 500 })).toBe("Jev returned an unexpected error (HTTP 500).");
+    expect(deciderFailureText({ reason: "http_error", status: 500 })).toBe("Jev sent back an error (500). Try again in a moment.");
     expect(deciderFailureText({ reason: "something-new" })).toBe("The test did not finish. Try again.");
   });
 
@@ -376,6 +434,24 @@ describe("DecisionModelSettings", () => {
         expect(fixture.api).toHaveBeenCalledWith("/api/config", { method: "PUT", body: JSON.stringify({ decider: { enabled: true } }) });
       });
 
+      it("keeps a chosen Jev selected with Jev's key field, and saves a pasted Jev key in Jev's slot", async () => {
+        fixture.config = openrouter({ ...SHARED, chosen: "jev", enabled: true });
+        const view = render();
+        expect(view.provider!.props.value).toBe("jev");
+        expect(view.model).toBeUndefined();
+        expect(view.input.props["aria-label"]).toBe("Jev API key");
+        expect(view.input.props.placeholder).toBe("Paste your TypeSafe API key");
+        expect(view.html).toContain("Using your OpenRouter API key");
+        expect(view.html).toContain("https://typesafe.ai");
+        expect(view.html).not.toContain("Clear");
+        fixture.api.mockResolvedValueOnce(status({ provider: "jev", configured: true, enabled: true, jobs: { roomRouting: true } }));
+        type(view.input, KEY);
+        click(render().save);
+        await flush();
+        expect(fixture.api).toHaveBeenCalledWith("/api/config", { method: "PUT", body: JSON.stringify({ decider: { key: KEY } }) });
+        expect(render().provider!.props.value).toBe("jev");
+      });
+
       it("links to where the key is managed", () => {
         fixture.config = openrouter(SHARED);
         fixture.dispatch.mockReset();
@@ -439,15 +515,15 @@ describe("DecisionModelSettings", () => {
       const text = (result: { reason: string; status?: number }) => deciderFailureText(result, false, "openrouter");
       expect(text({ reason: "rejected", status: 401 })).toBe("OpenRouter rejected this key. Check it at openrouter.ai/keys.");
       expect(text({ reason: "http_error", status: 402 })).toBe("Your OpenRouter account is out of credits. Add some at openrouter.ai/credits.");
-      expect(text({ reason: "http_error", status: 500 })).toBe("OpenRouter returned an unexpected error (HTTP 500).");
+      expect(text({ reason: "http_error", status: 500 })).toBe("OpenRouter sent back an error (500). Try again in a moment.");
       expect(text({ reason: "rate_limited" })).toBe("OpenRouter is limiting requests right now. Try again in a moment.");
       expect(text({ reason: "overloaded" })).toBe("The model is overloaded right now. Try again shortly.");
-      expect(text({ reason: "malformed" })).toBe("The model sent an answer OpenMausBot could not read. Try another model.");
+      expect(text({ reason: "malformed" })).toBe("The model sent an answer MausBot could not read. Try another model.");
       expect(text({ reason: "unreachable" })).toBe("Could not reach OpenRouter. Check your connection.");
       expect(text({ reason: "timeout" })).toBe("OpenRouter did not answer in time. Try again.");
       expect(text({ reason: "no_key" })).toBe("Paste a key or save one first.");
       expect(text({ reason: "something-new" })).toBe("The test did not finish. Try again.");
-      expect(deciderFailureText({ reason: "http_error", status: 402 })).toBe("Jev returned an unexpected error (HTTP 402).");
+      expect(deciderFailureText({ reason: "http_error", status: 402 })).toBe("Jev sent back an error (402). Try again in a moment.");
     });
   });
 });

@@ -76,7 +76,7 @@ describe("setupSystemPrompt", () => {
   it("is the skill_manage-naming block when active with skills on", () => {
     const prompt = setupSystemPrompt(true, { skills: true, connectedApps: AVAILABLE });
     expect(prompt.startsWith("\n\n")).toBe(true);
-    for (const tool of ["propose_profile", "create_trigger", "skill_manage", "request_credential"]) {
+    for (const tool of ["propose_profile", "trigger", "skill_manage", "request_credential"]) {
       expect(prompt).toContain(tool);
     }
     expect(prompt).toContain("at most four questions");
@@ -87,7 +87,7 @@ describe("setupSystemPrompt", () => {
     for (const prompt of [setupSystemPrompt(true, { connectedApps: AVAILABLE }), setupSystemPrompt(true, { skills: false, connectedApps: AVAILABLE })]) {
       expect(prompt).not.toContain("skill_manage");
       expect(prompt).toContain("propose_profile");
-      expect(prompt).toContain("create_trigger");
+      expect(prompt).toContain("trigger for a schedule or webhook");
       expect(prompt).toContain("request_credential");
       expect(prompt).toContain("describe procedures plainly in your standing instructions");
     }
@@ -118,6 +118,18 @@ describe("setupSystemPrompt working-folder clause and result ordering", () => {
     expect(text).toContain("Full Access does not supply answers, credentials, or broader permissions for another bot");
     expect(text).not.toContain("each of which the user must confirm");
     expect(text).not.toContain("propose it paused");
+  });
+});
+
+describe("setupSystemPrompt for a Chief of Staff", () => {
+  it("tells a Chief to stay the Chief and add the job to what it already does", () => {
+    const chief = setupSystemPrompt(true, { chief: true, connectedApps: AVAILABLE });
+    expect(chief).toContain("You are also the Chief of Staff, and setting yourself up does not change that");
+    expect(chief).toContain("add this job to your standing instructions instead of replacing them");
+    for (const prompt of [setupSystemPrompt(true, { connectedApps: AVAILABLE }), setupSystemPrompt(true, { chief: false, connectedApps: AVAILABLE })]) {
+      expect(prompt).not.toContain("Chief of Staff");
+    }
+    expect(setupSystemPrompt(false, { chief: true, connectedApps: AVAILABLE })).toBe("");
   });
 });
 
@@ -170,10 +182,10 @@ describe("setupSystemPrompt connected apps", () => {
 
   it("says in one sentence where connected apps are set up when this OpenMausBot has none", () => {
     expect(prompt({ state: "not-configured", host: "server" })).toContain(
-      "Connected apps are not set up here, so you cannot connect an app such as Gmail yourself. If the job needs one, say so in one sentence: they are set up by adding a Composio project key in Settings → API keys, under Self-host connected apps.",
+      "Connected apps are not set up here, so you cannot connect an app such as Gmail yourself. If the job needs one, say so in one sentence: they are set up by adding a Composio project key in Settings → AI → Other services, under Self-host connected apps.",
     );
     expect(prompt({ state: "not-configured", host: "desktop" })).toContain(
-      "restarting OpenMausBot usually brings them back, or they can add their own Composio project key in Settings → API keys, under Self-host connected apps.",
+      "restarting OpenMausBot usually brings them back, or they can add their own Composio project key in Settings → AI → Other services, under Self-host connected apps.",
     );
     const cloud = prompt({ state: "not-configured", host: "cloud" });
     expect(cloud).toContain("Connected apps come with their MausBot Cloud plan but are not answering right now");

@@ -8,7 +8,7 @@ import type { BrowserLive } from "../browser-live.ts";
 import type { BrowserRuntime, BrowserSpawnSpec } from "../browser-runtime.ts";
 import type { StepContext } from "../browser-steps.ts";
 import type { FillLoginDeps } from "../login-fill.ts";
-import { LocalBackend } from "./backends.ts";
+import { LocalBackend, type Backend } from "./backends.ts";
 import { sandboxDisabled } from "./chrome/host-setup.ts";
 import type { HostKind } from "./chrome/flags.ts";
 import { ChromeLauncher } from "./chrome/launcher.ts";
@@ -16,6 +16,8 @@ import { ProcessRegistry, sweep } from "./chrome/processes.ts";
 import { browserRoot } from "./chrome/profile.ts";
 import { browserLanguage, browserTimeZone, languageList } from "./chrome/wrapper.ts";
 import { displayScreen } from "./display.ts";
+import { botReason, browserInputLog, pageAction, type BotReason, type BrowserInputLog } from "./input-log.ts";
+import type { PaneBackend } from "./pane/backend.ts";
 import type { Download } from "./cdp/downloads.ts";
 import { BrowserService, type BrowserTarget } from "./service.ts";
 import { LiveV1 } from "./viewers/live-v1.ts";
@@ -47,8 +49,17 @@ export interface ChromeEngineOptions {
   platform?: NodeJS.Platform;
   egressPort(key: string): Promise<number>;
   idleMs(): number;
+  held?(session: string): boolean;
   egressNotice(key: string): string | null;
+  language?(): string | undefined;
+  /** The desktop app's panes, used for a browser that starts while they are wanted and the app shows them. */
+  pane?: { backend: PaneBackend; wanted(): boolean };
   log?: (line: string) => void;
+}
+
+/** Each start of a profile's browser picks again, so turning the pane on or off takes effect at the next start. */
+export function backendFor(local: Backend, pane: ChromeEngineOptions["pane"]): Backend {
+  return pane && pane.wanted() && pane.backend.available ? pane.backend : local;
 }
 
 /** The new engine: one Chrome launcher (no agent-browser wrapper), the browser service, its live views and its sweep. */
@@ -69,10 +80,10 @@ export class ChromeEngine {
     const env = options.env ?? process.env;
     const platform = options.platform ?? process.platform;
     const sandbox = !sandboxDisabled(env);
-    this.launcher = new ChromeLauncher({ dataDir: options.dataDir, env, platform, engine: () => ({ managed: true }), wrapper: false, sandbox, ...(options.log ? { log: options.log } : {}) });
+    this.launcher = new ChromeLauncher({ dataDir: options.dataDir, env, platform, language: options.language, engine: () => ({ managed: true }), wrapper: false, sandbox, ...(options.log ? { log: options.log } : {}) });
     this.#registry = new ProcessRegistry(browserRoot(options.dataDir));
     let screen: ReturnType<typeof displayScreen> | null = null;
-    const locale = browserLanguage(env) ?? null;
+    const locale = () => browserLanguage(env, options.language?.()) ?? null;
     const backend = new LocalBackend({
       dataDir: options.dataDir,
       host: options.host,
@@ -82,20 +93,22 @@ export class ChromeEngine {
         return { path: binary.path, identity: { ...binary.identity, product: binary.product } };
       },
       screen: () => (screen ??= displayScreen(options.host, { platform, env })),
-      locale: () => locale,
-      acceptLanguages: () => languageList(locale ?? undefined),
+      locale,
+      acceptLanguages: () => languageList(locale() ?? undefined),
       timezone: () => browserTimeZone(env, platform) ?? null,
       egressPort: (key) => options.egressPort(key),
       registry: this.#registry,
       sandbox,
       ...(options.log ? { log: options.log } : {}),
     });
+    options.pane?.backend.fallBackTo(backend);
     const maxRunning = Number(env.OMB_BROWSER_MAX_RUNNING) || MAX_RUNNING[options.host];
     this.service = new BrowserService({
       dataDir: options.dataDir,
-      backend: () => backend,
+      backend: () => backendFor(backend, options.pane),
       maxRunning,
       idleMs: options.idleMs,
+      held: options.held,
       egressNotice: options.egressNotice,
       ...(options.log ? { log: options.log } : {}),
     });
@@ -156,9 +169,11 @@ export class ChromeEngine {
   /** A deleted bot's or profile's browser: stopped, and its folder, downloads and screenshots gone. */
   async erase(request: { kind: "bot" | "profile"; id: string; partitionId: string }): Promise<boolean> {
     const key = request.kind === "bot" ? `bot:${request.id}` : `shared:${request.partitionId}`;
-    if (!this.#everUsed()) return true;
+    const paneUsed = this.#options.pane?.backend.used(key) === true;
+    if (!this.#everUsed() && !paneUsed) return true;
     try {
       await this.service.erase(key);
+      if (paneUsed) this.#options.pane?.backend.erase(key);
       return true;
     } catch (error) {
       this.#options.log?.(`browser cleanup: could not erase ${key}: ${error instanceof Error ? error.message : String(error)}`);
@@ -182,31 +197,85 @@ export class ChromeEngine {
 
 export interface RuntimeRouterOptions {
   /** What a tool call is told instead of reaching either engine, or null to run it. */
-  refusal?(spec: BrowserSpawnSpec, params: unknown): string | null;
+  refusal?(session: string, spec: BrowserSpawnSpec, params: unknown): string | null;
+  /** Asked next, before an opt-in engine's tool call that may open the session's browser: what it is told while the server
+   * has no room to run one (a self-hosted server's pids limit), or null once it has. agent-browser's calls ask the same
+   * room through its BrowserRoom, after its count of browsers. */
+  room?(session: string, spec: BrowserSpawnSpec, params: unknown): Promise<string | null>;
+  /** Asked each time beforeDispatch ran, so after it claimed the session for this call's turn and before anything reaches
+   * the engine: what a refusal that depends on who is calling tells the call, or null to run it. */
+  afterClaim?(session: string, spec: BrowserSpawnSpec): string | null;
   /** A tool call's answer as the bot gets it, from either engine. */
   annotate?(spec: BrowserSpawnSpec, result: unknown): unknown;
+  /** The annotated answer, last, for what only the session's host knows about it. */
+  afterCall?(session: string, spec: BrowserSpawnSpec, result: unknown): unknown;
+  /** Where a page action that failed is counted; the server's own log when unset. */
+  inputLog?: BrowserInputLog;
 }
+
+const resultText = (result: unknown): string => {
+  const first = (result as { content?: Array<{ text?: unknown }> } | null)?.content?.[0]?.text;
+  return typeof first === "string" ? first : "";
+};
+
+/** afterClaim's refusal, thrown out of the engine's dispatch and answered as the call's result. */
+class ClaimRefused extends Error {}
 
 /** BrowserRuntime's API, each call going to the engine its session runs on. */
 export class RuntimeRouter {
   readonly #old: BrowserRuntime;
   readonly #chrome: ChromeEngine;
   readonly #refusal: RuntimeRouterOptions["refusal"];
+  readonly #room: RuntimeRouterOptions["room"];
+  readonly #afterClaim: RuntimeRouterOptions["afterClaim"];
   readonly #annotate: RuntimeRouterOptions["annotate"];
+  readonly #afterCall: RuntimeRouterOptions["afterCall"];
+  readonly #log: BrowserInputLog;
 
   constructor(old: BrowserRuntime, chrome: ChromeEngine, options: RuntimeRouterOptions = {}) {
+    this.#log = options.inputLog ?? browserInputLog;
     this.#old = old;
     this.#chrome = chrome;
     this.#refusal = options.refusal;
+    this.#room = options.room;
+    this.#afterClaim = options.afterClaim;
     this.#annotate = options.annotate;
+    this.#afterCall = options.afterCall;
   }
 
   async agentRpc(session: string, spec: BrowserSpawnSpec, method: "tools/list" | "tools/call", params: unknown, beforeDispatch?: () => void, ctx?: StepContext): Promise<unknown> {
-    const refusal = method === "tools/call" ? this.#refusal?.(spec, params) : null;
-    if (refusal) return { isError: true, content: [{ type: "text", text: refusal }] };
     const target = chromeTarget(session, spec);
-    const result = await (target ? this.#chrome.service.agentRpc(target, method, params, beforeDispatch) : this.#old.agentRpc(session, spec, method, params, beforeDispatch, ctx));
-    return method === "tools/call" && this.#annotate ? this.#annotate(spec, result) : result;
+    const action = method === "tools/call" ? pageAction((params as { name?: unknown } | null)?.name) : null;
+    const failed = (reason: BotReason) => {
+      if (action) this.#log.record({ who: "bot", reason, what: action, engine: target ? "chrome" : "agent-browser", transport: "tools", session });
+    };
+    const refuse = (text: string, reason: BotReason = botReason(text)) => {
+      failed(reason);
+      return { isError: true, content: [{ type: "text", text }] };
+    };
+    const refusal = method === "tools/call" ? this.#refusal?.(session, spec, params) : null;
+    if (refusal) return refuse(refusal);
+    const full = method === "tools/call" && target ? await this.#room?.(session, spec, params) : null;
+    if (full) return refuse(full, "no_room");
+    const afterClaim = method === "tools/call" ? this.#afterClaim : undefined;
+    const dispatch = afterClaim ? () => {
+      beforeDispatch?.();
+      const text = afterClaim(session, spec);
+      if (text) throw new ClaimRefused(text);
+    } : beforeDispatch;
+    let result: unknown;
+    try {
+      result = await (target ? this.#chrome.service.agentRpc(target, method, params, dispatch) : this.#old.agentRpc(session, spec, method, params, dispatch, ctx));
+    } catch (error) {
+      if (error instanceof ClaimRefused) return refuse(error.message);
+      const reason = botReason(error instanceof Error ? error.message : "");
+      failed(reason === "engine_error" ? "threw" : reason);
+      throw error;
+    }
+    if (method !== "tools/call") return result;
+    if ((result as { isError?: unknown } | null)?.isError === true) failed(botReason(resultText(result)));
+    const annotated = this.#annotate ? this.#annotate(spec, result) : result;
+    return this.#afterCall ? this.#afterCall(session, spec, annotated) : annotated;
   }
 
   previewFrame<T>(session: string, capture: () => Promise<T>, spec: { command: string; args?: readonly string[] }): Promise<T | { png: string; format: "jpeg" }> {
@@ -220,6 +289,10 @@ export class RuntimeRouter {
 
   heldBy(session: string): string | null {
     return this.#chrome.service.heldBy(session) ?? this.#old.heldBy(session);
+  }
+
+  working(session: string): boolean {
+    return this.#chrome.service.working(session) || this.#old.working(session);
   }
 
   interrupted(session: string): boolean {

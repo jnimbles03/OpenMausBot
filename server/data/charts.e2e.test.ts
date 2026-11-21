@@ -80,6 +80,48 @@ describe("charts end to end on DuckDB", () => {
     expect(new Set(reduced.rows.map((r) => r[1]))).toEqual(new Set(["web", "shop"]));
   });
 
+  it.each(["bar", "pie"] as const)("%s: keeps a real other category separate from the folded tail", async (type) => {
+    const table = `other_${type}`;
+    await connection.run(`CREATE TABLE ${table} AS
+      SELECT * FROM (VALUES ('other', 100), ('alpha', 90), (NULL, 1)) t(category, amount)`);
+    const { compiled, reduced } = await chart({ type, x: "category", y: "amount", limit: 1, sort: "x" }, table);
+    expect(reduced.rows.map(([x, y]) => [x, Number(y)])).toEqual([["other", 100], ["other (2)", 91]]);
+    const svg = await chartRenderer.svg(compiled.vegaLite, reduced.rows, reduced.columns, { theme: "light" });
+    expect(svg).toContain("other (2)");
+  });
+
+  it("uses a tail label distinct from every retained category, including numbered other names", async () => {
+    await connection.run(`CREATE TABLE numbered_other AS
+      SELECT * FROM (VALUES ('other', 100), ('other (2)', 90), ('other (3)', 80), ('tail', 10)) t(category, amount)`);
+    const { reduced } = await chart({ type: "bar", x: "category", y: "amount", limit: 3, sort: "x" }, "numbered_other");
+    expect(reduced.rows.map(([x, y]) => [x, Number(y)])).toEqual([
+      ["other", 100], ["other (2)", 90], ["other (3)", 80], ["other (4)", 10],
+    ]);
+  });
+
+  it("uses the same distinct tail label for every color series", async () => {
+    await connection.run(`CREATE TABLE colored_other AS
+      SELECT * FROM (VALUES ('other', 'web', 100), ('other', 'shop', 90), ('tail', 'web', 1), ('tail', 'shop', 2)) t(category, channel, amount)`);
+    const { reduced } = await chart({ type: "bar", x: "category", y: "amount", color: "channel", limit: 1 }, "colored_other");
+    expect(reduced.rows.map(([x, color, y]) => [x, color, Number(y)])).toEqual(expect.arrayContaining([
+      ["other", "web", 100], ["other", "shop", 90], ["other (2)", "web", 1], ["other (2)", "shop", 2],
+    ]));
+    expect(reduced.rows).toHaveLength(4);
+  });
+
+  it("aggregates the raw tail rows after choosing a distinct label", async () => {
+    await connection.run(`CREATE TABLE averaged_other AS
+      SELECT * FROM (VALUES ('other', 100), ('a', 1), ('b', 3), ('b', 5)) t(category, amount)`);
+    const { reduced } = await chart({ type: "pie", x: "category", y: "amount", agg: "avg", limit: 1, sort: "x" }, "averaged_other");
+    expect(reduced.rows.map(([x, y]) => [x, Number(y)])).toEqual([["other", 100], ["other (2)", 3]]);
+  });
+
+  it("does not invent a tail when the only category is named other", async () => {
+    await connection.run(`CREATE TABLE only_other AS SELECT 'other' AS category, 100 AS amount`);
+    const { reduced } = await chart({ type: "pie", x: "category", y: "amount", limit: 1 }, "only_other");
+    expect(reduced.rows.map(([x, y]) => [x, Number(y)])).toEqual([["other", 100]]);
+  });
+
   it("line: picks hour buckets for a 3.5-day range, day buckets for a 400-day one", async () => {
     const hours = await chart({ type: "line", x: "ts", y: "amount", agg: "avg" }, "sales");
     expect(hours.compiled.reduction.method).toBe("timeBucket");
@@ -96,6 +138,42 @@ describe("charts end to end on DuckDB", () => {
     const svg = await chartRenderer.svg(hours.compiled.vegaLite, hours.reduced.rows, hours.reduced.columns, { theme: "dark" });
     expect(svg).toContain("<svg");
     expect(svg).toContain(">avg(amount)</text>");
+  });
+
+  it("a stacked bar over weekly dates draws one full-width column per week, stacked from the baseline", async () => {
+    await connection.run(`CREATE TABLE weekly AS
+      SELECT (DATE '2026-08-31' + INTERVAL (w * 7) DAY)::DATE AS week, plan, CAST((w + 1) * mult AS DOUBLE) AS revenue
+      FROM range(8) r(w), (VALUES ('Max', 300), ('Pro', 200), ('Starter', 100)) p(plan, mult)`);
+    const { compiled, reduced } = await chart({ type: "bar", x: "week", y: "revenue", color: "plan", stack: true }, "weekly");
+    expect(reduced.rows).toHaveLength(24);
+    const day = 86_400_000;
+    // A DATE comes back as "2026-08-31" and the bucket end as a TIMESTAMP: read both as local wall-clock time.
+    const at = (cell: Cell) => Date.parse(String(cell).length === 10 ? `${String(cell)}T00:00:00` : String(cell).replace(" ", "T"));
+    for (const [x, x2] of reduced.rows) expect(at(x2!) - at(x!)).toBe(7 * day);
+    const svg = await chartRenderer.svg(compiled.vegaLite, reduced.rows, reduced.columns, { theme: "light", width: 640 });
+    const bars = [...svg.matchAll(/aria-roledescription="bar" d="M([\d.]+),([\d.]+)h([\d.]+)v([\d.]+)/g)]
+      .map((m) => ({ x: Number(m[1]), y: Number(m[2]), w: Number(m[3]), h: Number(m[4]) }));
+    expect(bars).toHaveLength(24);
+    const left = Math.min(...bars.map((bar) => bar.x));
+    const right = Math.max(...bars.map((bar) => bar.x + bar.w));
+    for (const bar of bars) expect(bar.w).toBeGreaterThan(((right - left) / 8) * 0.9);
+    const columns = new Map<number, typeof bars>();
+    for (const bar of bars) columns.set(bar.x, [...(columns.get(bar.x) ?? []), bar]);
+    expect(columns.size).toBe(8);
+    const baselines = new Set<number>();
+    for (const segments of columns.values()) {
+      const ordered = [...segments].sort((a, b) => a.y - b.y);
+      for (let i = 1; i < ordered.length; i += 1) expect(ordered[i]!.y).toBeCloseTo(ordered[i - 1]!.y + ordered[i - 1]!.h, 3);
+      baselines.add(Math.round(ordered.at(-1)!.y + ordered.at(-1)!.h));
+    }
+    expect(baselines.size).toBe(1);
+    expect(svg).toContain(">Sep 7</text>");
+  });
+
+  it("a whole-number x draws one bar per value", async () => {
+    await connection.run(`CREATE TABLE weeks AS SELECT 36 + i AS week_no, CAST(i * 10 AS DOUBLE) AS revenue FROM range(9) r(i)`);
+    const { reduced } = await chart({ type: "bar", x: "week_no", y: "revenue" }, "weeks");
+    expect(reduced.rows.map((r) => [Number(r[0]), Number(r[1])])).toEqual(Array.from({ length: 9 }, (_, i) => [36 + i, 37 + i]));
   });
 
   it("line of a raw series: M4 keeps at most four points per pixel column and every extreme", async () => {

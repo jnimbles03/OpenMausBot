@@ -26,3 +26,21 @@ export declare function acquireDataDirLeaseForProcess(
   dataDir: string,
   environment?: NodeJS.ProcessEnv | Record<string, string | undefined>,
 ): OwnedDataDirLease | DelegatedDataDirLease;
+
+export declare function clearRecordsFromOtherMachines(
+  dataDir: string,
+): { path: string; host: string; pid: number }[];
+
+export declare function macMountIsLocal(dfOutput: string, mountTable: string): boolean;
+
+export declare function inMacSyncedFolder(path: string, home: string): boolean;
+
+export declare function clearRecordsFromEarlierRunOfThisContainer(
+  dataDir: string,
+): { path: string; host: string; pid: number }[];
+
+export type DataDirLeaseHolder =
+  | { state: "none" | "invalid"; path: string }
+  | { state: "alive" | "dead" | "other-machine"; path: string; pid: number; host: string; createdAt: number };
+
+export declare function describeDataDirLease(dataDir: string): DataDirLeaseHolder;

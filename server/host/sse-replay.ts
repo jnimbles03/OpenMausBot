@@ -1,9 +1,15 @@
+import type { BotFrameForm } from "./bot-frames.ts";
+
 export interface ReplayFrame {
   seq: number;
   kind: string;
   frame: string | null;
   clientFrame: string | null;
   payload: Record<string, unknown> | null;
+  /** Only this person's streams get it (a Team Cloud's room as they read it). */
+  person?: string;
+  /** Only streams that take this form of bot frame get it. */
+  frames?: BotFrameForm;
 }
 
 export const REPLAY_MAX_FRAMES = 500;

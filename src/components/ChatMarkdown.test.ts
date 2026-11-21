@@ -26,10 +26,19 @@ import {
 } from "./ChatMarkdown";
 import { getSnippetFileName, parseFenceInfo } from "@/lib/code-block";
 import { markdownImageName, markdownImageOpenUrl } from "@/lib/markdown-image";
-import { StoreProvider } from "@/state/store";
+import { BotEditorStore, initialState, StoreProvider } from "@/state/store";
 import { setLocale } from "@/lib/i18n";
 import { ThreadRefsContext } from "./ThreadRefs";
 import * as AttachmentPreview from "./AttachmentPreview";
+import { messageReferencesFile } from "../../server/message-file";
+
+// Most of this file pins Advanced mode's chrome; the Simple code block has its own tests below.
+const mode = vi.hoisted(() => ({ advanced: true }));
+vi.mock("@/lib/interface-mode", async (importOriginal) => ({
+  ...await importOriginal<typeof import("@/lib/interface-mode")>(),
+  useAdvancedMode: () => mode.advanced,
+  readAdvancedMode: () => mode.advanced,
+}));
 
 vi.mock("react", async (importOriginal) => {
   const react = await importOriginal<typeof React>();
@@ -50,6 +59,28 @@ vi.mock("shiki/core", () => ({
 vi.mock("shiki/engine/javascript", () => ({
   createJavaScriptRegexEngine: () => ({}),
 }));
+// These tests pin how a block is coloured, not when: without an observer a block counts as near the screen at once.
+// Tests below undo every stubbed global, so the observer is deleted instead.
+delete (globalThis as { IntersectionObserver?: unknown }).IntersectionObserver;
+
+describe("soft line breaks", () => {
+  it("keeps a reply's single line breaks as line breaks, outside code", () => {
+    const html = renderToStaticMarkup(createElement(ChatMarkdown, { text: "1\n2\n3\n\n`a`\nb\n\n```\nx\ny\n```" }));
+    expect(html).toContain('<p dir="ltr">1<br/>\n2<br/>\n3</p>');
+    expect(html).toMatch(/>a<\/code><br\/>\nb<\/p>/);
+    expect(html).toContain(">x\ny</pre>");
+  });
+});
+
+describe("spoilers", () => {
+  it("hides only double-tilde spans, not text between ranges written with a single tilde", () => {
+    const ranges = renderToStaticMarkup(createElement(ChatMarkdown, { text: "Episodes 77~82 first, then 77~80." }));
+    expect(ranges).not.toContain("Reveal spoiler");
+    expect(ranges).toContain("Episodes 77~82 first, then 77~80.");
+    const spoiler = renderToStaticMarkup(createElement(ChatMarkdown, { text: "The answer is ~~42~~." }));
+    expect(spoiler).toContain("Reveal spoiler");
+  });
+});
 
 describe("mention highlighting", () => {
   const mentionPeers = [{ name: "Atlas" }, { name: "調査担当" }];
@@ -322,7 +353,7 @@ describe("repaired tables", () => {
     const html = renderToStaticMarkup(createElement(ChatMarkdown, {
       text: "Pros | Cons\n---\n\n| a \\| b | c |\n| --- | --- |\n| 1 | 2 |",
     }));
-    expect(html).toContain('font-semibold">Pros | Cons</div>');
+    expect(html).toContain('tracking-[-0.005em]">Pros | Cons</div>');
     expect(html.match(/<table\b/g)).toHaveLength(1);
     expect(html).toContain(">a | b</span>");
     expect(html.match(/<th\b/g)).toHaveLength(2);
@@ -525,7 +556,7 @@ describe("#Title thread links in markdown", () => {
     const markup = render("`#QA PR 245` in code, [#QA PR 245](https://example.test) as a link, #123 an issue\n\n# QA PR 245\n\nplain");
     expect(markup).not.toContain("data-thread-link");
     expect(markup).toContain("<code");
-    expect(markup).toContain('font-semibold">QA PR 245</div>');
+    expect(markup).toContain('tracking-[-0.01em]">QA PR 245</div>');
   });
 
   it("does nothing without any visible threads", () => {
@@ -547,6 +578,123 @@ describe("#Title thread links in markdown", () => {
     expect(markup).not.toContain("data-thread-link");
     expect(markup).not.toContain('href="openmausbot://');
     expect(markup).not.toContain('target="_blank"');
+  });
+});
+
+describe("a Use my Mac link in an older bot message", () => {
+  const text = "To let me use your apps, press [Use my Mac](openmausbot://use-my-computer).";
+
+  it("is plain text everywhere, even in this app with an older Cloud's bridge: this computer is lent by itself", () => {
+    const offer = vi.fn(async () => {});
+    window.ogb = { platform: "darwin", cloudLending: { open: async () => {}, offer } } as unknown as typeof window.ogb;
+    try {
+      const markup = renderToStaticMarkup(createElement(ChatMarkdown, { text }));
+      expect(markup).toContain(">Use my Mac<");
+      expect(markup).not.toContain("<button");
+      expect(markup).not.toContain('href="openmausbot://');
+      expect(offer).not.toHaveBeenCalled();
+    } finally {
+      delete window.ogb;
+    }
+    expect(chatUrlTransform("openmausbot://use-my-computer")).toBe("openmausbot://use-my-computer");
+  });
+});
+
+describe("application and rejected Markdown links", () => {
+  it.each([
+    ["[Open Chief](obsidian://open?vault=botbrain&file=agents%2Fchief)", "obsidian://open?vault=botbrain&file=agents%2Fchief"],
+    ["[Open Chief](OBSIDIAN://open?vault=botbrain&file=agents%2fchief)", "OBSIDIAN://open?vault=botbrain&file=agents%2fchief"],
+    ["[Open Chief](ObSiDiAn://open?vault=Bot%20Brain&file=agents%2FChief%20Notes%23Inbox)", "ObSiDiAn://open?vault=Bot%20Brain&file=agents%2FChief%20Notes%23Inbox"],
+    ["[Open Chief](obsidian&#58;//open?vault=botbrain&amp;file=agents%2Fchief)", "obsidian://open?vault=botbrain&file=agents%2Fchief"],
+    ["[Open Chief][chief]\n\n[chief]: obsidian://open?vault=botbrain&file=agents%2Fchief", "obsidian://open?vault=botbrain&file=agents%2Fchief"],
+    ["<obsidian://open?vault=botbrain&file=agents%2Fchief>", "obsidian://open?vault=botbrain&file=agents%2Fchief"],
+  ])("preserves an Obsidian destination through the real Markdown renderer: %s", (text, destination) => {
+    const host = document.createElement("div");
+    host.innerHTML = renderToStaticMarkup(createElement(ChatMarkdown, { text }));
+    const link = host.querySelector("a");
+    expect(link?.getAttribute("href")).toBe(destination);
+    expect(link?.target).toBe("_blank");
+    expect(link?.rel).toBe("noreferrer");
+    expect(host.querySelectorAll("a")).toHaveLength(1);
+  });
+
+  it.each([
+    "",
+    "   ",
+    "javascript:alert(1)",
+    "JaVaScRiPt:alert(1)",
+    "javascript&#58;alert(1)",
+    "java&#x09;script:alert(1)",
+    "java&#x0a;script:alert(1)",
+    "data:text/html;base64,PHNjcmlwdD4=",
+    "vbscript:msgbox(1)",
+    "blob:https://example.test/123",
+    "shell:calc.exe",
+    "powershell:command",
+    "unlisted-app://open",
+    "obsidianx://open",
+  ])("keeps rejected or empty destinations as formatted text without a clickable link: %s", (destination) => {
+    const host = document.createElement("div");
+    host.innerHTML = renderToStaticMarkup(createElement(ChatMarkdown, { text: `[**Blocked**](${destination})` }));
+    expect(host.querySelector("strong")?.textContent).toBe("Blocked");
+    expect(host.querySelector("a, button, [role='link']")).toBeNull();
+  });
+
+  it("does not allow application URIs as image sources", () => {
+    const host = document.createElement("div");
+    host.innerHTML = renderToStaticMarkup(createElement(ChatMarkdown, {
+      text: "![Note](obsidian://open?vault=botbrain&file=agents%2Fchief)",
+    }));
+    expect(host.querySelector("img, a, button")).toBeNull();
+    expect(host.querySelector('[role="alert"]')?.textContent).toBe("Image unavailable");
+  });
+});
+
+describe("a bot's link to a page it published", () => {
+  const PAGE = "https://abcdefghijklmnopqrstuvwxyz.mausbot.page/";
+  const text = `Here is your dashboard: [Sales dashboard](${PAGE})`;
+  async function clickPage(store?: Parameters<typeof BotEditorStore>[0]["value"]) {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    try {
+      const markdown = createElement(ChatMarkdown, { text });
+      await act(async () => root.render(store ? createElement(BotEditorStore, { value: store, children: markdown }) : markdown));
+      const link = host.querySelector<HTMLAnchorElement>(`a[href="${PAGE}"]`)!;
+      expect(link.textContent).toBe("Sales dashboard");
+      const click = new MouseEvent("click", { bubbles: true, cancelable: true });
+      await act(async () => { link.dispatchEvent(click); });
+      return click;
+    } finally {
+      await act(async () => root.unmount());
+      host.remove();
+    }
+  }
+
+  it("in the desktop app, opens like the card's Open: in the bot's browser panel, never as a message", async () => {
+    const openExternal = vi.fn(async () => {});
+    window.ogb = { platform: "darwin", openExternal } as unknown as typeof window.ogb;
+    const dispatch = vi.fn();
+    try {
+      const state = { ...initialState, selectedId: "pepper", bots: [{ id: "pepper" }], config: { features: { browser: true }, browserEngine: { kind: "engine" } } };
+      const click = await clickPage({ state, dispatch, flushBotPatches: async () => null, refreshInstances: async () => {}, refreshModels: async () => {} } as never);
+      expect(click.defaultPrevented).toBe(true);
+      expect(dispatch.mock.calls).toEqual([[{ type: "toggleComputer", open: true }]]);
+      expect(openExternal).not.toHaveBeenCalled();
+    } finally {
+      delete window.ogb;
+    }
+  });
+
+  it("elsewhere, opens it outside the chat, as any web link", async () => {
+    const opened = vi.spyOn(window, "open").mockReturnValue(null);
+    try {
+      const click = await clickPage();
+      expect(click.defaultPrevented).toBe(true);
+      expect(opened).toHaveBeenCalledWith(PAGE, "_blank", "noopener,noreferrer");
+    } finally {
+      opened.mockRestore();
+    }
   });
 });
 
@@ -621,7 +769,7 @@ describe("ChatMarkdown attachments", () => {
       text: "[macOS](file:///Users/milind/report.md) [Windows](C:/Users/Maus/report.md)",
       message: { threadId: "thread-1", messageId: "message-1" },
     }));
-    expect(html).toContain('title="Save a copy"');
+    expect(html).toContain('title="Preview: report.md"');
     expect(html).not.toContain("/Users/milind/report.md");
     expect(html).not.toContain("C:/Users/Maus/report.md");
   });
@@ -663,7 +811,7 @@ describe("ChatMarkdown attachments", () => {
         text: "[Report](C:\\Users\\Maus\\.openmausbot\\report.md)\n\n![Chart](C:\\Users\\Maus\\.openmausbot\\chart.png)",
         message: { threadId: "thread-1", messageId: "message-1" },
       }));
-      expect(html).toContain('title="Save a copy"');
+      expect(html).toContain('title="Preview: report.md"');
       expect(html).not.toContain('href=""');
       expect(html).not.toContain("Image unavailable");
       expect(save.mock.calls[0]?.[0]).toBe("C:\\Users\\Maus\\.openmausbot\\report.md");
@@ -672,6 +820,32 @@ describe("ChatMarkdown attachments", () => {
       save.mockRestore();
       preview.mockRestore();
     }
+  });
+
+  it("names a linked page by its real file name, not its percent-encoded spelling", () => {
+    const filePath = String.raw`C:\Users\Maus\Downloads\2026 AI视频分析报告.html`;
+    for (const text of [`[报告](<${filePath}>)`, "已保存到 `" + filePath + "`", "[报告](file:///C:/Users/Maus/Downloads/2026%20AI%E8%A7%86%E9%A2%91%E5%88%86%E6%9E%90%E6%8A%A5%E5%91%8A.html)"]) {
+      const html = renderToStaticMarkup(createElement(ChatMarkdown, { text, message: { threadId: "thread-1", messageId: "message-1" } }));
+      expect(html).toContain('title="Preview page: 2026 AI视频分析报告.html"');
+      expect(html).toContain('aria-label="Save a copy of 2026 AI视频分析报告.html"');
+      expect(html).not.toContain("%E8");
+    }
+  });
+
+  it("decodes a linked name once: a literal %25 in a file:// link stays as written", () => {
+    const html = renderToStaticMarkup(createElement(ChatMarkdown, {
+      text: "[Report](file:///Users/maus/100%2541%20report.html)", message: { threadId: "thread-1", messageId: "message-1" },
+    }));
+    expect(html).toContain('title="Preview page: 100%41 report.html"');
+  });
+
+  it("names a delivered copy by its literal file name, without decoding it", () => {
+    const html = renderToStaticMarkup(createElement(ChatMarkdown, {
+      text: "[Report](/old/100%41.html)", message: { threadId: "thread-1", messageId: "message-1" },
+      delivered: { "100%41.html": "/store/delivered-100.html" },
+    }));
+    expect(html).toContain('title="Preview page: 100%41.html"');
+    expect(html).not.toContain("100A.html");
   });
 
   it("preserves dollar signs in Windows file destinations", () => {
@@ -685,6 +859,34 @@ describe("ChatMarkdown attachments", () => {
     } finally {
       save.mockRestore();
     }
+  });
+
+  it("links a path written as plain text, and the server authorizes the very path the link asks for", () => {
+    const cases: Array<[string, string]> = [
+      ["I saved the report to /Users/maus/reports/q3.md, have a look.", "/Users/maus/reports/q3.md"],
+      ["It's in `/Users/maus/My Reports/q3 final.md`.", "/Users/maus/My Reports/q3 final.md"],
+      [String.raw`Written to C:\Users\Maus\.openmausbot\report.md.`, String.raw`C:\Users\Maus\.openmausbot\report.md`],
+      [String.raw`It's on \\fileserver\team\plans\roadmap.docx now.`, String.raw`\\fileserver\team\plans\roadmap.docx`],
+      [String.raw`Saved /tmp/out/my\_notes.md`, "/tmp/out/my_notes.md"],
+    ];
+    for (const [text, expected] of cases) {
+      const save = vi.spyOn(AttachmentPreview, "useLocalFileSave");
+      try {
+        renderToStaticMarkup(createElement(ChatMarkdown, { text, message: { threadId: "thread-1", messageId: "message-1" } }));
+        const requested = save.mock.calls[0]?.[0];
+        // Spaces travel percent-encoded, as in any Markdown link, and the server decodes them once.
+        expect(requested!.replace(/%20/g, " ")).toBe(expected);
+        expect(messageReferencesFile(text, requested!)).toBe(true);
+      } finally {
+        save.mockRestore();
+      }
+    }
+  });
+
+  it("does not authorize a path the message never rendered as a link", () => {
+    expect(messageReferencesFile("Use and/or here, or /etc alone.", "/etc")).toBe(false);
+    expect(messageReferencesFile("```\ncat /Users/maus/notes.md\n```", "/Users/maus/notes.md")).toBe(false);
+    expect(messageReferencesFile(String.raw`On \\fileserver\team\a.md`, String.raw`\fileserver\team\a.md`.slice(1))).toBe(false);
   });
 
   it("keeps an unscoped legacy file link inert", () => {
@@ -704,6 +906,7 @@ describe("ChatMarkdown attachments", () => {
       reason: "",
       savedTo: "",
       outsideWorkspace: false,
+      retryable: false,
       folder: {
         name: "04_post",
         entries: [{ name: "cover.png", bytes: 2048, mime: "image/png" }],
@@ -731,6 +934,7 @@ describe("ChatMarkdown attachments", () => {
         reason: "the linked file is outside this conversation's workspace",
         savedTo: "",
         outsideWorkspace,
+        retryable: !outsideWorkspace,
         folder: null,
         save: vi.fn(async () => undefined),
       });
@@ -776,6 +980,57 @@ describe("ChatMarkdown attachments", () => {
 
     it("shows the path in a browser, which has no desktop bridge", () => {
       expect(render(true)).toContain(`>${filePath}</code>`);
+    });
+
+    describe("a backticked folder path with a space", () => {
+      const folder = "D:\\Claude Works\\v3\\";
+      const text = `The videos are in \`${folder}\``;
+      const outsideSave = () => vi.spyOn(AttachmentPreview, "useLocalFileSave").mockReturnValue({
+        state: "failed", reason: "", savedTo: "", outsideWorkspace: true, retryable: false, folder: null,
+        save: vi.fn(async () => undefined),
+      });
+
+      it("shows the real path in a browser, not the link's %20 spelling", () => {
+        const save = outsideSave();
+        try {
+          const html = renderToStaticMarkup(createElement(ChatMarkdown, { text, message: { threadId: "thread-1", messageId: "message-1" } }));
+          expect(html).toContain(`>${folder}</code>`);
+          expect(html).not.toContain("%20");
+        } finally {
+          save.mockRestore();
+        }
+      });
+
+      it("keeps a # or an escape in a file:// link's already-decoded path", () => {
+        const save = outsideSave();
+        try {
+          const html = renderToStaticMarkup(createElement(ChatMarkdown, { text: "[report](file:///tmp/Reports%23Final/100%2520x/)", message: { threadId: "thread-1", messageId: "message-1" } }));
+          expect(html).toContain(">/tmp/Reports#Final/100%20x/</code>");
+        } finally {
+          save.mockRestore();
+        }
+      });
+
+      it("asks the desktop app to show the real folder", async () => {
+        const save = outsideSave();
+        const ogb = (window as { ogb?: unknown }).ogb;
+        const reveal = vi.fn(async () => "shown" as const);
+        (window as { ogb?: unknown }).ogb = { revealInFolder: reveal, remoteClient: { active: false } };
+        const host = document.createElement("div");
+        document.body.append(host);
+        const root = createRoot(host);
+        try {
+          await act(async () => root.render(createElement(ChatMarkdown, { text, message: { threadId: "thread-1", messageId: "message-1" } })));
+          const show = [...host.querySelectorAll("button")].find((button) => button.textContent === "Show in folder")!;
+          await act(async () => show.click());
+          expect(reveal).toHaveBeenCalledWith(folder);
+        } finally {
+          await act(async () => root.unmount());
+          host.remove();
+          (window as { ogb?: unknown }).ogb = ogb;
+          save.mockRestore();
+        }
+      });
     });
 
     it("leaves other failures alone", () => {
@@ -1035,7 +1290,68 @@ describe("a fence's wrap directive", () => {
 describe("bidi: message content carries its own direction", () => {
   const ARABIC = "مرحبا بالعالم";
 
-  it("reads direction from the first strong letter, ignoring weak characters", () => {
+  it("goes with the script that has more words, so an Arabic answer opening on a Latin name stays right-to-left", () => {
+    expect(textDirection("Chrome 158 هو الإصدار الأحدث من المتصفح")).toBe("rtl");
+    expect(textDirection("Node.js بيئة تشغيل لجافاسكريبت على الخادم")).toBe("rtl");
+    expect(textDirection("OpenMausBot v0.1.169 صدر في 2026-11-18 مع إصلاحات كثيرة")).toBe("rtl");
+    expect(textDirection("The Arabic word مرحبا means hello")).toBe("ltr");
+    expect(textDirection("שלום is how you say hello in Hebrew, among other things")).toBe("ltr");
+  });
+
+  it("does not count a bare address, which is Latin in any language", () => {
+    expect(textDirection("راجع https://github.com/milind-soni/OpenMausBot/issues/6541 للتفاصيل")).toBe("rtl");
+    expect(textDirection("https://openmausbot.com/download هو رابط التحميل الرسمي")).toBe("rtl");
+    expect(textDirection("انظر www.example.com/a/very/long/path/to/the/release/notes هنا")).toBe("rtl");
+    expect(textDirection("https://example.com/page")).toBe("ltr");
+  });
+
+  it("keeps an Arabic sentence right-to-left when it holds long technical Latin tokens", () => {
+    expect(textDirection("شغّل pnpm install --frozen-lockfile بعدين")).toBe("rtl");
+    expect(textDirection("استخدم TypeScriptLanguageServer")).toBe("rtl");
+    expect(textDirection("راجع pnpm.io/installation/and/more/details/here للتفاصيل")).toBe("rtl");
+  });
+
+  it("keeps an English sentence left-to-right when it holds an Arabic name", () => {
+    expect(textDirection("Meeting with محمد عبد الرحمن at 5")).toBe("ltr");
+    expect(textDirection("Set process.env.NODE_ENV in config.ts for مرحبا")).toBe("ltr");
+  });
+
+  it("counts a word that ends a sentence, and still skips a dotted technical token", () => {
+    expect(textDirection("Hello. Welcome. مرحبا")).toBe("ltr");
+    expect(textDirection("Done! Thanks, really? مرحبا بك")).toBe("ltr");
+    expect(textDirection("افتح config.ts. ثم احفظ")).toBe("rtl");
+  });
+
+  it("does not count digits as words, Arabic-Indic ones included", () => {
+    expect(textDirection("١٢٣ hello")).toBe("ltr");
+    expect(textDirection("١٢٣ مرحبا")).toBe("rtl");
+    expect(textDirection("٤٥٦ ٧٨٩ hello world")).toBe("ltr");
+  });
+
+  it("does not let an address swallow the RTL text glued to it", () => {
+    expect(textDirection("API https://x.io/aوالتفاصيل هنا")).toBe("rtl");
+    expect(textDirection("التوثيق (https://pnpm.io/installation) فيه كل التفاصيل")).toBe("rtl");
+    expect(textDirection("مرحبا welcome https://example.com،والتفاصيل")).toBe("rtl");
+  });
+
+  it("keeps a link label and the Arabic prose right after it apart when judging the block", () => {
+    const html = renderToStaticMarkup(createElement(ChatMarkdown, {
+      text: "مرحبا welcome [https://example.com](https://example.com)،والتفاصيل",
+    }));
+    expect(html).toMatch(/<p dir="rtl"/);
+  });
+
+  it("gives a list whose items open on Latin names the direction of its text", () => {
+    const html = renderToStaticMarkup(createElement(ChatMarkdown, {
+      text: [
+        "- **Chrome**: متصفح من جوجل يعمل على كل الأنظمة",
+        "- **Firefox**: متصفح مفتوح المصدر من موزيلا",
+      ].join("\n"),
+    }));
+    expect(html).toMatch(/<ul dir="rtl"/);
+  });
+
+  it("breaks a tie with the first strong letter, ignoring weak characters", () => {
     expect(textDirection("مرحبا")).toBe("rtl");
     expect(textDirection("hello")).toBe("ltr");
     expect(textDirection("")).toBe("ltr");
@@ -1074,7 +1390,7 @@ describe("bidi: message content carries its own direction", () => {
       ].join("\n"),
     }));
 
-    expect(html).toContain('<div dir="rtl" class="mt-2 text-[16px] font-semibold">');
+    expect(html).toContain('<div dir="rtl" class="md-heading mt-3 text-[20px] font-semibold leading-[26px] tracking-[-0.01em]">');
     expect(html).toContain('<p dir="rtl">');
     expect(html).toContain('<p dir="ltr">An English paragraph');
     expect(html).toContain('<blockquote dir="rtl"');
@@ -1226,4 +1542,61 @@ it("renders mermaid strictly and serves repeat views from cache", async () => {
     effect.mockImplementation(originalUseEffect);
     vi.doUnmock("mermaid");
   }
+});
+
+describe("Simple mode's code block", () => {
+  const simple = (render: () => string) => {
+    mode.advanced = false;
+    try { return render(); } finally { mode.advanced = true; }
+  };
+
+  it("drops the header bar for a quiet surface, with Copy and a ⋯ menu on a hover plate", () => {
+    const html = simple(() => renderToStaticMarkup(createElement(CodeBlock, { code: "const a = 1;", lang: "js" })));
+    expect(html).toMatch(/class="chat-code-block group\/code relative my-2\.5 overflow-hidden rounded-xl bg-ink\/\[0\.04\]"/);
+    expect(html).not.toContain("border-hairline");
+    expect(html).not.toContain('aria-label="Wrap long lines"');
+    const plate = html.match(/<div data-code-plate="[^"]*" class="([^"]*)"/)?.[1] ?? "";
+    expect(plate.split(" ")).toEqual(expect.arrayContaining(["opacity-0", "group-hover/code:opacity-100", "focus-within:opacity-100", "touch:opacity-100"]));
+    expect(html).toContain('aria-label="Copy code"');
+    expect(html).toContain('aria-label="More"');
+    // A finger-sized target on touch screens, and a ring on the menu's button for the keyboard.
+    expect(html.match(/<button[^>]*aria-label="Copy code"[^>]*>/)?.[0]).toContain("touch:size-11");
+    expect(html.match(/<button[^>]*aria-label="More"[^>]*>/)?.[0]).toContain("focus-visible:ring-2");
+    expect(html).toMatch(/<pre class="[^"]*leading-5 px-3 py-2 text-ink-secondary/);
+  });
+
+  it("gives a diagram the same plate instead of its header", () => {
+    const html = simple(() => renderToStaticMarkup(createElement(ChatMarkdown, { text: "```mermaid\ngraph TD; A-->B\n```" })));
+    expect(html).toContain("data-code-plate");
+    expect(html).toContain('aria-label="Copy diagram source"');
+    expect(html).not.toContain('title="Mermaid diagram"');
+  });
+});
+
+describe("a code block far from the screen", () => {
+  it("stays plain until it comes near the screen, then is coloured", async () => {
+    let report: IntersectionObserverCallback | undefined;
+    (globalThis as { IntersectionObserver?: unknown }).IntersectionObserver = class {
+      constructor(callback: IntersectionObserverCallback) { report = callback; }
+      observe() {}
+      unobserve() {}
+    };
+    shiki.codeToHtml.mockReset();
+    shiki.codeToHtml.mockImplementation(async (code: string) => `<pre class="near-probe">${code}</pre>`);
+    const host = document.createElement("div");
+    document.body.append(host);
+    const root = createRoot(host);
+    try {
+      await act(async () => root.render(createElement(ChatMarkdown, { text: "```ts\nconst farAway = 1;\n```" })));
+      expect(shiki.codeToHtml).not.toHaveBeenCalled();
+      expect(host.textContent).toContain("const farAway = 1;");
+      await act(async () => report!([{ target: host.querySelector(".chat-code-block")!, isIntersecting: true } as IntersectionObserverEntry], {} as IntersectionObserver));
+      await vi.waitFor(() => expect(host.querySelector(".near-probe")?.textContent).toBe("const farAway = 1;"));
+    } finally {
+      await act(async () => root.unmount());
+      host.remove();
+      delete (globalThis as { IntersectionObserver?: unknown }).IntersectionObserver;
+      shiki.codeToHtml.mockReset();
+    }
+  });
 });

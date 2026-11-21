@@ -1,13 +1,15 @@
 // A macOS app launched from Finder inherits a bare PATH (no ~/.local/bin, /opt/homebrew/bin or nvm/volta/asdf shims),
 // so every agent CLI spawn goes through augmentedPath().
-import { execFile } from "node:child_process";
+import { spawn } from "node:child_process";
 import { closeSync, existsSync, openSync, readFileSync, readSync, statSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, delimiter, dirname, extname, join } from "node:path";
+import { homeProgramsDistrusted, serverMayRunFrom } from "./bot-box/program-trust.ts";
+import { resolvePortableHermes } from "./portable-hermes.ts";
 
-function nvmBinDirs(): string[] {
+function nvmBinDirs(home: string): string[] {
   try {
-    const base = join(homedir(), ".nvm", "versions", "node");
+    const base = join(home, ".nvm", "versions", "node");
     return readdirSync(base)
       .filter((v) => v.startsWith("v"))
       .sort((a, b) => b.localeCompare(a, undefined, { numeric: true }))
@@ -22,8 +24,7 @@ export function sealedFixture(): boolean {
   return process.env.OMB_TEST_SEALED_PATH === "1";
 }
 
-function knownDirs(): string[] {
-  const home = homedir();
+function knownDirs(home: string = homedir()): string[] {
   return [
     join(home, ".local", "bin"), // claude installer default
     join(home, ".npm-global", "bin"), // npm prefix ~/.npm-global (claude, opencode)
@@ -41,7 +42,12 @@ function knownDirs(): string[] {
     join(home, ".local", "share", "mise", "shims"), // mise installer
     join(home, ".deno", "bin"),
     join(home, "bin"),
-    ...nvmBinDirs(),
+    ...nvmBinDirs(home),
+    // Mac Local VM runtimes: Docker Desktop's per-user CLI install and Podman's official pkg.
+    ...(process.platform === "darwin" ? [
+      join(home, ".docker", "bin"),
+      ...(sealedFixture() ? [] : ["/opt/podman/bin"]),
+    ] : []),
   ];
 }
 
@@ -82,49 +88,108 @@ export function registerPathDir(dir: string): void {
   resetPathCache();
 }
 
+// App-installed standalone builds go last: a copy the person installs themselves, anywhere, takes over.
+const fallbackDirs: string[] = [];
+
+export function registerFallbackPathDir(dir: string): void {
+  if (fallbackDirs.includes(dir)) return;
+  fallbackDirs.push(dir);
+  resetPathCache();
+}
+
 /** `probed` resets too, or a rescan would drop rc-file PATH entries and never probe the login shell again. */
 export function resetPathCache(): void {
   cached = null;
   probed = false;
 }
 
+/** The folders under `home` that CLI installers put programs in, which exist: a boxed process's own PATH keeps them. */
+export function homeProgramDirs(home: string): string[] {
+  return (process.platform === "win32" ? [] : knownDirs(home)).filter((dir) => dir.startsWith(`${home}/`) && existsSync(dir));
+}
+
 export function augmentedPath(): string {
-  if (cached === null) {
-    cached = mergePaths([
-      ...registeredDirs.filter((d) => existsSync(d)),
-      ...(process.env.OMB_EXTRA_PATH ? process.env.OMB_EXTRA_PATH.split(delimiter) : []),
-      ...(process.env.PATH ? process.env.PATH.split(delimiter) : []),
-      // Keep the last login-shell result while a rescan re-probes, or rc-only CLIs vanish for the response that triggered it.
-      ...(loginShellPath ? loginShellPath.split(delimiter) : []),
-      ...(process.platform === "win32" ? windowsKnownDirs() : knownDirs()).filter((d) => existsSync(d)),
-    ]);
-  }
-  if (!probed && !process.env.VITEST && !sealedFixture() && process.platform !== "win32") {
+  if (cached === null) cached = buildPath();
+  // The login shell reads its rc files from HOME, which a boxed bot can write.
+  if (!probed && !process.env.VITEST && !sealedFixture() && process.platform !== "win32" && !homeProgramsDistrusted()) {
     probed = true;
     probeLoginShellPath();
   }
   return cached;
 }
 
+function buildPath(): string {
+  const fallback = fallbackDirs.filter((d) => existsSync(d));
+  return mergePaths([
+    ...registeredDirs.filter((d) => existsSync(d)),
+    ...(process.env.OMB_EXTRA_PATH ? process.env.OMB_EXTRA_PATH.split(delimiter) : []),
+    ...(process.env.PATH ? process.env.PATH.split(delimiter) : []),
+    // Keep the last login-shell result while a rescan re-probes, or rc-only CLIs vanish for the response that triggered it.
+    ...(loginShellPath ? loginShellPath.split(delimiter) : []),
+    ...(process.platform === "win32" ? windowsKnownDirs() : knownDirs()).filter((d) => existsSync(d)),
+  ].filter((d) => !fallback.includes(d)).concat(fallback).filter(serverMayRunFrom));
+}
+
 function mergePaths(parts: string[]): string {
   return [...new Set(parts.filter(Boolean))].join(delimiter);
 }
 
+const PROBE_TIMEOUT_MS = 5000;
+const PROBE_MAX_OUTPUT_BYTES = 1024 * 1024;
+
 function probeLoginShellPath(): void {
   const shell = process.env.SHELL || "/bin/zsh";
   // -l -i: nvm and friends live in .zshrc/.bashrc, which only interactive shells read; a marker isolates $PATH from rc noise.
-  execFile(
-    shell,
-    ["-l", "-i", "-c", 'printf "__OMB_PATH__%s" "$PATH"'],
-    { timeout: 5000 },
-    (err, stdout) => {
-      if (err || !stdout) return;
-      const m = /__OMB_PATH__([^\n]*)/.exec(stdout);
-      if (!m || !m[1]) return;
+  // detached: an interactive shell makes its job the terminal's foreground, which stops `openmausbot setup` and its sign-in CLI (SIGTTOU).
+  const child = spawn(shell, ["-l", "-i", "-c", 'printf "__OMB_PATH__%s__OMB_END__" "$PATH"'], {
+    detached: true,
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  let stdout = "";
+  let bytes = 0;
+  let exitCode: number | null | undefined;
+  let finished = false;
+  const finish = (): void => {
+    if (finished) return;
+    finished = true;
+    clearTimeout(deadline);
+    // An interactive shell ignores SIGTERM, and something its rc started in the background can hold stdout open after it exits.
+    // Killed before stdout closes: a closed pipe ends only the writer, and the shell would run its next command meanwhile.
+    if (exitCode === undefined && child.pid) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {}
+    }
+    child.stdout?.destroy();
+  };
+  const deadline = setTimeout(finish, PROBE_TIMEOUT_MS);
+  deadline.unref();
+  // Applied once the shell has exited cleanly and its whole answer has arrived, not when stdout closes: its rc may leave a
+  // background job holding it. Reading stops there, so that job's later output is never part of the answer.
+  const applyIfDone = (): void => {
+    if (exitCode !== 0) return;
+    const m = /__OMB_PATH__([^\n]*?)__OMB_END__/.exec(stdout);
+    if (!m) return;
+    if (m[1] && m[1] !== loginShellPath) {
       loginShellPath = m[1];
-      cached = mergePaths([...(cached ?? "").split(delimiter), ...m[1].split(delimiter)]);
-    },
-  );
+      cached = buildPath();
+    }
+    finish();
+  };
+  // Listeners first: spawn can fail (EMFILE) without creating stdout and report it later through "error".
+  child.on("error", finish);
+  child.on("exit", (code) => {
+    exitCode = code;
+    if (code === 0) applyIfDone();
+    else finish();
+  });
+  child.on("close", finish);
+  child.stdout?.setEncoding("utf8").on("data", (chunk: string) => {
+    bytes += Buffer.byteLength(chunk);
+    if (bytes > PROBE_MAX_OUTPUT_BYTES) return finish();
+    stdout += chunk;
+    applyIfDone();
+  });
 }
 
 export function resetPathCacheForTests(): void {
@@ -132,6 +197,7 @@ export function resetPathCacheForTests(): void {
   probed = false;
   loginShellPath = null;
   registeredDirs.length = 0;
+  fallbackDirs.length = 0;
 }
 
 /** Windows CLIs keep state under USERPROFILE; a HOME leaking in from a POSIX-flavoured shell is not it. */
@@ -145,12 +211,13 @@ export function harnessHome(name: string, env: Record<string, string | undefined
   return join(userHome(env), `.${name}`);
 }
 
-export function findCliCandidates(name: string): string[] {
+/** Every copy of `name` on `path` (the app's PATH unless given), in the order a lookup would find them. */
+export function findCliCandidates(name: string, path: string = augmentedPath()): string[] {
   if (!name || /[\n\r]/.test(name)) return [];
   if (/[/\\]/.test(name) || /^[a-zA-Z]:/.test(name)) return [name];
   const exts = process.platform === "win32" ? (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean) : [""];
   const out: string[] = [];
-  for (const dir of augmentedPath().split(delimiter)) {
+  for (const dir of path.split(delimiter)) {
     if (!dir) continue;
     for (const ext of exts) {
       const p = join(dir, name + ext);
@@ -164,12 +231,14 @@ export function findCliCandidates(name: string): string[] {
 }
 
 // Windows: libuv ignores PATHEXT, Node refuses to spawn a .cmd without shell:true since CVE-2024-27980, and there is no #!.
-// shell:true is out (cmd would mangle the JSON drivers pass in argv), so npm .cmd shims resolve to what they wrap and node
-// shebang scripts to `node <script>`; an unknown shim stays unspawnable rather than cross the no-shell security boundary.
+// shell:true is out (cmd would mangle the JSON drivers pass in argv), so npm .cmd shims resolve to what they wrap, node
+// shebang scripts to `node <script>`, and a PowerShell -File .cmd to powershell.exe plus its sibling .ps1. An unknown
+// shim stays the .cmd rather than cross the no-shell security boundary.
 
 export interface ResolvedSpawn {
   command: string;
   args: string[];
+  env?: NodeJS.ProcessEnv;
 }
 
 /** A mini tokenizer, never a shell: quotes group segments; no escapes, no substitution, nothing evaluated. */
@@ -202,7 +271,7 @@ function isFile(p: string): boolean {
   }
 }
 
-function whichWin(cli: string, env?: NodeJS.ProcessEnv): string | null {
+export function whichWin(cli: string, env?: NodeJS.ProcessEnv): string | null {
   const exts = ((env ?? process.env).PATHEXT ?? ".COM;.EXE;.BAT;.CMD").split(";").filter(Boolean);
   // npm installs both `claude` (a sh script) and `claude.cmd`; an extensionless name is not runnable on Windows.
   const probe = (base: string) => {
@@ -228,7 +297,80 @@ function nodeExe(near: string, env?: NodeJS.ProcessEnv): string | null {
   return (process.versions as Record<string, string | undefined>).electron ? null : process.execPath;
 }
 
-/** npm/pnpm .cmd shims spell their target as "%dp0%\..." (or "%~dp0\..."). */
+const POWERSHELL_NAMES = new Set(["powershell.exe", "pwsh.exe"]);
+const POWERSHELL_COMMAND_SWITCHES = new Set(["c", "command", "e", "ec", "enc", "encodedcommand"]);
+
+/** `-Command` / `-c` / `-EncodedCommand` (and `/c`) run before `-File`, so that line is not a script launch. */
+function isPowerShellCommandSwitch(token: string): boolean {
+  let name = token.startsWith("-") || token.startsWith("/") ? token.slice(1) : token;
+  const colon = name.indexOf(":");
+  if (colon >= 0) name = name.slice(0, colon);
+  return POWERSHELL_COMMAND_SWITCHES.has(name.toLowerCase());
+}
+
+function windowsSystemRoot(env?: NodeJS.ProcessEnv): string {
+  const source = env ?? process.env;
+  return source.SystemRoot || source.WINDIR || process.env.SystemRoot || process.env.WINDIR || "";
+}
+
+/** Only `%SystemRoot%` and `%WINDIR%` expand, and only in the executable token. */
+function expandWindowsRoot(token: string, env?: NodeJS.ProcessEnv): string {
+  const root = windowsSystemRoot(env);
+  return token.replace(/%SystemRoot%/gi, () => root).replace(/%WINDIR%/gi, () => root);
+}
+
+function powerShellExecutable(token: string, env?: NodeJS.ProcessEnv): string | null {
+  const expanded = expandWindowsRoot(token, env);
+  if (!POWERSHELL_NAMES.has(basename(expanded).toLowerCase())) return null;
+  if (/[\\/]/.test(expanded) || /^[a-zA-Z]:/.test(expanded)) {
+    return extname(expanded).toLowerCase() === ".exe" && isFile(expanded) ? expanded : null;
+  }
+  const hit = whichWin(expanded, env);
+  return hit && extname(hit).toLowerCase() === ".exe" ? hit : null;
+}
+
+/** `%SCRIPT_DIR%` and `%~dp0` are the shim directory. A remaining `%VAR%`, `..`, or another directory does not count. */
+function siblingPowerShellScript(operand: string, shimDir: string): string | null {
+  const prefix = /^(?:%SCRIPT_DIR%|%~dp0)\\?/i.exec(operand);
+  if (!prefix && /%[^%]+%/.test(operand)) return null;
+  const rest = prefix ? operand.slice(prefix[0].length) : operand;
+  if (/%[^%]+%/.test(rest)) return null;
+  const absolute = /^[a-zA-Z]:[\\/]/.test(rest) || rest.startsWith("\\\\");
+  if (!prefix && !absolute) return null;
+  const script = prefix ? join(shimDir, rest) : rest;
+  if (extname(script).toLowerCase() !== ".ps1" || !isFile(script)) return null;
+  if (dirname(script).toLowerCase() !== shimDir.toLowerCase()) return null;
+  return script;
+}
+
+/** `-Command` is not a spawn. The first `-File` whose `.ps1` sits beside the shim is. */
+function parsePowerShellFileShim(shim: string, text: string, env?: NodeJS.ProcessEnv): ResolvedSpawn | null {
+  const shimDir = dirname(shim);
+  for (const line of text.split(/\r?\n/)) {
+    const tokens = splitCliString(line);
+    const head = tokens[0];
+    if (!head || tokens.length < 3) continue;
+    const command = powerShellExecutable(head, env);
+    if (!command) continue;
+    const rest = tokens.slice(1);
+    if (rest.some(isPowerShellCommandSwitch)) continue;
+    const fileAt = rest.findIndex((token) => token.toLowerCase() === "-file");
+    const operand = fileAt >= 0 ? rest[fileAt + 1] : undefined;
+    if (!operand) continue;
+    const script = siblingPowerShellScript(operand, shimDir);
+    if (!script) continue;
+    const args: string[] = [];
+    for (let index = 0; index < rest.length; index++) {
+      const token = rest[index];
+      if (!token || token === "%*") continue;
+      args.push(index === fileAt + 1 ? script : token);
+    }
+    return { command, args };
+  }
+  return null;
+}
+
+/** npm/pnpm .cmd shims spell their target as "%dp0%\..." (or "%~dp0\..."). A PowerShell `-File` launcher is spawnable only for a sibling `.ps1`. */
 function parseCmdShim(shim: string, env?: NodeJS.ProcessEnv): ResolvedSpawn | null {
   let text: string;
   try {
@@ -237,6 +379,20 @@ function parseCmdShim(shim: string, env?: NodeJS.ProcessEnv): ResolvedSpawn | nu
     return null;
   }
   const dir = dirname(shim);
+  if (basename(shim).toLowerCase() === "dsh.cmd" && /^set "ELECTRON_RUN_AS_NODE=1"\r?$/im.test(text)) {
+    const desktop = /^"%~dp0([^"\r\n]+\.exe)" --expose-internals "%~dp0((?:[^"\r\n]+\\)?app\.asar)\\([^"\r\n]+\.js)" %\*\r?$/im.exec(text);
+    if (desktop) {
+      const command = join(dir, desktop[1]);
+      const archive = join(dir, desktop[2]);
+      const script = join(archive, desktop[3]);
+      if (isFile(command) && isFile(archive)) {
+        return { command, args: ["--expose-internals", script], env: { ELECTRON_RUN_AS_NODE: "1" } };
+      }
+    }
+    return null;
+  }
+  const portableHermes = resolvePortableHermes(shim, text);
+  if (portableHermes) return portableHermes;
   // npm's own npm.cmd/npx.cmd name their entry as SET "NPX_CLI_JS=%~dp0\…"; a launcher switch to a global npm is not followed.
   const npmEntry = /^SET "NP[MX]_CLI_JS=%~dp0\\([^"]+)"/im.exec(text);
   const targets = [...(npmEntry ? [npmEntry] : []), ...text.matchAll(/"%~?dp0%?\\?([^"]+)"/g)]
@@ -248,7 +404,12 @@ function parseCmdShim(shim: string, env?: NodeJS.ProcessEnv): ResolvedSpawn | nu
     if (node) return { command: node, args: [script] };
   }
   const exe = targets.find((p) => extname(p).toLowerCase() === ".exe");
-  return exe ? { command: exe, args: [] } : null;
+  if (exe) return { command: exe, args: [] };
+  for (const target of targets) {
+    const viaNode = parseNodeShebang(target, env);
+    if (viaNode) return viaNode;
+  }
+  return parsePowerShellFileShim(shim, text, env);
 }
 
 function parseNodeShebang(file: string, env?: NodeJS.ProcessEnv): ResolvedSpawn | null {
@@ -282,7 +443,7 @@ function resolveWord(cli: string, args: string[], env?: NodeJS.ProcessEnv): Reso
   const ext = extname(file).toLowerCase();
   if (ext === ".cmd" || ext === ".bat") {
     const direct = parseCmdShim(file, env);
-    return direct ? { command: direct.command, args: [...direct.args, ...args] } : { command: file, args };
+    return direct ? { ...direct, args: [...direct.args, ...args] } : { command: file, args };
   }
   if (ext === ".exe" || ext === ".com") return { command: file, args };
   const viaNode = parseNodeShebang(file, env);

@@ -4,13 +4,14 @@ import { beforeEach, describe, expect, it } from "vitest";
 
 import { DATA_DIR } from "./config.ts";
 import { CaptureBuffer, capturePrompt, newCandidates, parseCandidates, topicFileName, type CaptureTurn } from "./memory-capture.ts";
+import { passageMatcher } from "./memory-entries.ts";
 import { mergeTopicText, parseTopicHeader } from "./memory-topics.ts";
-import { applyMoves, MAX_MOVES, organizeCandidates, ORGANIZE_MARKER, parseMoves } from "./memory-organize.ts";
-import { flushMemoryJournal, readMemoryJournal } from "./memory-journal.ts";
-import { applyTidy, contradictionBudget, contradictionCandidates, parseContradictions, planTidy } from "./memory-tidy.ts";
+import { applyMoves, MAX_MOVES, organizeCandidates, ORGANIZE_MARKER, organizePrompt, parseMoves } from "./memory-organize.ts";
+import { flushMemoryJournal, readMemoryJournal, revertMemoryChange } from "./memory-journal.ts";
+import { applyTidy, contradictionBudget, contradictionCandidates, contradictionPrompt, parseContradictions, planTidy } from "./memory-tidy.ts";
 import { createMemoryUpkeep, MAX_PENDING_THREADS, NO_TEXT_ENGINE, type UpkeepBot, type UpkeepEngine } from "./memory-upkeep.ts";
 import { closeMessageDb } from "./message-db.ts";
-import { aboutMeLine, appendAboutMe, commitLearned, listLearnedFacts, planLearned, removeLearned } from "./profile-learned.ts";
+import { aboutMeLine, appendAboutMe, clearForgotten, commitLearned, listLearnedFacts, planLearned, rememberForgotten, removeLearned } from "./profile-learned.ts";
 import { ensureWorkspace, readMemoryTopic, workspaceDir, writeMemoryFile, writeMemoryTopic, WORKSPACES_DIR } from "./workspace.ts";
 
 const TODAY = "2026-09-25";
@@ -162,6 +163,25 @@ describe("tidy plan", () => {
       { a: 2, b: 1, keep: "b" },
     ]);
   });
+
+  it("never supersedes a note outside the contradiction prompt", () => {
+    const text = Array.from({ length: 205 }, (_, index) => `- 2026-09-01 · Project ${index} has its own deadline`).join("\n");
+    const candidates = contradictionCandidates(text, TODAY);
+    const prompt = contradictionPrompt(candidates);
+    expect(candidates).toHaveLength(205);
+    expect(prompt).toContain("[199] (2026-09-01) Project 199");
+    expect(prompt).not.toContain("[200]");
+    const pairs = parseContradictions(JSON.stringify({ pairs: [
+      { a: 0, b: 200, keep: "a" },
+      { a: 204, b: 1, keep: "b" },
+      { a: 2, b: 199, keep: "b" },
+    ] }), candidates.length);
+    expect(pairs).toEqual([{ a: 2, b: 199, keep: "b" }]);
+    const next = applyTidy(text, planTidy(text, TODAY, pairs), TODAY).text;
+    expect(next).toContain("- 2026-09-01 · Project 200 has its own deadline");
+    expect(next).toContain("- 2026-09-01 · Project 204 has its own deadline");
+    expect(next).toContain("~~Project 2 has its own deadline~~");
+  });
 });
 
 describe("About me, learned on its own", () => {
@@ -203,6 +223,18 @@ describe("organizing MEMORY.md", () => {
     const { text: left, byTopic } = applyMoves(text, parseMoves('{"moves":[{"i":0,"topic":"x","aliases":["q"]}]}', candidates)!);
     expect(left).toBe("- 2026-09-26 · A\n- 2026-09-20 · Trip · until 2026-09-21\n");
     expect(byTopic.get("x.md")).toEqual({ lines: ["- 2026-09-26 · B"], aliases: ["q"] });
+  });
+});
+
+describe("filing finished work", () => {
+  it("offers a finished work log for filing with its date, and never a rule the person gave", () => {
+    const text = "- 2026-09-01 · PR #12 for the billing page merged\n- 2026-09-20 · Never book red-eye flights\n- 2026-09-20 · Don't email Asha after 9pm\n";
+    const candidates = organizeCandidates(text, TODAY, new Set());
+    expect(candidates.map((e) => e.body)).toEqual(["PR #12 for the billing page merged"]);
+    const prompt = organizePrompt(candidates, "", TODAY);
+    expect(prompt).toContain("(today is 2026-09-25)");
+    expect(prompt).toContain("[0] PR #12 for the billing page merged (noted 2026-09-01)");
+    expect(prompt).toContain('otherwise under "work-log"');
   });
 });
 
@@ -285,8 +317,8 @@ describe("the upkeep loop", () => {
   it("captures new facts as dated, sourced entries, journaled as upkeep, and adds About me lines", async () => {
     ensureWorkspace(BOT.id);
     answers.push(JSON.stringify([
-      { text: "The person is vegetarian", kind: "preference", aboutUser: true, confidence: 0.9 },
-      { text: "The person has exams this weekend", kind: "fact", until: "2026-09-27", confidence: 0.9 },
+      { text: "The person is vegetarian", kind: "preference", evidence: "I'm vegetarian", aboutUser: true, confidence: 0.9 },
+      { text: "The person has exams this weekend", kind: "fact", evidence: "I have exams this weekend", until: "2026-09-27", confidence: 0.9 },
     ]));
     const report = await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "I'm vegetarian and I have exams this weekend", bot: "Good luck!" }] });
     expect(report).toMatchObject({ added: 2, topics: 0, aboutMe: 1 });
@@ -301,8 +333,8 @@ describe("the upkeep loop", () => {
     const old = Array.from({ length: 200 }, (_, i) => `- 2026-08-01 · old fact ${i}`);
     writeMemoryFile(BOT.id, `${old.join("\n")}\n`);
     answers.push(JSON.stringify([
-      { text: "The staging host is kestrel", kind: "fact", confidence: 0.9 },
-      { text: "Deploys go out on Tuesdays", kind: "fact", confidence: 0.9 },
+      { text: "The staging host is kestrel", kind: "fact", evidence: "staging is kestrel", confidence: 0.9 },
+      { text: "Deploys go out on Tuesdays", kind: "fact", evidence: "we deploy Tuesdays", confidence: 0.9 },
     ]));
     const report = await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "staging is kestrel; we deploy Tuesdays", bot: "Noted." }] });
     expect(report).toMatchObject({ added: 2 });
@@ -318,7 +350,7 @@ describe("the upkeep loop", () => {
   it("forgets a deleted bot: its waiting turns and its status go", async () => {
     ensureWorkspace(BOT.id);
     const loop = upkeep();
-    answers.push(JSON.stringify([{ text: "The person is vegetarian", kind: "preference", aboutUser: false, confidence: 0.9 }]));
+    answers.push(JSON.stringify([{ text: "The person is vegetarian", kind: "preference", evidence: "I'm vegetarian", aboutUser: false, confidence: 0.9 }]));
     await loop.capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "I'm vegetarian", bot: "Noted" }] });
     expect(loop.status(BOT.id).lastCapture).toBeDefined();
     loop.noteTurn(BOT.id, "t2", { person: "I moved to Lyon", bot: "Nice" });
@@ -343,7 +375,7 @@ describe("the upkeep loop", () => {
   it("adds to About me a fact the notebook already holds, without appending it again", async () => {
     ensureWorkspace(BOT.id);
     writeMemoryFile(BOT.id, "- 2026-09-25 · The user's company is called Northwind Studio.\n");
-    answers.push(JSON.stringify([{ text: "The user's company is Northwind Studio", kind: "fact", aboutUser: true, noted: true }]));
+    answers.push(JSON.stringify([{ text: "The user's company is Northwind Studio", kind: "fact", evidence: "My company is Northwind Studio", aboutUser: true, noted: true }]));
     const report = await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "My company is Northwind Studio", bot: "Noted." }] });
     expect(report).toMatchObject({ added: 0, aboutMe: 1 });
     expect(memory().match(/Northwind/g)).toHaveLength(1);
@@ -352,9 +384,9 @@ describe("the upkeep loop", () => {
   it("files detail into a topic it creates, with other words for it", async () => {
     ensureWorkspace(BOT.id);
     answers.push(JSON.stringify([
-      { text: "The person loves pasta", kind: "preference", topic: "Food", topicAliases: ["restaurants", "dinner"] },
-      { text: "Sister Asha lives in Delhi", kind: "fact", topic: "family", topicAliases: ["sister", "asha"] },
-      { text: "The person is vegetarian", kind: "preference" },
+      { text: "The person loves pasta", kind: "preference", evidence: "I love pasta", topic: "Food", topicAliases: ["restaurants", "dinner"] },
+      { text: "Sister Asha lives in Delhi", kind: "fact", evidence: "my sister Asha lives in Delhi", topic: "family", topicAliases: ["sister", "asha"] },
+      { text: "The person is vegetarian", kind: "preference", evidence: "I'm vegetarian" },
     ]));
     const report = await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "I love pasta, I'm vegetarian, my sister Asha lives in Delhi", bot: "Noted." }] });
     expect(report).toMatchObject({ added: 1, topics: 2 });
@@ -364,16 +396,55 @@ describe("the upkeep loop", () => {
     expect(parseTopicHeader(food)).toEqual({ title: "food", aliases: ["restaurants", "dinner"] });
     expect(food).toContain('from chat "Plans" (noticed) · The person loves pasta');
     expect(readMemoryTopic(BOT.id, "family.md")).toContain("Sister Asha lives in Delhi");
-    answers.push(JSON.stringify([{ text: "The person loves pasta", kind: "preference", topic: "food" }]));
+    answers.push(JSON.stringify([{ text: "The person loves pasta", kind: "preference", evidence: "pasta again", topic: "food" }]));
     expect((await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "pasta again", bot: "ok" }] })).topics).toBe(0);
     await flushMemoryJournal(BOT.id);
     expect(readMemoryJournal(BOT.id, 10).filter((row) => row.via === "capture").map((row) => row.path).sort()).toEqual(["MEMORY.md", "memory/family.md", "memory/food.md"]);
   });
 
   it("does not add About me lines from another person's message", async () => {
-    answers.push(JSON.stringify([{ text: "Is vegetarian", kind: "preference", aboutUser: true }]));
+    answers.push(JSON.stringify([{ text: "Is vegetarian", kind: "preference", evidence: "I'm vegetarian", aboutUser: true }]));
     const report = await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [{ person: "I'm vegetarian", bot: "ok", owner: false }] });
     expect(report).toMatchObject({ added: 1, aboutMe: 0 });
+  });
+
+  it("keeps only what the person says about themselves: nothing guessed from a question, a task or a made-up case", async () => {
+    ensureWorkspace(BOT.id);
+    answers.push(JSON.stringify([
+      { text: "The person works at a 10-person startup", kind: "fact", evidence: "for a 10-person startup", aboutUser: true, confidence: 0.9 },
+      { text: "The person is developing an AI agent app", kind: "fact", aboutUser: true, confidence: 0.9 },
+      { text: "The person builds AI agent apps", kind: "fact", evidence: "I build AI agent apps", aboutUser: true, confidence: 0.9 },
+      { text: "The person is a teacher", kind: "fact", evidence: "I'm a teacher", aboutUser: true, confidence: 0.9 },
+      { text: "The person prefers short answers", kind: "preference", evidence: "I prefer short answers", aboutUser: true, confidence: 0.9 },
+    ]));
+    const report = await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [
+      { person: "What are the 3 best AI meeting note-takers for a 10-person startup right now? Price and a one-line verdict each.", bot: "Fathom, Granola, Avoma." },
+      { person: "Write a one-page launch plan for an open-source AI agent app, with a 7-day timeline.", bot: "Here it is." },
+      { person: "Suppose I'm a teacher. Draft a lesson plan.", bot: "Done." },
+      { person: "Remember: I prefer short answers.", bot: "Got it: short answers." },
+    ] });
+    expect(report).toMatchObject({ added: 1, aboutMe: 1 });
+    expect(memory()).toContain("The person prefers short answers");
+    expect(memory()).not.toMatch(/startup|agent app|teacher/);
+    expect(aboutMeAdded).toEqual(["The person prefers short answers"]);
+  });
+
+  it("never learns again what the person asked a bot to forget, until they ask to remember it", async () => {
+    ensureWorkspace(BOT.id);
+    rememberForgotten("short answers", passageMatcher("short answers")!);
+    const said = { person: "Remember: I prefer short answers and I'm in India (IST).", bot: "Got it." };
+    const answer = JSON.stringify([
+      { text: "The person prefers short answers", kind: "preference", evidence: "I prefer short answers", aboutUser: true, confidence: 0.9 },
+      { text: "The person is in India (IST)", kind: "fact", evidence: "I'm in India (IST)", aboutUser: true, confidence: 0.9 },
+    ]);
+    answers.push(answer);
+    expect(await upkeep().capture({ botId: BOT.id, threadId: "t1", turns: [said] })).toMatchObject({ added: 1, aboutMe: 1 });
+    expect(memory()).not.toContain("short answers");
+    expect(aboutMeAdded).toEqual(["The person is in India (IST)"]);
+    clearForgotten("The person prefers short answers");
+    answers.push(answer);
+    expect(await upkeep().capture({ botId: BOT.id, threadId: "t2", turns: [said] })).toMatchObject({ added: 1 });
+    expect(memory()).toContain("The person prefers short answers");
   });
 
   it("captures a room turn sourced to the room, and drops one the host no longer allows", async () => {
@@ -394,8 +465,8 @@ describe("the upkeep loop", () => {
       tidyHour: () => 3,
       now: () => clock,
     });
-    const turn: CaptureTurn = { person: "", bot: "Noted.", owner: false, room: [{ by: "other", name: "Asha", text: "Launch moved to Friday" }] };
-    answers.push(JSON.stringify([{ text: "The launch moved to Friday", kind: "decision", confidence: 0.9 }, { text: "Asha is vegetarian", kind: "preference", aboutUser: true, confidence: 0.9 }]));
+    const turn: CaptureTurn = { person: "", bot: "Noted.", owner: false, room: [{ by: "other", name: "Asha", text: "Launch moved to Friday. I'm vegetarian, by the way." }] };
+    answers.push(JSON.stringify([{ text: "The launch moved to Friday", kind: "decision", confidence: 0.9 }, { text: "Asha is vegetarian", kind: "preference", evidence: "I'm vegetarian", aboutUser: true, confidence: 0.9 }]));
     const report = await roomUpkeep.capture({ botId: BOT.id, threadId: "room-thread", turns: [turn] });
     expect(report).toMatchObject({ added: 2, aboutMe: 0 });
     expect(memory()).toContain('from room "Launch" (noticed) · The launch moved to Friday');
@@ -442,6 +513,108 @@ describe("the upkeep loop", () => {
     const rows = readMemoryJournal(BOT.id, 10);
     expect(rows.filter((row) => row.actor === "upkeep" && row.via === "tidy").map((row) => row.path)).toEqual(["MEMORY.md", "memory/archive.md"]);
     expect(rows[0]!.path).toBe("MEMORY.md");
+  });
+
+  it("files a finished work log out of MEMORY.md, undoable from Changes, and keeps the person's rules", async () => {
+    ensureWorkspace(BOT.id);
+    writeMemoryFile(BOT.id, ["- 2026-09-01 · Release 0.1.40 shipped to every computer", "- 2026-09-20 · Always answer in British English", ""].join("\n"));
+    organizeAnswer = '{"moves":[{"i":0,"topic":"work-log","aliases":["releases"]}]}';
+    const report = await upkeep().tidy(BOT.id);
+    expect(report.organized).toBe(1);
+    expect(organizePrompts[0]).not.toContain("British English");
+    expect(memory()).toBe("- 2026-09-20 · Always answer in British English\n");
+    expect(readMemoryTopic(BOT.id, "work-log.md")).toContain("- 2026-09-01 · Release 0.1.40 shipped to every computer");
+    await flushMemoryJournal(BOT.id);
+    const row = readMemoryJournal(BOT.id, 10).find((entry) => entry.path === "MEMORY.md" && entry.via === "organize")!;
+    expect(row).toMatchObject({ actor: "upkeep", canRevert: true });
+    expect(revertMemoryChange(BOT.id, row.id).ok).toBe(true);
+    expect(memory()).toContain("Release 0.1.40 shipped to every computer");
+  });
+
+  it.each(["MEMORY.md", "memory/travel.md"])("archives expired continuations from %s without leaving live fragments", async (path) => {
+    ensureWorkspace(BOT.id);
+    const expired = [
+      "- 2026-09-01 · Temporary deployment · until 2026-09-07",
+      "  ```sh",
+      "  deploy --temporary",
+      "",
+      "  ```",
+      "  Remove the temporary deployment.",
+    ];
+    const live = "- 2026-09-20 · Current deployment\n  Keep this detail.\n";
+    const before = `${expired.join("\n")}\n${live}`;
+    if (path === "MEMORY.md") writeMemoryFile(BOT.id, before);
+    else writeMemoryTopic(BOT.id, "travel.md", before);
+    const report = await upkeep().tidy(BOT.id);
+    await flushMemoryJournal(BOT.id);
+    expect(report.expired).toBe(1);
+    expect(readFileSync(join(workspaceDir(BOT.id), path), "utf8")).toBe(live);
+    expect(readMemoryTopic(BOT.id, "archive.md"))
+      .toContain([`${expired[0]} · expired ${TODAY}`, ...expired.slice(1)].join("\n"));
+    const row = readMemoryJournal(BOT.id, 10).find((entry) => entry.path === path && entry.via === "tidy")!;
+    expect(row.canRevert).toBe(true);
+    const reverted = revertMemoryChange(BOT.id, row.id);
+    await flushMemoryJournal(BOT.id);
+    expect(reverted.ok).toBe(true);
+    expect(readFileSync(join(workspaceDir(BOT.id), path), "utf8")).toBe(before);
+  });
+
+  it("keeps a source entry when its topic only shares the heading, while completing other moves", async () => {
+    ensureWorkspace(BOT.id);
+    const kept = "- 2026-09-25 · Deployment steps\n  deploy --new-environment\n";
+    const moved = "- 2026-09-25 · Release notes\n  Version two is ready.\n";
+    writeMemoryFile(BOT.id, `${kept}${moved}- 2026-09-25 · Short note\n`);
+    writeMemoryTopic(BOT.id, "project.md", "- 2026-09-20 · Deployment steps\n  deploy --old-environment\n- Short note\n");
+    organizeAnswer = '{"moves":[{"i":0,"topic":"project"},{"i":1,"topic":"project"},{"i":2,"topic":"project"}]}';
+    const report = await upkeep().tidy(BOT.id);
+    await flushMemoryJournal(BOT.id);
+    expect(report.organized).toBe(2);
+    expect(memory()).toBe(kept);
+    const topic = readMemoryTopic(BOT.id, "project.md")!;
+    expect(topic).toContain("deploy --old-environment");
+    expect(topic).not.toContain("deploy --new-environment");
+    expect(topic).toContain(moved);
+    expect(topic.match(/Short note/g)).toHaveLength(1);
+  });
+
+  it("completes a move without duplicating a topic that already holds the full entry", async () => {
+    ensureWorkspace(BOT.id);
+    const details = "  ```sh\n  deploy --current\n\n  ```\n  Keep the release tag.\n";
+    writeMemoryFile(BOT.id, `- 2026-09-25 · Deployment steps\n${details}`);
+    const topic = `- 2026-09-20 · Deployment steps\n${details}`;
+    writeMemoryTopic(BOT.id, "project.md", topic);
+    organizeAnswer = '{"moves":[{"i":0,"topic":"project"}]}';
+    const report = await upkeep().tidy(BOT.id);
+    await flushMemoryJournal(BOT.id);
+    expect(report.organized).toBe(1);
+    expect(memory()).toBe("");
+    expect(readMemoryTopic(BOT.id, "project.md")).toBe(topic);
+  });
+
+  it.each(["2026-09-07", "2026-09-26"].flatMap((until) => [
+    { until, details: "  deploy --current\n" },
+    { until, details: "" },
+  ]))("keeps a permanent entry when its topic copy expires on $until (details: $details)", async ({ until, details }) => {
+    ensureWorkspace(BOT.id);
+    const source = `- 2026-09-25 · Deployment steps\n${details}`;
+    writeMemoryFile(BOT.id, source);
+    writeMemoryTopic(BOT.id, "project.md", `- 2026-09-01 · Deployment steps · until ${until}\n${details}`);
+    organizeAnswer = '{"moves":[{"i":0,"topic":"project"}]}';
+    const report = await upkeep().tidy(BOT.id);
+    await flushMemoryJournal(BOT.id);
+    expect(report.organized ?? 0).toBe(0);
+    expect(memory()).toBe(source);
+  });
+
+  it("retains both code blocks when their identical headings hide meaningful whitespace differences", async () => {
+    const source = "- 2026-09-25 · Cedar command\n  ```sh\n  printf 'a b'\n  ```\n";
+    const topic = "- 2026-09-20 · Cedar command\n  ```sh\n  printf 'a  b'\n  ```\n";
+    writeMemoryFile(BOT.id, source);
+    writeMemoryTopic(BOT.id, "cedar.md", topic);
+    organizeAnswer = '{"moves":[{"i":0,"topic":"cedar"}]}';
+    expect((await upkeep().tidy(BOT.id)).organized ?? 0).toBe(0);
+    expect(memory()).toBe(source);
+    expect(readMemoryTopic(BOT.id, "cedar.md")).toBe(topic);
   });
 
   it("moves detail the bot wrote itself out of MEMORY.md into topics, keeping core facts", async () => {
@@ -614,7 +787,7 @@ describe("the upkeep loop", () => {
 
   it("defers capture while paused for a backup and runs it on resume", async () => {
     const loop = upkeep();
-    answers.push(JSON.stringify([{ text: "Likes jazz", kind: "preference" }]));
+    answers.push(JSON.stringify([{ text: "Likes jazz", kind: "preference", evidence: "I like jazz" }]));
     loop.pause();
     loop.noteTurn(BOT.id, "t1", { person: "I like jazz", bot: "Nice, jazz is a great pick." });
     loop.flushThread("t1");
@@ -643,7 +816,7 @@ describe("the upkeep loop", () => {
       { botId: BOT.id, threadId: "t3", turnIds: ["turn-gone"] },
     ] });
 
-    answers.push(JSON.stringify([{ text: "Likes jazz", kind: "preference" }]));
+    answers.push(JSON.stringify([{ text: "Likes jazz", kind: "preference", evidence: "I like jazz" }]));
     const second = upkeep();
     second.start();
     expect(existsSync(pending)).toBe(false);

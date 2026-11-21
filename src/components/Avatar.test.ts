@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   BotAvatar,
+  InitialsAvatar,
   MausAvatar,
   resolveBotAvatarOutcome,
   type BotAvatarProps,
@@ -45,6 +46,34 @@ describe("MausAvatar body", () => {
   });
 });
 
+describe("mascot facial feature colors", () => {
+  it.each(["white", "black"] as const)("uses %s for both eyes and mouth on every body type", (mascotFaceColor) => {
+    const ink = mascotFaceColor === "white" ? "#ffffff" : "#000000";
+    for (const mascotBody of ["cursor", "star", "pumpkin", "vampire"] as const) {
+      for (const color of ["green", "chrome"] as const) {
+        const markup = renderBot({ color, mascotBody, mascotFaceColor });
+        expect(markup).toContain(`fill="${ink}"`);
+        expect(markup).toContain(`stroke="${ink}"`);
+        expect(markup).not.toContain('visibility="hidden"');
+      }
+    }
+  });
+
+  it("cuts the features out of the body when no colour is set", () => {
+    expect(renderBot({ color: "chrome", mascotFaceColor: null })).toContain('stroke="#1E2833"');
+    for (const markup of [renderBot({ mascotBody: "ghost" }), renderBot({})]) {
+      expect(markup).toContain("<mask");
+      expect(markup).not.toMatch(/stroke="#(?:ffffff|0d0a10)"/);
+    }
+  });
+
+  it("does not paint features over an uploaded image", () => {
+    const markup = renderBot({ mascotFaceColor: "black", avatarUrl: "/api/attachments/photo.png", avatarCrop: "circle" });
+    expect(markup).toContain("<img");
+    expect(markup).not.toContain("<svg");
+  });
+});
+
 describe("BotAvatar's two avatar outcomes", () => {
   it("zooms and positions a custom image inside its crop", () => {
     const markup = renderBot({
@@ -83,6 +112,20 @@ describe("BotAvatar's two avatar outcomes", () => {
     const markup = renderBot({ avatarUrl: undefined, avatarCrop: "circle" });
     expect(markup).not.toContain("<img");
     expect(markup).toContain("<svg");
+  });
+});
+
+describe("theme hooks on faces", () => {
+  it("marks a bot's picture, its gradient mascot and its carved mascot, and leaves a decorative mascot unmarked", () => {
+    expect(renderBot({ avatarUrl: "/api/attachments/a.png", avatarCrop: "circle" })).toMatch(/<span data-avatar="picture" data-avatar-kind="bot"/);
+    expect(renderBot({})).toMatch(/<span data-avatar="mascot" data-avatar-kind="bot"/);
+    expect(renderBot({ mascotBody: "ghost" })).toMatch(/<span data-avatar="mascot" data-avatar-kind="bot"/);
+    expect(render({})).not.toContain("data-avatar");
+  });
+
+  it("marks the person's picture and their initials", () => {
+    expect(renderToStaticMarkup(createElement(InitialsAvatar, { initials: "AL", avatarUrl: "/api/attachments/me.png" }))).toMatch(/<img data-avatar="picture" data-avatar-kind="person"/);
+    expect(renderToStaticMarkup(createElement(InitialsAvatar, { initials: "AL" }))).toMatch(/<div data-avatar="initials" data-avatar-kind="person"/);
   });
 });
 

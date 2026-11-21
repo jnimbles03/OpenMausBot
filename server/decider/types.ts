@@ -1,12 +1,19 @@
-export type DeciderProvider = "jev" | "openrouter";
+/** workersai: Cloudflare's Clef on Workers AI, Jev-compatible. custom: a gateway the person points at. gemini: Google's
+ * Decisions API with the Gemini key saved for speech or images. */
+export type DeciderProvider = "jev" | "workersai" | "openrouter" | "custom" | "gemini";
 
 /** chat: a chat model asked for strict JSON; decisions: OpenRouter's Decisions API (output modality `decisions`). */
 export type OpenRouterApi = "chat" | "decisions";
 
-export type DeciderJob = "roomRouting";
-export const DECIDER_JOBS: readonly DeciderJob[] = ["roomRouting"];
+/** A custom gateway's protocol: systemone is `POST {base}/systemone` (Jev's shape), decisions is `POST {base}/decisions`,
+ * chat is `POST {base}/chat/completions` (any OpenAI-compatible server, such as Gemini's, asked for strict JSON). */
+export type CustomApi = "systemone" | "decisions" | "chat";
 
-export type DeciderSeam = DeciderJob | "keyCheck";
+export type DeciderJob = "roomRouting" | "inboxTriage";
+export const DECIDER_JOBS: readonly DeciderJob[] = ["roomRouting", "inboxTriage"];
+
+/** botDecide: a bot's own `decide` tool call. */
+export type DeciderSeam = DeciderJob | "keyCheck" | "botDecide";
 
 /** Every failure means "use today's rule". */
 export type DeciderFailure =
@@ -24,6 +31,8 @@ export type DeciderFailure =
   | "rate_limited"
   /** 529 or 503 */
   | "overloaded"
+  /** 413: the request is over what the relay or the model takes. Never retried: it would be refused again. */
+  | "too_large"
   | "http_error"
   | "malformed";
 
@@ -89,6 +98,8 @@ export interface AskOptions {
   /** Hard ceiling for the whole call, body included. */
   timeoutMs?: number;
   signal?: AbortSignal;
+  /** A hard case: Workers AI answers with Clef rather than Clef-flash. */
+  careful?: boolean;
 }
 
 /** One call to a backend. The key is passed in and never kept. */
@@ -96,8 +107,13 @@ export interface BackendRequest {
   key: string;
   baseUrl?: string;
   model?: string;
-  /** Which OpenRouter API that model is served by; absent is `chat`. */
-  api?: OpenRouterApi;
+  /** Which OpenRouter API that model is served by (absent is `chat`), or a custom gateway's protocol (absent is `systemone`). */
+  api?: OpenRouterApi | CustomApi;
+  /** Workers AI only: the Cloudflare account the token belongs to. */
+  accountId?: string;
+  careful?: boolean;
+  /** Set only for the included relay, which is told the seam in a header. */
+  relaySeam?: DeciderSeam;
   state: unknown;
   questions: Record<string, DeciderQuestion>;
   signal: AbortSignal;

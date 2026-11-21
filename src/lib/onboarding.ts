@@ -1,4 +1,5 @@
 import { ONBOARDING_CLOUD_HINT, WELCOME_VERSION } from "../../electron/onboarding-record.mjs";
+import { freeFallback, rankAis, type AiTestState, type RankableAi } from "../../shared/ai-ranking";
 
 export interface OnboardingStatus {
   completedAt: string;
@@ -21,6 +22,8 @@ export interface WelcomeViewer {
   hosted: boolean;
   canSave: boolean;
   cloudHome?: boolean;
+  /** On a Team Cloud: the person's role there (owner, admin, member). */
+  teamRole?: string;
 }
 
 export const LOCAL_VIEWER: WelcomeViewer = { hosted: false, canSave: true };
@@ -34,12 +37,19 @@ export function spotlightsQuiet(viewer: WelcomeViewer | null): boolean {
 }
 
 export function welcomeViewer(session: unknown): WelcomeViewer {
-  const record = session && typeof session === "object" ? (session as { hosted?: unknown; scopes?: unknown; cloudHome?: unknown }) : {};
+  const record = session && typeof session === "object" ? (session as { hosted?: unknown; scopes?: unknown; cloudHome?: unknown; team?: { role?: unknown } | null }) : {};
+  const teamRole = record.team?.role;
   return {
     hosted: record.hosted === true,
     canSave: Array.isArray(record.scopes) ? record.scopes.includes("admin") : true,
     ...(record.cloudHome === true ? { cloudHome: true } : {}),
+    ...(typeof teamRole === "string" ? { teamRole } : {}),
   };
+}
+
+/** Whose setup a Cloud's welcome and setup list are: whoever can change the Cloud, and on a team its Owner alone. */
+export function setsUpCloud(viewer: WelcomeViewer | null): boolean {
+  return Boolean(viewer?.cloudHome && viewer.canSave && (viewer.teamRole === undefined || viewer.teamRole === "owner"));
 }
 
 export function welcomeDue(
@@ -60,6 +70,19 @@ export function completionPatch(now: Date = new Date()): { onboarding: { complet
   return { onboarding: { completedAt: now.toISOString(), version: WELCOME_VERSION } };
 }
 
+/** Kept by an install whose first run ended by meeting its Chief of Staff: its first conversation stays quiet (no
+ * corner notices until a reply, no spotlights). */
+export const MET_CHIEF_HINT = "met-chief-v1";
+
+/** The first run's record: done, and marked as the one that met the Chief (MET_CHIEF_HINT). */
+export function firstRunPatch(
+  record: OnboardingStatus | undefined,
+  now: Date = new Date(),
+): { onboarding: { completedAt: string; version: number; hintsSeen?: string[] } } {
+  const have = record?.hintsSeen ?? [];
+  return { onboarding: { ...completionPatch(now).onboarding, ...(have.includes(MET_CHIEF_HINT) ? {} : { hintsSeen: [...have, MET_CHIEF_HINT] }) } };
+}
+
 export function hintSeen(record: OnboardingStatus | undefined, id: string): boolean {
   return (record?.hintsSeen ?? []).includes(id);
 }
@@ -73,47 +96,24 @@ export function hintSeenPatch(
 }
 
 
-export type BeatId = "hello" | "reel" | "engines" | "import" | "permissions" | "phone" | "cloud" | "bot";
+export type BeatId = "meet" | "chief";
 
-export interface BeatOptions {
-  dictation: boolean;
-  reel: boolean;
-  hosted?: boolean;
-  /** An AI already works here (a signed-in CLI, an API key, an organization's or the Cloud's model): it is used without a step. */
-  aiReady?: boolean;
-  /** This computer has skills or MCP servers from another AI tool to bring in. */
-  setupImport?: boolean;
-  /** MausBot Cloud can be bought from this desktop now (cloudBeatWanted); the first bot stays the last beat. */
-  cloud?: boolean;
+/** Every screen the first run can show, in the order it shows them. */
+export const BEAT_ORDER: readonly BeatId[] = ["meet", "chief"];
+
+/** Two screens, then the chat: meeting the app (and connecting an AI when none works), then the Chief of Staff. A hosted
+ * place's admin only meets the app: their team's bots and Chief are already set up. */
+export function beatsFor(options: { hosted?: boolean }): BeatId[] {
+  return options.hosted ? ["meet"] : ["meet", "chief"];
 }
 
-export function beatsFor(options: BeatOptions): BeatId[] {
-  if (options.hosted) return ["hello", "bot"];
-  const beats: BeatId[] = ["hello"];
-  if (options.reel) beats.push("reel");
-  if (!options.aiReady) beats.push("engines");
-  if (options.setupImport) beats.push("import");
-  if (options.dictation) beats.push("permissions");
-  beats.push("phone");
-  if (options.cloud) beats.push("cloud");
-  beats.push("bot");
-  return beats;
+/** Where a reloaded first run opens: the saved screen while it is offered, else the first. */
+export function resumeBeat(beats: readonly BeatId[], saved: BeatId | undefined): BeatId {
+  return saved && beats.includes(saved) ? saved : beats[0] ?? "meet";
 }
 
 export function onboardingCloudOffered(record: OnboardingStatus | undefined): boolean {
   return hintSeen(record, ONBOARDING_CLOUD_HINT);
-}
-
-/** Where the welcome may offer MausBot Cloud at all: this computer's own page with the Cloud bridge, not a branded
- * build, not a hosted or remote viewer. */
-export function cloudBeatPossible(input: { bridge: boolean; branded: boolean; hosted: boolean; remote: boolean }): boolean {
-  return input.bridge && !input.branded && !input.hosted && !input.remote;
-}
-
-/** ...and whether it does: as the buy sheet decides, an account that may buy (buyOfferAllowed) and the Admin's offer
- * loaded. Anything unknown is no beat: onboarding never waits for it. */
-export function cloudBeatWanted(input: { bridge: boolean; branded: boolean; hosted: boolean; remote: boolean; mayBuy: boolean | null; offer: unknown }): boolean {
-  return cloudBeatPossible(input) && input.mayBuy === true && Boolean(input.offer);
 }
 
 let welcomeShown = 0;
@@ -127,40 +127,25 @@ export function welcomeOnScreen(): boolean {
   return welcomeShown > 0;
 }
 
-export function nextBeat(beats: readonly BeatId[], current: BeatId): BeatId | null {
-  const index = beats.indexOf(current);
-  if (index < 0 || index + 1 >= beats.length) return null;
-  return beats[index + 1]!;
-}
-
-export function previousBeat(beats: readonly BeatId[], current: BeatId): BeatId | null {
-  const index = beats.indexOf(current);
-  if (index <= 0) return null;
-  return beats[index - 1]!;
-}
-
-export function beatWidth(beat: BeatId): number {
-  switch (beat) {
-    case "engines":
-      return 680;
-    case "phone":
-      return 620;
-    case "import":
-      return 540;
-    case "reel":
-      return 720;
-    case "bot":
-    case "cloud":
-      return 520;
-    default:
-      return 460;
+const WELCOME_FINISHED_KEY = "omb.onboarding.welcomeFinished";
+/** The first-run welcome ended in this app session (never a replay): the full-screen Cloud Pro popup waits for a later
+ * launch rather than following it. Kept for the window's session, so a reload counts as the same launch. */
+// Where browser storage is blocked, this page's memory stands in for it.
+let welcomeFinishedRemembered = false;
+export function markWelcomeFinished(): void {
+  try {
+    sessionStorage.setItem(WELCOME_FINISHED_KEY, "1");
+  } catch {
+    welcomeFinishedRemembered = true;
   }
 }
-
-export function flowDotsShown(beat: BeatId): boolean {
-  return beat !== "reel";
+export function welcomeFinishedThisLaunch(): boolean {
+  try {
+    return sessionStorage.getItem(WELCOME_FINISHED_KEY) === "1";
+  } catch {
+    return welcomeFinishedRemembered;
+  }
 }
-
 
 export const DEFAULT_ADMIN_ORIGIN = "https://admin.openmausbot.com";
 
@@ -180,15 +165,68 @@ interface AiChoice {
   driverKind: string;
   access?: string;
   readOnly?: boolean;
+  snapshot?: { freeFallback?: boolean };
 }
 
-/** The one way the welcome recommends to connect an AI (a Claude account first, then a ChatGPT plan), and every other way. */
+/** The one way the welcome recommends to connect an AI, in the new-bot default's own order (shared/ai-ranking.ts: a Claude
+ * account first, then a ChatGPT plan), and every other way. */
 export function aiChoices<Instance extends AiChoice>(instances: readonly Instance[]): { recommended?: Instance; others: Instance[] } {
   const plan = (instance: Instance) => !instance.readOnly && instance.access !== "api" && instance.access !== "custom";
-  const recommended = instances.find((instance) => plan(instance) && instance.driverKind === "claudeAgent")
-    ?? instances.find((instance) => plan(instance) && instance.driverKind === "codex")
-    ?? instances.find((instance) => !instance.readOnly);
+  const recommended = rankAis(instances.filter(plan))[0] ?? instances.find((instance) => !instance.readOnly);
   return { recommended, others: instances.filter((instance) => instance !== recommended) };
+}
+
+export type FirstAiKind = "claude" | "chatgpt" | "opencode";
+
+interface FirstAi extends AiChoice {
+  authentication?: { method?: string };
+  snapshot?: { freeFallback?: boolean; authenticationUnavailableReason?: string };
+}
+
+const FIRST_AIS: ReadonlyArray<[FirstAiKind, string]> = [["claude", "claudeAgent"], ["chatgpt", "codex"], ["opencode", "opencodeGo"]];
+
+/** The welcome's three first ways to connect an AI, in this order: a Claude account, a ChatGPT account through Codex and
+ * OpenCode. Each is the provider's own sign-in that can work here: one already `ready` first, then ChatGPT's plan sign-in
+ * in the browser, else the first listed (on a Cloud, which refuses the plan sign-in, Codex's own). */
+export function firstAis<Instance extends FirstAi>(
+  instances: readonly Instance[],
+  ready: (instance: Instance) => boolean = () => false,
+): Array<{ kind: FirstAiKind; instance: Instance }> {
+  const own = instances.filter((instance) => !instance.readOnly && instance.access !== "api" && instance.access !== "custom"
+    && !instance.snapshot?.authenticationUnavailableReason);
+  return FIRST_AIS.flatMap(([kind, driverKind]) => {
+    const group = own.filter((instance) => instance.driverKind === driverKind);
+    const instance = group.find(ready) ?? group.find((candidate) => candidate.authentication?.method === "browser-pkce") ?? group[0];
+    return instance ? [{ kind, instance }] : [];
+  });
+}
+
+/** OpenCode's free models need no account, so its setup keeps its own words instead of the plain sign-in line. */
+export function signInFollows(instance: SignInStep & { driverKind: string }): boolean {
+  return plainSignIn(instance) && instance.driverKind !== "opencodeGo";
+}
+
+/** The AI the welcome's Connect an AI step stands on: the best ready AI (the same ranking) that isn't OpenCode's free
+ * backup unless the person `chose` it on the welcome, passing over one whose test message got no answer. An AI not
+ * tested yet is `testing`; none ready is null. */
+export function welcomeAi<Instance extends RankableAi>(
+  instances: readonly Instance[],
+  ready: (instance: Instance) => boolean,
+  test: (instance: Instance) => AiTestState | undefined,
+  chose: (instance: Instance) => boolean = () => false,
+): { instance: Instance; state: AiTestState } | null {
+  let silent: Instance | undefined;
+  for (const instance of rankAis(instances.filter((candidate) => ready(candidate) && (!freeFallback(candidate) || chose(candidate))))) {
+    const state = test(instance) ?? "testing";
+    if (state !== "failed") return { instance, state };
+    silent ??= instance;
+  }
+  return silent ? { instance: silent, state: "failed" } : null;
+}
+
+/** It answered its test, or has no way to be tested and is trusted as before. */
+export function aiWorks(found: { state: AiTestState } | null): boolean {
+  return found?.state === "passed" || found?.state === "untestable";
 }
 
 interface SignInStep {

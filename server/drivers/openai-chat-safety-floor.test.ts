@@ -75,6 +75,8 @@ async function fixture(commands: string[]) {
       return;
     }
     let data = "";
+    // Only a turn's POST carries a body; the Ollama probe GETs /api/version first (ollama-context.ts).
+    if (request.method !== "POST") { response.writeHead(404); response.end(); return; }
     for await (const part of request) data += part.toString();
     requests.push(JSON.parse(data) as ChatRequest);
     const command = commands[requests.length - 1];
@@ -193,7 +195,7 @@ describe("the safety floor in the chat runtime", () => {
     const f = await fixture([WIPE]);
     await f.start({ approvalMode: "ask" });
     const card = await f.recorder.until((event) => event.type === "request.opened");
-    expect(card).toMatchObject({ requestType: "permission", tool: "shell_exec" });
+    expect(card).toMatchObject({ requestType: "permission", tool: "mcp__shell__exec" });
     expect(f.handed()).toEqual([]);
     expect(await f.instance.adapter.respondToRequest(f.threadId, card.requestId!, { behavior: "allow" })).toBe("allowed-once");
     expect(await f.completed()).toMatchObject({ ok: true });
@@ -207,7 +209,7 @@ describe("the safety floor in the chat runtime", () => {
     const f = await fixture(["ls", WIPE, "pwd"]);
     await f.start({ approvalMode: "ask" });
     const card = await f.recorder.until((event) => event.type === "request.opened");
-    expect(card).toMatchObject({ tool: "shell_exec", allowSession: true });
+    expect(card).toMatchObject({ tool: "mcp__shell__exec", allowSession: true });
     await f.instance.adapter.respondToRequest(f.threadId, card.requestId!, { behavior: "allow", always: true });
     await f.completed();
     // one card for the whole turn: the grant covered the rest, except the wipe

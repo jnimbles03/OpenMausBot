@@ -10,7 +10,7 @@ import type { AppState, ConfigStatus, InstanceInfo } from "@/state/store";
 const fixture = vi.hoisted(() => ({ owner: true as boolean | null, track: vi.fn(), api: vi.fn(), connectedApps: vi.fn() }));
 vi.mock("@/lib/use-owner-or-admin", () => ({ useOwnerOrAdmin: () => fixture.owner }));
 vi.mock("@/lib/analytics", () => ({ track: fixture.track, analyticsEnabled: () => true }));
-vi.mock("@/components/PluginsPanel", () => ({ preloadConnectedApps: fixture.connectedApps }));
+vi.mock("@/lib/connected-apps", () => ({ preloadConnectedApps: fixture.connectedApps }));
 vi.mock("@/state/store", async (original) => ({ ...await original<typeof import("@/state/store")>(), api: fixture.api }));
 
 const LATE_EVENING = Date.parse("2026-10-15T22:30:00.000Z");
@@ -76,6 +76,10 @@ describe("useUsageSnapshot", () => {
     await draw(ready());
     expect(sent()).toHaveLength(1);
     expect(sent()[0]![1]).toMatchObject({ bots: 0, engines: ["claude"], platform: "browser", remote_client: false });
+    // Its reads are background reads: nobody is using a Cloud home when the day's snapshot goes (src/state/api.ts).
+    expect(fixture.api.mock.calls.length).toBeGreaterThan(0);
+    expect(fixture.api.mock.calls.every(([, init]) => (init as { background?: boolean } | undefined)?.background === true)).toBe(true);
+    expect(fixture.connectedApps).toHaveBeenCalledWith(false, true);
   });
 
   it("still sends one through re-renders and readiness that comes and goes", async () => {
@@ -153,14 +157,16 @@ describe("what the snapshot asks this page's app", () => {
     vi.stubGlobal("ogb", { remoteClient: { active: true }, ...bridges });
     await draw(ready({ webhookIngress: null }));
     expect(asked).toEqual([]);
-    expect(sent()[0]![1]).toMatchObject({ cloud_plan: "unknown", remote_client: true });
+    expect(sent()[0]![1]).toMatchObject({ remote_client: true });
+    expect(sent()[0]![1]).not.toHaveProperty("cloud_plan");
     expect(sent()[0]![1]).not.toHaveProperty("webhooks");
   });
 
   it("asks nothing in a plain browser", async () => {
     await draw(ready({ config: { ...ready().config!, cloudHome: true } }));
     expect(asked).toEqual([]);
-    expect(sent()[0]![1]).toMatchObject({ cloud_plan: "unknown", platform: "browser" });
+    expect(sent()[0]![1]).toMatchObject({ platform: "browser" });
+    expect(sent()[0]![1]).not.toHaveProperty("cloud_plan");
   });
 
   it("runs in the app shell, so every app page sends it", () => {

@@ -1,6 +1,10 @@
 import { z } from "zod";
 
+import { RESERVED_MCP_NAMES, slugMcpName } from "../shared/mcp-name.ts";
 import type { McpServerSpec, RemoteMcpSpec, StdioMcpSpec } from "./contracts.ts";
+import { MCP_RESTART_ENV } from "./mcp-app-catalog.ts";
+
+export { importedMcpServerName } from "../shared/mcp-name.ts";
 
 /** The computer a server runs on when its program, files or address are that computer's own: kept with its entry so a
  * bot can reach it through that computer, and never started anywhere else. */
@@ -11,12 +15,19 @@ export interface McpRunsOn {
   label: string;
 }
 
-/** One config.json `mcpServers` entry: the block Claude Code, Cursor and Claude Desktop write. */
+/** One config.json `mcpServers` entry: the block Claude Code, Cursor and Claude Desktop write. An env or header value (or
+ * an OAuth client secret) may be a `vault:<id>` pointer that a bot's secretRef left there: the secret stays in the Vault
+ * and the pointer is resolved when the server starts or is called. */
 export interface StoredStdioMcpServer extends StdioMcpSpec {
   enabled: boolean;
   /** Characters of one tool result allowed into context; 0 = never trim, absent = OMB_MCP_RESULT_BUDGET, else 8,000. */
   resultBudget?: number;
   runsOn?: McpRunsOn;
+  /** The id of the bot whose own server this is: its program or files are in that bot's folder, so it starts only for
+   * that bot. Absent: every bot's. */
+  bot?: string;
+  /** "Show its apps in chat": stored only as `false`; on by default. */
+  apps?: false;
 }
 /** An app pre-registered with the server's authorization server; its secret is a credential, never listed. */
 export interface McpOAuthClientConfig {
@@ -29,6 +40,10 @@ export interface StoredRemoteMcpServer extends RemoteMcpSpec {
   oauth?: McpOAuthClientConfig;
   resultBudget?: number;
   runsOn?: McpRunsOn;
+  /** The id of the bot this connection is for, such as one holding that bot's own key: only that bot reaches it. Absent: every bot's. */
+  bot?: string;
+  /** "Show its apps in chat": stored only as `false`; on by default. */
+  apps?: false;
 }
 export type StoredMcpServer = StoredStdioMcpServer | StoredRemoteMcpServer;
 
@@ -41,6 +56,8 @@ export interface StdioMcpServerListing {
   enabled: boolean;
   resultBudget?: number;
   runsOn?: McpRunsOn;
+  apps: boolean;
+  bot?: string;
 }
 export interface RemoteMcpServerListing {
   name: string;
@@ -49,8 +66,10 @@ export interface RemoteMcpServerListing {
   headerKeys: string[];
   enabled: boolean;
   resultBudget?: number;
+  apps: boolean;
   oauth?: { clientId: string; scopes: string[]; clientSecretConfigured: boolean };
   runsOn?: McpRunsOn;
+  bot?: string;
 }
 export type McpServerListing = StdioMcpServerListing | RemoteMcpServerListing;
 
@@ -58,7 +77,51 @@ export function isRemoteMcpServer(server: McpServerSpec): server is RemoteMcpSpe
   return "url" in server;
 }
 
+/** Whether `botId` may start this server: every bot may start one that is no bot's own. */
+export function mcpServerServes(server: object & { bot?: string }, botId: string | undefined): boolean {
+  return !server.bot || server.bot === botId;
+}
+
+/** Why a team setup plan cannot give this bot the named server, or null when it can. */
+export function mcpServerProblemFor(servers: Record<string, unknown> | undefined, name: string, botId: string): string | null {
+  const server = servers && Object.hasOwn(servers, name) ? servers[name] : undefined;
+  if (!server || typeof server !== "object") return "no such server";
+  return mcpServerServes(server, botId) ? null : "that server belongs to another bot";
+}
+
+/** How many MCP servers one bot can use: the shared ones plus its own. */
 export const MAX_MCP_SERVERS = 20;
+/** How many the whole install can hold, shared and per-bot together. */
+export const MAX_MCP_SERVERS_TOTAL = 100;
+
+/** How many servers there are, how many every bot uses, and the most any one bot has of its own. */
+function countMcpServers(values: readonly unknown[]): { total: number; shared: number; mostOwn: number } {
+  const own = new Map<string, number>();
+  let shared = 0;
+  for (const value of values) {
+    const bot = value && typeof value === "object" ? (value as { bot?: unknown }).bot : undefined;
+    if (typeof bot === "string" && bot) own.set(bot, (own.get(bot) ?? 0) + 1);
+    else shared++;
+  }
+  return { total: values.length, shared, mostOwn: Math.max(0, ...own.values()) };
+}
+
+/** Why `adding` would not fit next to `current`: at most 100 servers in all, and no bot may use more than 20, the shared ones plus its own. */
+export function mcpServerLimitError(current: Record<string, unknown>, adding: readonly unknown[]): string | null {
+  const { total, shared, mostOwn } = countMcpServers([...Object.values(current), ...adding]);
+  if (total > MAX_MCP_SERVERS_TOTAL) return `You can add at most ${MAX_MCP_SERVERS_TOTAL} MCP servers in all.`;
+  if (shared + mostOwn <= MAX_MCP_SERVERS) return null;
+  return mostOwn
+    ? `A bot can use at most ${MAX_MCP_SERVERS} MCP servers: the shared ones plus its own.`
+    : `You can add at most ${MAX_MCP_SERVERS} MCP servers.`;
+}
+
+/** How many more shared servers (ones every bot uses) fit next to `current`. */
+export function mcpSharedServerRoom(current: Record<string, unknown>): number {
+  const { total, shared, mostOwn } = countMcpServers(Object.values(current));
+  return Math.max(0, Math.min(MAX_MCP_SERVERS_TOTAL - total, MAX_MCP_SERVERS - shared - mostOwn));
+}
+
 const MAX_ARGS = 64;
 const MAX_ENV = 64;
 const MAX_HEADERS = 32;
@@ -70,6 +133,9 @@ const resultBudgetSchema = z.number({ message: "The result size limit must be a 
   .min(0, "The result size limit cannot be negative.")
   .max(MAX_RESULT_BUDGET, `The result size limit can be at most ${MAX_RESULT_BUDGET.toLocaleString("en-US")} characters; use 0 for no limit.`);
 const MCP_NAME = /^[a-z][a-z0-9_-]{0,31}$/;
+
+/** A server the request named is not saved here: its name, in the words every route answers with. */
+export const mcpServerNotFound = (name: string): string => `MCP server "${name}" not found. It may have been removed: check Apps → MCP servers.`;
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
 /** An HTTP header field name: RFC 9110 token characters. */
 const HEADER_NAME = /^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$/;
@@ -83,6 +149,22 @@ export function isHarnessOwnedMcpEnvName(name: string): boolean {
 export function isReservedMcpEnvEntry(name: string, value: string): boolean {
   if (name === "ELECTRON_RUN_AS_NODE") return value !== "1";
   return isHarnessOwnedMcpEnvName(name);
+}
+
+/** Custom command servers as Codex mounts them, with new MCP children every turn: the host's restart count (MCP_RESTART_ENV)
+ * only tells an engine that keeps servers across turns to start a new one, so it is dropped here instead of failing every
+ * turn as an OMB_ name; any other reserved variable is refused. */
+export function perTurnCustomMcp<T extends { integrations?: { custom?: Record<string, McpServerSpec> } }>(turn: T): T {
+  if (!turn.integrations?.custom) return turn;
+  const custom = { ...turn.integrations.custom };
+  for (const [name, server] of Object.entries(custom)) {
+    if ("url" in server) continue;
+    const { [MCP_RESTART_ENV]: _restarts, ...env } = server.env;
+    const reserved = Object.entries(env).find(([key, value]) => isReservedMcpEnvEntry(key, value));
+    if (reserved) throw new Error(`Custom MCP server “${name}” cannot set reserved environment variable “${reserved[0]}”`);
+    custom[name] = { ...server, env };
+  }
+  return { ...turn, integrations: { ...turn.integrations, custom } };
 }
 
 function environmentEntryError(name: string, value: string): string | null {
@@ -114,18 +196,7 @@ function urlError(value: string): string | null {
   return null;
 }
 
-const RESERVED_MCP_NAMES = new Set([
-  "ogb",
-  "computer",
-  "agents",
-  "composio",
-  "data",
-  "browser",
-  "phone",
-  "dweb",
-  "openmausbot_connectors",
-  "openmausbot_phone",
-]);
+const BOT_ID = /^[A-Za-z0-9_-]{1,128}$/u;
 
 const runsOnSchema = z.object({
   environmentId: z.string().regex(/^[\w-]{1,128}$/u),
@@ -133,15 +204,19 @@ const runsOnSchema = z.object({
 }).strict();
 
 const stdioEntrySchema = z.object({
+  /** Optional, as other MCP clients write it; a command always runs over stdio, so it is not stored. */
+  type: z.literal("stdio").optional(),
   command: z.string().trim().min(1).max(1_024),
   args: z.array(z.string().max(4_096)).max(MAX_ARGS).optional(),
   env: z.record(z.string(), z.string().max(16_384)).optional(),
   enabled: z.boolean().optional(),
   resultBudget: resultBudgetSchema.optional(),
   runsOn: runsOnSchema.optional(),
+  apps: z.boolean().optional(),
+  bot: z.string().regex(BOT_ID).optional(),
 }).strict();
 
-/** `runsOn: null` says it runs here after all; left out, an edit keeps the computer it runs on. */
+/** `runsOn: null` says it runs here after all; left out, an edit keeps the computer it runs on and the bot it is for. */
 const stdioMutationSchema = stdioEntrySchema.extend({
   env: z.record(z.string(), z.union([z.string().max(16_384), z.literal(true)])).optional(),
   runsOn: runsOnSchema.nullable().optional(),
@@ -168,6 +243,8 @@ const remoteEntrySchema = z.object({
   enabled: z.boolean().optional(),
   resultBudget: resultBudgetSchema.optional(),
   runsOn: runsOnSchema.optional(),
+  apps: z.boolean().optional(),
+  bot: z.string().regex(BOT_ID).optional(),
 }).strict();
 
 const remoteMutationSchema = remoteEntrySchema.extend({
@@ -256,8 +333,15 @@ function parseStdio(raw: unknown, mutation: boolean, existing?: StoredMcpServer)
       enabled: enabledFor(parsed.data.enabled, mutation, existing),
       ...(parsed.data.resultBudget !== undefined ? { resultBudget: parsed.data.resultBudget } : {}),
       ...runsOnFor(parsed.data.runsOn, mutation, existing),
+      ...appsFor(parsed.data.apps, mutation, existing),
+      ...botFor(parsed.data.bot, mutation, existing),
     },
   };
+}
+
+function botFor(value: string | undefined, mutation: boolean, existing?: StoredMcpServer): { bot?: string } {
+  const bot = value ?? (mutation ? existing?.bot : undefined);
+  return bot ? { bot } : {};
 }
 
 function parseRemote(raw: unknown, mutation: boolean, existing?: StoredMcpServer): Parsed {
@@ -287,6 +371,8 @@ function parseRemote(raw: unknown, mutation: boolean, existing?: StoredMcpServer
       enabled: enabledFor(parsed.data.enabled, mutation, existing),
       ...(parsed.data.resultBudget !== undefined ? { resultBudget: parsed.data.resultBudget } : {}),
       ...runsOnFor(parsed.data.runsOn, mutation, existing),
+      ...appsFor(parsed.data.apps, mutation, existing),
+      ...botFor(parsed.data.bot, mutation, existing),
     },
   };
 }
@@ -299,6 +385,11 @@ function runsOnFor(value: McpRunsOn | null | undefined, mutation: boolean, exist
 function enabledFor(value: boolean | undefined, mutation: boolean, existing?: StoredMcpServer): boolean {
   if (!mutation) return value !== false;
   return existing ? (value ?? existing.enabled) : false;
+}
+
+function appsFor(value: boolean | undefined, mutation: boolean, existing?: StoredMcpServer): { apps?: false } {
+  const on = value ?? (mutation && existing ? existing.apps !== false : true);
+  return on ? {} : { apps: false };
 }
 
 export function parseStoredMcpServer(name: string, raw: unknown): Parsed {
@@ -343,8 +434,13 @@ export type DisabledMcpServerAdd =
 
 const BOT_CANNOT_SWITCH = "A bot cannot change the on/off switch. The server is saved off, and only the user can turn it on in MCP server settings.";
 
-/** Never probes or launches; the caller still applies organisation policy before writing. */
-export function addDisabledMcpServer(current: Record<string, unknown>, body: unknown): DisabledMcpServerAdd {
+/** Never probes or launches; the caller still applies organisation policy before writing. `ownerOf` names the bot the
+ * server will belong to (worked out by the caller, never taken from the body), so the per-bot limit counts it there. */
+export function addDisabledMcpServer(
+  current: Record<string, unknown>,
+  body: unknown,
+  ownerOf?: (server: StoredMcpServer) => string | undefined,
+): DisabledMcpServerAdd {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { ok: false, status: 400, error: "Expected an MCP server object with a name." };
   }
@@ -354,11 +450,11 @@ export function addDisabledMcpServer(current: Record<string, unknown>, body: unk
   if (name && Object.hasOwn(current, name)) {
     return { ok: false, status: 409, error: "An MCP server with that name already exists." };
   }
-  if (Object.keys(current).length >= MAX_MCP_SERVERS) {
-    return { ok: false, status: 400, error: `You can add at most ${MAX_MCP_SERVERS} MCP servers.` };
-  }
   const parsed = parseMcpServerMutation(name, pickMcpServerFields(record));
   if (!parsed.ok) return { ok: false, status: 400, error: parsed.error };
+  const owner = ownerOf?.(parsed.server);
+  const limit = mcpServerLimitError(current, [owner ? { ...parsed.server, bot: owner } : parsed.server]);
+  if (limit) return { ok: false, status: 400, error: limit };
   if (parsed.server.enabled !== false) return { ok: false, status: 400, error: BOT_CANNOT_SWITCH };
   return { ok: true, name, server: parsed.server, next: { ...current, [name]: parsed.server } };
 }
@@ -376,10 +472,12 @@ export function listMcpServers(raw: Record<string, unknown> | undefined): McpSer
         headerKeys: Object.keys(server.headers).sort(),
         enabled: server.enabled,
         ...(server.resultBudget !== undefined ? { resultBudget: server.resultBudget } : {}),
+        apps: server.apps !== false,
         ...(server.oauth ? {
           oauth: { clientId: server.oauth.clientId, scopes: server.oauth.scopes ?? [], clientSecretConfigured: Boolean(server.oauth.clientSecret) },
         } : {}),
         ...(server.runsOn ? { runsOn: server.runsOn } : {}),
+        ...(server.bot ? { bot: server.bot } : {}),
       }];
     }
     return [{
@@ -390,6 +488,8 @@ export function listMcpServers(raw: Record<string, unknown> | undefined): McpSer
       enabled: server.enabled,
       ...(server.resultBudget !== undefined ? { resultBudget: server.resultBudget } : {}),
       ...(server.runsOn ? { runsOn: server.runsOn } : {}),
+      apps: server.apps !== false,
+      ...(server.bot ? { bot: server.bot } : {}),
     }];
   });
 }
@@ -449,13 +549,3 @@ export function parseMcpServersImport(
   return { ok: true, servers };
 }
 
-/** What Paste config names a server another tool calls `raw`; a name OpenMausBot keeps for itself gets an mcp- prefix. */
-export function importedMcpServerName(raw: string): string {
-  const slug = slugMcpName(raw);
-  return RESERVED_MCP_NAMES.has(slug) ? `mcp-${slug}`.slice(0, 32) : slug;
-}
-
-function slugMcpName(raw: string): string {
-  const slug = raw.trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32);
-  return /^[a-z]/.test(slug) ? slug : slug ? `mcp-${slug}`.slice(0, 32) : "";
-}

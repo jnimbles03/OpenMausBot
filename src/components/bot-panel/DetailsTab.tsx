@@ -1,234 +1,122 @@
-import { useState } from "react";
-import { ChevronRight, FileText, Plus, Sparkles } from "lucide-react";
+import { Calendar, CalendarPlus, ChevronRight, Sparkles } from "lucide-react";
 
 import { cn } from "@/lib/cn";
 import { t } from "@/lib/i18n";
-import type { BotOverview } from "@/lib/bot-overview-types";
-import type { Routine } from "@/lib/routines";
-import { routineFinished, routineNextLabel } from "@/lib/routine-display";
-import { scheduleLabel } from "@/lib/schedule-label";
-import { firstSentence } from "@/lib/soul";
-import { useStore, type Bot } from "@/state/store";
-import type { ApprovalMode } from "../../../shared/approval-mode";
-import type { ReplyStyle } from "../../../shared/reply-style";
-import { approvalModeOptionsFor } from "../ApprovalModeSelector";
-import { engineReady } from "../EngineLibrary";
-import { LocalComputerAutoWarning } from "../LocalComputerAutoWarning";
-import { RoutineEditor } from "../RoutinesPage";
-import { SoulField } from "../SoulField";
-import { useBotApps } from "../bot-settings/useBotApps";
-import type { BotPatch, useBotSettingsDerived } from "../bot-settings/useBotSettingsDerived";
-import { AppsCard } from "./apps-and-logins";
-import type { PageId } from "./page-registry";
-import { BotSwitch, buttonCls, Card, ColRow, LabelAction, LinkRow, NavRow, NoteRow, rowCls, Segmented, SegmentedRow } from "./rows";
+import { currentTaskBot, type Bot } from "@/state/store";
+import { useChatMoreItems } from "../ChatMoreMenu";
+import { EffortRow, ModelPicker } from "../ModelPicker";
+import type { SidebarMenuItem } from "../SidebarPopoverMenu";
+import type { useBotSettingsDerived } from "../bot-settings/useBotSettingsDerived";
+import { BotConversations } from "./Conversations";
+import type { SimplePageId } from "./page-registry";
+import { TryAsking } from "./TryAsking";
+import { Card, CardLabel, LabelAction, panelActionCls, NavRow, RowIcon, rowCls, RowText } from "./rows";
+import { useStoreDispatch, useStoreSelector } from "@/state/store-select";
+import { newChatBot } from "@/state/new-chat";
 
 type Derived = ReturnType<typeof useBotSettingsDerived>;
 
-export function DetailsTab({ bot, derived, overview, onOpen }: {
+export const CONVERSATION_ITEMS = ["find", "start-fresh", "share-team", "share-person", "usage", "activity", "inspector"];
+
+/** A ⋯ menu item drawn as a panel row: the same label, icon, value and handler. */
+export function ItemRow({ item }: { item: SidebarMenuItem }) {
+  // Only the usage value is long text that should wrap; shortcuts and other values keep their full width.
+  const wrapsValue = item.key === "usage";
+  return (
+    <button
+      type="button"
+      data-panel-item={item.key}
+      disabled={item.disabled}
+      title={item.title}
+      aria-pressed={item.active || undefined}
+      onClick={item.onSelect}
+      className={cn(rowCls, "w-full rounded-[8px] text-left enabled:hover:bg-ink/[0.04] disabled:cursor-default disabled:opacity-45")}
+    >
+      <span className="flex size-4 shrink-0 items-center justify-center text-ink-secondary [&_svg]:size-4" aria-hidden="true">
+        {item.icon}
+      </span>
+      <span className={cn("min-w-0 truncate text-[14px] font-medium", !wrapsValue && "flex-1", item.active ? "text-accent-text" : "text-ink")}>{item.label}</span>
+      {item.trailing && <span className={cn("flex items-center", wrapsValue ? "min-w-0 flex-1 justify-end text-right" : "shrink-0")}>{item.trailing}</span>}
+      {item.key !== "find" && item.key !== "start-fresh" && <ChevronRight size={15} aria-hidden="true" className="shrink-0 text-ink-tertiary rtl:-scale-x-100" />}
+    </button>
+  );
+}
+
+export function DetailsTab({ bot, derived, onOpen }: {
   bot: Bot;
   derived: Derived;
-  overview: BotOverview | null;
-  onOpen: (page: PageId) => void;
+  onOpen: (page: SimplePageId) => void;
 }) {
-  const { state, dispatch } = useStore();
-  const [editingSoul, setEditingSoul] = useState(false);
-  const [localAutoWarning, setLocalAutoWarning] = useState<{ botId: string; patch: BotPatch } | null>(null);
-  const [editingRoutine, setEditingRoutine] = useState<Routine | "new" | null>(null);
-  const apps = useBotApps(bot);
-  const { patch, approvalMode, engine, trustedModesAvailable } = derived;
-
-  // Antigravity's old Auto still executes as Ask: show that without changing the saved mode or granting Full.
-  const displayedApprovalMode = engine?.driverKind === "antigravityAgent" && approvalMode === "auto" ? "ask" : approvalMode;
-  const autoOffered = approvalModeOptionsFor(engine?.driverKind ?? "", trustedModesAvailable)
-    .some((option) => option.mode === "auto");
-  const chooseMode = (mode: Extract<ApprovalMode, "ask" | "auto" | "full">) => {
-    if (bot.busy || mode === approvalMode) return;
-    if (mode === "full") {
-      dispatch({ type: "updateBot", botId: bot.id, patch: { approvalMode: "full", applyToAllThreads: true } });
-      return;
-    }
-    if (mode === "auto" && bot.computer === "local") {
-      setLocalAutoWarning({ botId: bot.id, patch: { approvalMode: "auto", acknowledgeLocalAuto: true } });
-      return;
-    }
-    patch({ approvalMode: mode });
-  };
-  const customMode = displayedApprovalMode === "edits" || displayedApprovalMode === "custom";
-  const actsHint = customMode
-    ? <span data-approval-custom>{t("botSettings.simple.customMode")}</span>
-    : t(displayedApprovalMode === "auto" ? "botSettings.simple.decideHint"
-      : displayedApprovalMode === "full" ? "botSettings.simple.fullHint" : "botSettings.simple.askHint");
-
-  const routines = [...derived.botRoutines].sort((a, b) =>
-    Number(b.enabled) - Number(a.enabled) || (a.nextRunAt ?? Infinity) - (b.nextRunAt ?? Infinity) || a.name.localeCompare(b.name));
-  const soulOpen = editingSoul || Boolean(bot.soulDrift);
-  const setupLeft = (overview?.setup ?? []).filter((step) => !step.done).length;
+  const { items } = useChatMoreItems(bot);
+  const dispatch = useStoreDispatch();
+  // While a blank chat is open the chat shows it, not the conversation it covers: the Model and Reasoning rows show and
+  // set the blank chat's choices, which the first send applies to the conversation it makes.
+  const newChat = useStoreSelector((state) => state.newChat);
+  const thread = currentTaskBot(newChatBot(bot, newChat));
+  const routinesOn = derived.botRoutines.filter((routine) => routine.enabled).length;
+  const conversationItems = CONVERSATION_ITEMS.flatMap((key) => items.filter((item) => item.key === key));
 
   return (
     <div data-panel-tabpanel="details">
-      {setupLeft > 0 && (
-        <Card>
-          <NavRow
-            data-panel-page="setup"
-            icon={Sparkles}
-            title={t("botPanel.finishSetup")}
-            hint={t("botPanel.finishSetupHint", { count: setupLeft, name: bot.name })}
-            onClick={() => onOpen("setup")}
+      {/* One row style down the whole tab: flat rows under quiet labels, no cards. */}
+      <section data-panel-card="model" className="pt-2">
+        <div data-panel-row="model" className={cn(rowCls, "rounded-[8px]")}>
+          <ModelPicker
+            key={thread.threadId}
+            bot={thread}
+            contained
+            threadId={thread.threadId}
+            label={<span className="flex shrink-0 items-center gap-2.5"><RowIcon icon={Sparkles} /><RowText title={t("model.simple.model")} /></span>}
           />
-        </Card>
-      )}
-
-      {!(engine && engineReady(engine)) && (
-        <Card anchor="model">
-          <NoteRow tone="warn">{t("botPanel.noAi", { name: bot.name })}</NoteRow>
-          <LinkRow data-panel-link="connect-ai" onClick={() => dispatch({ type: "toggleAppSettings", open: true, section: "engines" })}>
-            {t("onboarding.engines.title")}
-          </LinkRow>
-        </Card>
-      )}
-
-      <Card label={t("botSettings.simple.instructions")} anchor="instructions">
-        {soulOpen ? (
-          <ColRow data-panel-row="soul">
-            <SoulField
-              bot={bot}
-              onPatch={patch}
-              simple={{
-                label: t("botSettings.simple.instructions"),
-                placeholder: t("botSettings.simple.instructionsPlaceholder", { name: bot.name }),
-              }}
-            />
-            {editingSoul && (
-              <div className="flex justify-end">
-                <button type="button" data-panel-done="soul" onClick={() => setEditingSoul(false)} className={buttonCls}>
-                  {t("botSettings.simple.done")}
-                </button>
-              </div>
-            )}
-          </ColRow>
-        ) : (
-          <button
-            type="button"
-            data-panel-edit="soul"
-            aria-label={`${t("botSettings.simple.edit")}: ${t("botSettings.simple.instructions")}`}
-            onClick={() => setEditingSoul(true)}
-            className={cn(rowCls, "w-full text-left hover:bg-ink/[0.03]")}
-          >
-            <span className={cn("line-clamp-2 min-w-0 flex-1 text-[13px]", bot.soul?.trim() ? "text-ink" : "text-ink-secondary")}>
-              {firstSentence(bot.soul ?? "") || t("botSettings.simple.noInstructions")}
-            </span>
-            <span className="inline-flex shrink-0 items-center gap-0.5 text-[13.5px] text-ink">
-              {t("botSettings.simple.edit")}
-              <ChevronRight size={14} aria-hidden="true" />
-            </span>
-          </button>
-        )}
-        <SegmentedRow
-          attr="data-reply-style-choice"
-          title={t("botSettings.replyStyle.title")}
-          label={t("botSettings.replyStyle.title")}
-          value={bot.replyStyle ?? "default"}
-          onChange={(replyStyle: ReplyStyle) => patch({ replyStyle })}
-          options={[
-            { value: "default", label: t("botSettings.replyStyle.default"), tooltip: t("botSettings.replyStyle.defaultHint") },
-            { value: "conversational", label: t("botSettings.replyStyle.conversational"), tooltip: t("botSettings.replyStyle.conversationalHint") },
-          ]}
-        />
-        <LinkRow data-panel-link="instructions" onClick={() => onOpen("instructions")}>{t("botPanel.soulAndVersions")}</LinkRow>
-      </Card>
-
-      <Card label={t("botSettings.simple.beforeActs", { name: bot.name })} anchor="approval">
-        <ColRow data-panel-row="approval">
-          <Segmented
-            attr="data-approval-choice"
-            label={t("botSettings.simple.beforeActs", { name: bot.name })}
-            value={displayedApprovalMode}
-            onChange={chooseMode}
-            options={[
-              { value: "ask", label: t("botSettings.simple.ask"), tooltip: t("botSettings.simple.askHint"), disabled: Boolean(bot.busy) },
-              { value: "auto", label: t("botSettings.simple.decide"), tooltip: t("botSettings.simple.decideHint"), disabled: Boolean(bot.busy) || !autoOffered },
-              { value: "full", label: t("botSettings.simple.full"), tooltip: t("botSettings.simple.fullHint"), disabled: Boolean(bot.busy) },
-            ]}
-          />
-          <div className="mx-0.5 text-[12.5px] leading-[1.35] text-ink-secondary">{actsHint}</div>
-        </ColRow>
-        <LinkRow data-panel-link="approvals" onClick={() => onOpen("approvals")}>{t("botPanel.moreApprovals")}</LinkRow>
-      </Card>
-
-      <Card
-        label={t("botSettings.simple.routines")}
-        anchor="routines"
-        action={routines.length > 0 ? (
-          <LabelAction data-panel-action="routines" aria-label={t("botPanel.allRoutines")} onClick={() => onOpen("routines")}>
-            {routines.length}
-          </LabelAction>
-        ) : undefined}
-      >
-        {routines.length === 0 ? (
-          <NoteRow>{t("botSettings.simple.routinesEmpty", { name: bot.name })}</NoteRow>
-        ) : routines.map((routine) => (
-          <div key={routine.id} data-simple-routine={routine.id} className={rowCls}>
-            <button type="button" onClick={() => setEditingRoutine(routine)} className="min-w-0 flex-1 text-left">
-              <div className="truncate text-[13.5px] font-medium text-ink">{routine.name}</div>
-              <div className="mt-px truncate text-[12.5px] text-ink-secondary">
-                {scheduleLabel(routine.schedule)} · {routineNextLabel(routine)}
-              </div>
-            </button>
-            {!routineFinished(routine) && (
-              <BotSwitch
-                color={bot.color}
-                checked={routine.enabled}
-                aria-label={t("routines.toggle", { name: routine.name })}
-                onClick={() => dispatch({ type: "updateRoutine", routineId: routine.id, patch: { enabled: !routine.enabled } })}
-              />
-            )}
-          </div>
-        ))}
-        <div className={cn(rowCls, "flex-wrap gap-2")}>
-          <button type="button" data-panel-action="new-routine" onClick={() => setEditingRoutine("new")} className={buttonCls}>
-            <Plus size={14} aria-hidden="true" />
-            {t("computer.routines.create")}
-          </button>
-          <button
-            type="button"
-            data-panel-action="routine-logs"
-            onClick={() => dispatch({ type: "showRoutines", section: "logs", botId: bot.id })}
-            className={buttonCls}
-          >
-            <FileText size={13} aria-hidden="true" />
-            {t("routines.logs")}
-          </button>
         </div>
-        <LinkRow
-          data-panel-link="schedules"
-          onClick={() => dispatch({ type: "showRoutines", section: "schedule", view: "list", botId: bot.id })}
-        >
-          {t("computer.routines.openTitle")}
-        </LinkRow>
-      </Card>
-
-      <AppsCard bot={bot} derived={derived} apps={apps} onOpenAccess={() => onOpen("apps")} />
-
-      {editingRoutine && (
-        <RoutineEditor
-          key={bot.id}
-          routine={editingRoutine === "new" ? undefined : editingRoutine}
-          bots={[bot]}
-          lockedBotId={bot.id}
-          onClose={() => setEditingRoutine(null)}
+        {/* The picker hides its own reasoning row when contained, so this tab draws it as its own row. */}
+        <EffortRow
+          bot={thread}
+          threadId={thread.threadId}
+          compact
+          className={cn(rowCls, "min-w-0 flex-1 rounded-[8px]")}
+          label={<span className="flex shrink-0 items-center gap-2.5"><RowIcon icon={Sparkles} /><RowText title={t("model.simple.reasoning")} /></span>}
         />
+      </section>
+
+      <BotConversations bot={bot} />
+
+      <TryAsking bot={bot} />
+
+      {conversationItems.length > 0 && (
+        <section data-panel-card="conversation">
+          <CardLabel>{t("botPanel.section.conversation")}</CardLabel>
+          {conversationItems.map((item) => <ItemRow key={item.key} item={item} />)}
+        </section>
       )}
-      <LocalComputerAutoWarning
-        open={localAutoWarning !== null}
-        onCancel={() => setLocalAutoWarning(null)}
-        onConfirm={() => {
-          const target = localAutoWarning;
-          setLocalAutoWarning(null);
-          if (!target) return;
-          dispatch({ type: "updateBot", botId: target.botId, patch: target.patch });
-        }}
-      />
-      {state.routinesLoadState === "error" && <p role="alert" className="mx-1 mt-2 text-[12px] text-danger">{t("routines.loadError")}</p>}
+
+      {derived.botRoutines.length === 0 ? (
+        <section data-panel-empty="routines">
+          <CardLabel action={<LabelAction data-panel-automations="" onClick={() => dispatch({ type: "showRoutines", view: "list" })}>{t("sidebar.nav.automations")}</LabelAction>}>
+            {t("botSettings.simple.routines")}
+          </CardLabel>
+          <button
+            type="button"
+            data-panel-page="routines"
+            title={t("botPanel.routines.emptyHint")}
+            onClick={() => onOpen("routines")}
+            className={cn(panelActionCls, "w-full")}
+          >
+            <CalendarPlus size={15} aria-hidden="true" className="shrink-0 text-ink-secondary" />
+            <span className="truncate">{t("botPanel.routines.add")}</span>
+          </button>
+        </section>
+      ) : (
+        <Card label={t("botSettings.simple.routines")} anchor="routines">
+          <NavRow
+            data-panel-page="routines"
+            icon={Calendar}
+            title={t("botSettings.simple.routines")}
+            value={routinesOn > 0 ? t("botPanel.routinesOn", { count: routinesOn }) : t("botPanel.none")}
+            onClick={() => onOpen("routines")}
+          />
+        </Card>
+      )}
     </div>
   );
 }

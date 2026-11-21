@@ -23,7 +23,9 @@ import type { CdpPage } from "./cdp/page.ts";
 import { browserRoot, profileDir, profileHash, profileKind, removeProfile, workspaceId } from "./chrome/profile.ts";
 import { BROWSER_CONTROL_REFUSAL, ProfileControl, type TakeResult } from "./control.ts";
 import { executeTool, personUrl, toolFailure, type ToolContext } from "./dispatch.ts";
+import { installedExtensions } from "./extensions.ts";
 import { HealthShown, pageHealthLine } from "./health.ts";
+import type { HoldLimits } from "./hold.ts";
 import { errorResult, shapeResult, textResult, withParts, type ToolResult } from "./shape.ts";
 import { TabRegistry, type Tab } from "./tabs.ts";
 import { parseToolCall, RESTART_TOOL, TOOL_LIST } from "./tools.ts";
@@ -49,6 +51,8 @@ export interface BrowserServiceOptions {
   /** Browsers running at once on this server. */
   maxRunning: number;
   idleMs(): number;
+  /** A running turn holds this session between browser calls too. */
+  held?(session: string): boolean;
   scrub?: (text: string) => string;
   /** What the egress gate of this profile's browser refused since it was last asked, as one line. */
   egressNotice?: (key: string) => string | null;
@@ -57,6 +61,8 @@ export interface BrowserServiceOptions {
   laneWaitMs?: number;
   takeoverMs?: number;
   capacityWaitMs?: number;
+  /** How long a person's hold lasts without a hand-back; the standard limits when unset. */
+  holdLimits?: HoldLimits;
   log?: (line: string) => void;
 }
 
@@ -79,7 +85,11 @@ export class ProfileState {
   readonly shown = new WeakMap<Tab, HealthShown>();
   run: Running | null = null;
   starting: Promise<Running> | null = null;
+  /** The Chrome the pending start is opening; a stop waits for it. */
+  opening: Promise<Running> | null = null;
   stopping: Promise<void> | null = null;
+  /** Bumped by every stop: a start begun before it closes what it opened. */
+  epoch = 0;
   lastUsed = Date.now();
   calls = 0;
   reopened: Reopened = null;
@@ -169,18 +179,35 @@ export class BrowserService {
   running(profile: ProfileState): Promise<Running> {
     if (profile.run && !profile.run.closing && profile.run.browser.connected) return Promise.resolve(profile.run);
     if (profile.starting) return profile.starting;
+    const epoch = profile.epoch;
     const starting = (async () => {
       for (let stopping = profile.stopping; stopping; stopping = profile.stopping) await stopping;
-      return this.#start(profile);
+      return this.#start(profile, epoch);
     })().finally(() => { if (profile.starting === starting) profile.starting = null; });
     profile.starting = starting;
     return starting;
   }
 
-  async #start(profile: ProfileState): Promise<Running> {
-    await this.#capacity(profile);
+  async #start(profile: ProfileState, epoch: number): Promise<Running> {
+    await this.#capacity(profile, epoch);
+    this.#stillWanted(profile, epoch);
+    const opening = this.#open(profile, epoch);
+    profile.opening = opening;
+    try {
+      return await opening;
+    } finally {
+      if (profile.opening === opening) profile.opening = null;
+    }
+  }
+
+  #stillWanted(profile: ProfileState, epoch: number): void {
+    if (profile.epoch !== epoch || this.#profiles.get(profile.key) !== profile) throw new Error("The browser was closed while it was starting.");
+  }
+
+  async #open(profile: ProfileState, epoch: number): Promise<Running> {
     const fresh = profile.fresh;
     profile.fresh = false;
+    rmSync(profile.downloadDir, { recursive: true, force: true });
     mkdirSync(profile.downloadDir, { recursive: true, mode: 0o700 });
     const opened = await this.#options.backend(profile.key).open({ key: profile.key, mode: "headless", fresh, viewport: profile.hub.viewport(), downloadDir: profile.downloadDir });
     const run: Running = { opened, browser: opened.browser, offs: [], closing: false };
@@ -214,10 +241,13 @@ export class BrowserService {
       if (profile.tabs.remove(page.targetId)) profile.hub.tabsChanged();
     }));
     if (browser.downloads) run.offs.push(browser.downloads.onChange((download) => profile.hub.downloaded(download)));
+    if (opened.onPersonInput) run.offs.push(opened.onPersonInput(() => { profile.lastUsed = Date.now(); }));
     try {
+      this.#stillWanted(profile, epoch);
       await browser.waitForPage(() => true, 15_000);
       for (const page of browser.pages()) await page.ready.then(() => adopt(page, "restored"), () => undefined);
       if (fresh) await this.#onlyBlankTab(profile, browser);
+      this.#stillWanted(profile, epoch);
     } catch (error) {
       run.closing = true;
       for (const off of run.offs) off();
@@ -248,6 +278,11 @@ export class BrowserService {
     profile.run = null;
     profile.tabs.clear();
     if (run.closing) return;
+    try {
+      rmSync(profile.downloadDir, { recursive: true, force: true });
+    } catch (error) {
+      this.#options.log?.(`browser ${profile.key}: could not remove downloads: ${error}`);
+    }
     profile.reopened = { kind: "crash", pages: [] };
     profile.control.settle();
     this.#options.log?.(`browser ${profile.key}: Chrome exited unexpectedly; the next call starts it again`);
@@ -256,9 +291,12 @@ export class BrowserService {
 
   /** Graceful: Chrome's own quit, so its next start reopens the tabs and keeps session cookies. */
   async #stop(profile: ProfileState, reopened: Reopened, { erase = false }: { erase?: boolean } = {}): Promise<void> {
-    if (profile.stopping) return profile.stopping;
+    if (profile.stopping && !erase) return profile.stopping;
+    profile.epoch++;
+    if (profile.stopping) return this.#barrier(profile, profile.stopping.then(() => this.#erase(profile)));
     const run = profile.run;
-    const stopping = (async () => {
+    const opening = profile.opening;
+    return this.#barrier(profile, (async () => {
       profile.control.closing = true;
       profile.control.changed();
       try {
@@ -268,21 +306,33 @@ export class BrowserService {
           profile.hub.stopped(reopened?.kind === "idle" ? "asleep" : "closed");
           await run.opened.close().catch(() => undefined);
         }
+        await opening?.catch(() => undefined);
       } finally {
         if (profile.run === run) profile.run = null;
         profile.tabs.clear();
         if (reopened) profile.reopened = reopened;
-        if (profile.temporary || erase) this.#erase(profile);
-        profile.control.closing = false;
-        profile.control.settle();
+        try {
+          if (erase) this.#erase(profile);
+          else if (profile.temporary) this.#eraseFiles(profile.key);
+          else rmSync(profile.downloadDir, { recursive: true, force: true });
+        } finally {
+          profile.control.closing = false;
+          profile.control.settle();
+        }
       }
-    })().finally(() => { if (profile.stopping === stopping) profile.stopping = null; });
+    })());
+  }
+
+  #barrier(profile: ProfileState, work: Promise<void>): Promise<void> {
+    const stopping = work.finally(() => { if (profile.stopping === stopping) profile.stopping = null; });
     profile.stopping = stopping;
     return stopping;
   }
 
   #erase(profile: ProfileState): void {
+    if (this.#profiles.get(profile.key) !== profile) return;
     this.#eraseFiles(profile.key);
+    this.#profiles.delete(profile.key);
   }
 
   #eraseFiles(key: string): void {
@@ -294,13 +344,15 @@ export class BrowserService {
 
   #unused(profile: ProfileState, idleMs: number): boolean {
     return profile.run !== null && !profile.starting && !profile.stopping && profile.calls === 0
-      && profile.control.owner === null && profile.control.agents === 0 && !this.#lanes.held(profile.key) && Date.now() - profile.lastUsed >= idleMs;
+      && profile.control.owner === null && profile.control.agents === 0 && !this.#lanes.held(profile.key)
+      && !this.#options.held?.(profile.session) && Date.now() - profile.lastUsed >= idleMs;
   }
 
   /** The least recently used unwatched idle browser makes room; with none, the call waits, then is told why it cannot start. */
-  async #capacity(profile: ProfileState): Promise<void> {
+  async #capacity(profile: ProfileState, epoch: number): Promise<void> {
     const until = Date.now() + this.#options.capacityWaitMs;
     for (;;) {
+      this.#stillWanted(profile, epoch);
       const others = this.profiles().filter((other) => other !== profile && (other.run || other.starting));
       if (others.length < this.#options.maxRunning) return;
       const candidate = others.filter((other) => other.hub.size === 0 && this.#unused(other, 0)).sort((a, b) => a.lastUsed - b.lastUsed)[0];
@@ -349,7 +401,6 @@ export class BrowserService {
     const profile = this.#profiles.get(key);
     if (profile) {
       await this.#stop(profile, null, { erase: true });
-      this.#profiles.delete(key);
       this.#holds.drop(profile.session);
     } else {
       this.#eraseFiles(key);
@@ -597,6 +648,12 @@ export class BrowserService {
     return this.#bySession(session)?.control.owner ?? null;
   }
 
+  /** A bot call or a person's hold is under way in this session's browser. */
+  working(session: string): boolean {
+    const profile = this.#bySession(session);
+    return Boolean(profile && (profile.calls > 0 || profile.control.owner !== null || profile.control.agents > 0 || this.#lanes.held(profile.key)));
+  }
+
   /** Whether the page's open picker was offered to `owner`'s view as `chooserId`: an upload for any other is refused unread. */
   fileChooserOffered(session: string, owner: string, chooserId: string): boolean {
     return this.#bySession(session)?.hub.fileChooserOffered(owner, chooserId) ?? false;
@@ -613,10 +670,6 @@ export class BrowserService {
     return download?.state === "completed" && download.path ? download : undefined;
   }
 
-  canControl(session: string, owner: string): boolean {
-    return this.#bySession(session)?.control.canControl(owner) ?? false;
-  }
-
   interrupted(session: string): boolean {
     return this.#bySession(session)?.control.uncertain === true;
   }
@@ -627,12 +680,7 @@ export class BrowserService {
 
   /** Done on a sign-in card, from any window or device: whoever holds this browser hands it back. */
   async handBack(session: string): Promise<void> {
-    const profile = this.#bySession(session);
-    const owner = profile?.control.owner;
-    if (!profile || !owner) return;
-    const viewer = [...profile.hub.viewers].find((candidate) => candidate.id === owner);
-    await profile.control.release(owner, () => viewer?.releaseInput() ?? Promise.resolve(true));
-    profile.hub.broadcastControl();
+    await this.#bySession(session)?.hub.handBack();
   }
 
   /** A person's restart: every tab closes and the browser comes back on one blank tab. */
@@ -654,6 +702,7 @@ export class BrowserService {
   #hubHost(profile: ProfileState) {
     return {
       control: profile.control,
+      ...(this.#options.holdLimits ? { holdLimits: this.#options.holdLimits } : {}),
       browser: () => (profile.run && !profile.run.closing ? profile.run.browser : null),
       active: () => profile.active(),
       tabs: () => profile.tabs.list(),
@@ -681,6 +730,7 @@ export class BrowserService {
         profile.hub.tabsChanged();
       },
       download: (id: string): Download | undefined => profile.run?.browser.downloads?.list().find((download) => download.id === id),
+      extensions: () => (["mychrome", "cdp"].includes(profileKind(profile.key)) ? [] : installedExtensions(profileDir(this.#options.dataDir, profile.key))),
     };
   }
 }

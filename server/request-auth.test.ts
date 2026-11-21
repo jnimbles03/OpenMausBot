@@ -5,9 +5,12 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import {
+  acceptLegacyOrigins,
   BROWSER_SIGN_IN,
   clearSessionCookie,
   fromBrowser,
+  adminOnlyBotSetting,
+  botProfileSettings,
   clientBotPatchViolation,
   clientGroupPatchViolation,
   ipcPeer,
@@ -90,6 +93,77 @@ describe("request source for the lockout", () => {
 });
 
 describe("scopes", () => {
+  it("lets signed-in clients fork bot and room conversations without opening other task actions", () => {
+    for (const path of ["/api/bots/bot-1/tasks/thread-1/forks", "/api/groups/room-1/tasks/thread-1/forks"]) {
+      expect(requiredScope("POST", path), path).toBe("client");
+      for (const method of ["GET", "PATCH", "DELETE"]) expect(requiredScope(method, path), `${method} ${path}`).toBe("admin");
+      expect(requiredScope("POST", `${path}/extra`)).toBe("admin");
+    }
+  });
+
+  it("lets a member reach a connection card's authorize, whose handler decides who may sign in, and nothing past it", () => {
+    for (const [method, path] of [
+      ["POST", "/api/bots/bot-1/connector-cards/card-1/authorize"],
+      ["GET", "/api/bots/bot-1/connector-cards/card-1/status"],
+      ["POST", "/api/bots/bot-1/connector-cards/card-1/dismiss"],
+    ] as const) expect(requiredScope(method, path), `${method} ${path}`).toBe("client");
+    for (const [method, path] of [
+      ["GET", "/api/bots/bot-1/connector-cards/card-1/authorize"],
+      ["POST", "/api/bots/bot-1/connector-cards/card-1/authorize/extra"],
+      ["POST", "/api/connectors/gmail/authorize"],
+    ] as const) expect(requiredScope(method, path), `${method} ${path}`).toBe("admin");
+  });
+
+  it("lets a client read a bot's Data and nothing that runs, changes or exports it", () => {
+    for (const [method, path] of [
+      ["GET", "/api/bots/bot-1/data"],
+      ["POST", "/api/bots/bot-1/data/page"],
+      ["GET", "/api/bots/bot-1/data/cards/c_12/image"],
+    ] as const) expect(requiredScope(method, path), `${method} ${path}`).toBe("client");
+    for (const [method, path] of [
+      ["POST", "/api/bots/bot-1/data/run"],
+      ["POST", "/api/bots/bot-1/data/cancel"],
+      ["POST", "/api/bots/bot-1/data/export"],
+      ["PATCH", "/api/bots/bot-1/data/cards/c_12"],
+      ["DELETE", "/api/bots/bot-1/data/cards/c_12"],
+      ["GET", "/api/bots/bot-1/data/tables/orders/stats"],
+      ["GET", "/api/bots/bot-1/data/tables/orders/histogram"],
+      ["POST", "/api/bots/bot-1/data"],
+      ["GET", "/api/bots/bot-1/data/page"],
+      ["POST", "/api/bots/bot-1/data/cards/c_12/image"],
+      ["GET", "/api/bots/bot-1/data/cards/x/image"],
+      ["GET", "/api/bots/bot-1/data/cards/c_12/image/extra"],
+    ] as const) expect(requiredScope(method, path), `${method} ${path}`).toBe("admin");
+  });
+
+  it("keeps a card's \"Use a saved one\" an admin's, since picking one lets a bot use a Vault item", () => {
+    for (const [method, path] of [
+      ["GET", "/api/bots/bot-1/secret-cards/card-1/saved"],
+      ["POST", "/api/bots/bot-1/secret-cards/card-1/use"],
+      ["GET", "/api/bots/bot-1/sign-in-cards/card-1/saved-logins"],
+      ["POST", "/api/bots/bot-1/sign-in-cards/card-1/use-login"],
+    ] as const) expect(requiredScope(method, path), `${method} ${path}`).toBe("admin");
+  });
+
+  it("keeps the attachments clear to the owner: a client may read one file, never empty the store", () => {
+    for (const method of ["GET", "POST"]) expect(requiredScope(method, "/api/attachment-storage"), method).toBe("admin");
+    expect(requiredScope("GET", "/api/attachments/a1b2.png")).toBe("client");
+  });
+
+  it("allows clients to list and read notifications with exactly the feed's methods and paths", () => {
+    for (const [method, path] of [
+      ["GET", "/api/notifications"],
+      ["POST", "/api/notifications/read-all"],
+      ["POST", "/api/notifications/n-1/read"],
+    ] as const) expect(requiredScope(method, path), `${method} ${path}`).toBe("client");
+    for (const [method, path] of [
+      ["POST", "/api/notifications"], ["DELETE", "/api/notifications"],
+      ["GET", "/api/notifications/read-all"], ["PUT", "/api/notifications/read-all"],
+      ["GET", "/api/notifications/n-1/read"], ["DELETE", "/api/notifications/n-1/read"],
+      ["POST", "/api/notifications/n-1/read/extra"], ["GET", "/api/notifications/extra"],
+    ] as const) expect(requiredScope(method, path), `${method} ${path}`).toBe("admin");
+  });
+
   it("keeps full backups, credentials and replacement behind admin scope", () => {
     for (const path of ["status", "export", "upload", "preview", "restore", "client-state", "download/123"]) {
       for (const method of ["GET", "POST", "DELETE"]) expect(requiredScope(method, `/api/workspace-backup/${path}`)).toBe("admin");
@@ -100,9 +174,9 @@ describe("scopes", () => {
       ["POST", "/api/bots/x/messages"], ["POST", "/api/bots/x/respond"], ["POST", "/api/threads/t/respond"],
       ["POST", "/api/threads/t/undo"], ["POST", "/api/bots/x/compact"], ["POST", "/api/bots/x/tasks/t/title"],
       ["PATCH", "/api/bots/x/cards/m"], ["POST", "/api/groups/g/messages"], ["PATCH", "/api/groups/g"],
-      ["PATCH", "/api/bots/x"], ["PATCH", "/api/bots/x/profile"], ["POST", "/api/attachments"],
+      ["PATCH", "/api/bots/x"], ["PATCH", "/api/bots/x/profile"], ["POST", "/api/attachments"], ["PUT", "/api/bots/order"],
       ["GET", "/api/attachments/a.png"], ["POST", "/api/routines"], ["POST", "/api/routines/r/run"],
-      ["POST", "/api/routine-runs/seen-all"],
+      ["POST", "/api/routine-runs/seen-all"], ["POST", "/api/inbox/read-all"],
       ["GET", "/api/bots"], ["GET", "/api/threads/t/messages"], ["GET", "/api/search"], ["GET", "/api/events"],
       ["GET", "/api/config"], ["GET", "/api/webhooks"], ["POST", "/api/tts/speak"],
       ["GET", "/api/auth/session"], ["POST", "/api/auth/stream-ticket"], ["POST", "/api/auth/logout"],
@@ -110,6 +184,7 @@ describe("scopes", () => {
       ["POST", "/api/bots/x/sign-in-cards/m/done"], ["POST", "/api/bots/x/sign-in-cards/m/cancel"], ["POST", "/api/bots/x/sign-in-cards/m/save-login"],
       ["GET", "/api/bots/x/sign-in-cards/m/save-login"],
       ["GET", "/api/bots/x/browser/live"], ["POST", "/api/bots/x/browser/action"],
+      ["GET", "/api/threads/t/messages/m/app"], ["GET", "/api/threads/t/messages/m/app/download"], ["POST", "/api/bots/x/apps/m/rpc"], ["POST", "/api/bots/x/apps/m/context"],
       ["POST", "/api/bots/x/queue/q/steer"], ["POST", "/api/groups/g/queue/q/steer"],
     ] as const) expect(requiredScope(method, path), `${method} ${path}`).toBe("client");
     for (const [method, path] of [
@@ -118,11 +193,10 @@ describe("scopes", () => {
       ["POST", "/api/bots/x/local-computer/join"], ["POST", "/api/bots/x/local-computer/screenshot"],
       ["GET", "/api/computers/boxes"], ["POST", "/api/computers/boxes/bx_23456789/delete"],
       ["POST", "/api/webhooks"], ["POST", "/api/webhooks/w/rotate"], ["POST", "/api/bots/x/skills"], ["PATCH", "/api/bots/x/skills/s"],
-      ["PATCH", "/api/bots/x/model"], ["PATCH", "/api/groups/g/setup"], ["POST", "/api/teams/import"], ["GET", "/api/teams/scout"],
-      ["POST", "/api/team-library/github"], ["POST", "/api/team-library/grok"], ["GET", "/api/team-library/cursor"],
-      ["POST", "/api/team-library/cursor/sign-in"], ["POST", "/api/team-library/cursor/sign-out"],
-      ["GET", "/api/bots/x/memory"], ["PUT", "/api/bots/x/memory"], ["PUT", "/api/section-context"], ["GET", "/api/threads/t/events"],
-      ["GET", "/api/mcp/servers"], ["POST", "/api/mcp/servers"], ["POST", "/api/connectors/slack/authorize"],
+      ["PATCH", "/api/bots/x/model"], ["PATCH", "/api/groups/g/setup"], ["POST", "/api/teams/import"], ["POST", "/api/share/import"], ["POST", "/api/share/export"],
+      ["POST", "/api/team-library/github"], ["GET", "/api/setup-import/grok"],
+      ["GET", "/api/bots/x/memory"], ["PUT", "/api/bots/x/memory"], ["PUT", "/api/section-context"], ["PUT", "/api/groups/order"], ["GET", "/api/threads/t/events"],
+      ["GET", "/api/mcp/servers"], ["POST", "/api/mcp/servers"], ["GET", "/api/bots/x/mcp-servers"], ["POST", "/api/connectors/slack/authorize"],
       ["POST", "/api/bots/x/slack-management"], ["GET", "/api/bots/x/slack-management/extra"],
       ["PUT", "/api/config"], ["POST", "/api/auth/pairing"], ["GET", "/api/auth/sessions"], ["DELETE", "/api/auth/sessions/abc"],
       ["POST", "/api/live/session"], ["POST", "/api/live/call/end"], ["GET", "/api/live/call"], ["PATCH", "/api/live/settings"],
@@ -132,8 +206,24 @@ describe("scopes", () => {
       ["POST", "/api/bots/x/sign-in-cards/m/provide"], ["POST", "/api/browser-engine/install"],
       ["GET", "/api/logins"], ["POST", "/api/logins"], ["PATCH", "/api/logins/l1"], ["DELETE", "/api/logins/l1"],
       ["POST", "/api/logins/1password"], ["POST", "/api/logins/1password/refresh"], ["DELETE", "/api/logins/1password"],
+      ["POST", "/api/vault/secrets"], ["PATCH", "/api/vault/secrets/s1"], ["GET", "/api/vault/secrets/s1"], ["DELETE", "/api/vault/secrets"],
+      ["POST", "/api/threads/t/messages/m/app"], ["GET", "/api/bots/x/apps/m/rpc"], ["POST", "/api/bots/x/apps/m/delete"],
+      ["POST", "/api/bots/x/apps/m/rpc/extra"], ["DELETE", "/api/bots/x/apps/m/context"],
       ["PATCH", "/api/logins/1password/vaults/v1"], ["GET", "/api/bots/x/sign-in-cards/m/done"],
       ["GET", "/api/bots/x/queue/q/steer"], ["POST", "/api/bots/x/queue/q/steer/more"], ["POST", "/api/groups/g/queue/q/steer/more"],
+      ["POST", "/api/tts/voices/add"], ["GET", "/api/inbox/read-all"], ["PUT", "/api/inbox/read-all"], ["POST", "/api/inbox/read-all/extra"],
+    ] as const) expect(requiredScope(method, path), `${method} ${path}`).toBe("admin");
+  });
+
+  it("lets a Team Cloud member reach only their own connections; who connects what stays an admin's", () => {
+    for (const [method, path] of [
+      ["GET", "/api/team/my-connections"], ["POST", "/api/team/my-connections/apps/gmail/connect"], ["DELETE", "/api/team/my-connections/apps/gmail"],
+      ["POST", "/api/team/my-connections/mcp/mail/sign-in"], ["PUT", "/api/team/my-connections/mcp/mail/key"], ["DELETE", "/api/team/my-connections/mcp/mail"],
+      ["GET", "/api/vault"], ["DELETE", "/api/vault/secrets/s1"],
+    ] as const) expect(requiredScope(method, path), `${method} ${path}`).toBe("client");
+    for (const [method, path] of [
+      ["PUT", "/api/team/connection-scopes"], ["GET", "/api/team/my-connections/mcp/mail/key"], ["POST", "/api/team/my-connections/apps/gmail"],
+      ["POST", "/api/connectors/gmail/authorize"], ["POST", "/api/mcp/servers/mail/sign-in"],
     ] as const) expect(requiredScope(method, path), `${method} ${path}`).toBe("admin");
   });
 
@@ -157,9 +247,31 @@ describe("scopes", () => {
     expect(clientBotPatchViolation({ xResearch: true })).toBe("xResearch");
     expect(clientBotPatchViolation({ recordBrowserSteps: true })).toBe("recordBrowserSteps");
     expect(clientBotPatchViolation([])).toBe("body");
+    // A Team Cloud member changes no team bot's look, which everyone sees; their own MausBot's they do.
+    expect(clientBotPatchViolation({ color: "blue" }, false, true)).toBe("color");
+    expect(clientBotPatchViolation({ avatarUrl: null }, false, true)).toBe("avatarUrl");
+    expect(clientBotPatchViolation({ mascotBody: "cursor" }, false, true)).toBe("mascotBody");
+    expect(clientBotPatchViolation({ unread: false, pinned: true }, false, true)).toBeNull();
+    expect(clientBotPatchViolation({ color: "blue", name: "Mine" }, true, true)).toBeNull();
     expect(clientGroupPatchViolation({ name: "Ops", unread: false, turnTimeoutMinutes: 30 })).toBeNull();
     expect(clientGroupPatchViolation({ cwd: "/tmp" })).toBe("cwd");
     expect(clientGroupPatchViolation({ memberIds: [] })).toBe("memberIds");
+  });
+
+  it("refuses a session without the admin scope a bot's move into or out of a department", () => {
+    expect(clientBotPatchViolation({ section: "Work" }, false, true)).toBe("section");
+    expect(clientBotPatchViolation({ section: "" }, false, true)).toBe("section");
+    for (const method of ["POST", "PUT"]) expect(requiredScope(method, "/api/sidebar-sections"), method).toBe("admin");
+  });
+
+  it("lets a bot's maker without the admin scope say who it is and how it looks, never what it may do or whom it directs", () => {
+    const profile = { name: "Scout", title: "Trips", soul: "Plans trips.", color: "teal", avatarCrop: "square", voice: "alloy", modelSelection: { instanceId: "claude", model: "m" } };
+    expect(adminOnlyBotSetting(profile)).toBeNull();
+    for (const field of ["approvalMode", "autoApprove", "alwaysAllow", "chiefOfStaff", "managedSections", "computer", "cwd",
+      "mcpServers", "browserProfile", "toolScope", "composio", "browser", "section", "visibility", "reportsTo", "preset", "defaultBot", "installedPackage"]) {
+      expect(adminOnlyBotSetting({ ...profile, [field]: true }), field).toBe(field);
+      expect(botProfileSettings({ ...profile, [field]: true }), field).toEqual(profile);
+    }
   });
 });
 
@@ -195,6 +307,16 @@ describe("resolveRequestAuth", () => {
       ["GET", "/api/events"], ["PATCH", "/api/bots/b/profile"],
       ["GET", "/api/bots/b/browser/live"], ["POST", "/api/bots/b/browser/action"],
     ]) expect(check(method, path).auth?.kind, path).toBe("loopback");
+    expect(check("GET", "/api/phones/self/jobs").auth).toEqual({ kind: "loopback", scopes: ["admin", "client"], companionDevice: "phone-1" });
+    expect(check("GET", "/api/bots/b/skills").auth?.kind).toBe("loopback");
+    expect(check("POST", "/api/bots/b/skills").auth).toBeNull();
+    expect(check("DELETE", "/api/attachments/abc-1.jpg").auth).toEqual({ kind: "loopback", scopes: ["admin", "client"], companionDevice: "phone-1" });
+    expect(check("DELETE", "/api/attachments/..%2Fconfig.json").auth).toBeNull();
+    const plain = resolveRequestAuth(request({ host: "127.0.0.1:8799", "x-openmausbot-companion": "1", "x-openmausbot-companion-device": "phone-1" }, "GET"), {
+      sessions, cookieName, streamPath: "/api/events", url: new URL("/api/phones/self/jobs", "http://localhost"),
+      loopbackMutationToken: "desktop-secret", companionMutationToken: "relay-secret",
+    });
+    expect(plain.auth).toEqual({ kind: "loopback", scopes: ["admin", "client"] });
     for (const [method, path] of [
       ["POST", "/api/bots/b/browser/live"], ["GET", "/api/bots/b/browser/action"],
       ["POST", "/api/bots/b/browser/restart"],
@@ -267,7 +389,7 @@ describe("resolveRequestAuth", () => {
     const csrf = resolve({ host: "bots.example.com", cookie: `${cookieName}=${token}`, origin: "https://evil.example" }, "/api/bots", "POST");
     expect(csrf.error).toBe("forbidden: cross-origin request");
     expect(sessions.list()[0]?.expiresAt).toBe(session.expiresAt);
-    const overScope = resolve({ authorization: `Bearer ${token}` }, "/api/bots", "POST");
+    const overScope = resolve({ authorization: `Bearer ${token}` }, "/api/webhooks", "POST");
     expect(overScope.status).toBe(403);
     expect(sessions.list()[0]?.expiresAt).toBe(session.expiresAt);
     const { ticket } = sessions.issueStreamTicket(session.id);
@@ -318,8 +440,14 @@ describe("resolveRequestAuth", () => {
     );
     expect(connectorRefresh.auth).toBeNull();
     expect(connectorRefresh.status).toBe(403);
-    for (const path of ["/api/desktop-viewer/vps/bot-1", "/api/desktop-viewer/local/shared/websockify"]) {
-      expect(resolveRequestAuth(request({ host: "127.0.0.1:8799" }, "GET"), options(path)).status).toBe(403);
+    for (const path of ["/api/desktop-viewer/vps/bot-1", "/api/desktop-viewer/local/shared/websockify", "/api/webhooks/hook-1/address", "/api/setup-import/grok",
+      "/api/local-computer", "/api/bots/bot-1/local-computer", "/api/usb-phones/PHONE1/stream", "/api/usb-phones/emulator-5554/stream", "/api/usb-phones/SM.G991B/stream"]) {
+      expect(resolveRequestAuth(request({ host: "127.0.0.1:8799" }, "GET"), options(path)).status, path).toBe(403);
+      expect(resolveRequestAuth(request({ host: "127.0.0.1:8799", "x-openmausbot-desktop-owner": "owner-token-123" }, "GET"), options(path)).auth?.kind, path)
+        .toBe("loopback");
+    }
+    for (const path of ["/api/webhooks", "/api/local-computer/instances", "/api/bots/bot-1/local-computer/screenshot", "/api/usb-phones"]) {
+      expect(resolveRequestAuth(request({ host: "127.0.0.1:8799" }, "GET"), options(path)).auth?.kind, path).toBe("loopback");
     }
     expect(resolveRequestAuth(
       request({ host: "127.0.0.1:8799" }, "POST"),
@@ -330,6 +458,10 @@ describe("resolveRequestAuth", () => {
   it("never grants loopback trust to a request that came through a proxy, whatever Host it carries", () => {
     expect(isProxied(request({ host: "localhost", "x-forwarded-for": "203.0.113.9" }))).toBe(true);
     expect(isProxied(request({ host: "localhost", "x-forwarded-proto": "https" }))).toBe(true);
+    for (const name of ["x-real-ip", "cf-connecting-ip", "true-client-ip", "x-client-ip"]) {
+      expect(isProxied(request({ host: "localhost", [name]: "203.0.113.9" }))).toBe(true);
+      expect(resolve({ host: "localhost", [name]: "203.0.113.9" }).auth).toBeNull();
+    }
     expect(isProxied(request({ host: "localhost" }))).toBe(false);
     const viaProxy = resolve({ host: "localhost", "x-forwarded-for": "203.0.113.9" });
     expect(viaProxy.auth).toBeNull();
@@ -358,6 +490,41 @@ describe("resolveRequestAuth", () => {
     expect(csrf.error).toBe("forbidden: cross-origin request");
   });
 
+  it("takes a moved Cloud home's configured former address as its own, and no other, whatever X-Forwarded-Host says", () => {
+    const token = pairedToken();
+    const { credential } = sessions.openPairing({ browser: true, owner: "ada@example.test" });
+    const browser = sessions.exchange({ code: credential, label: "Chrome on Mac", source: "1.2.3.4", browser: true });
+    if (!browser.ok) throw new Error(browser.error);
+    // What the old address's forwarder sends: Host rewritten to this home's name, the page's own Origin kept.
+    const forwarded = (origin: string, cookie = token, extra: Record<string, string> = {}) => ({
+      host: "omb-u-1.homes.example", "x-forwarded-proto": "https", "x-forwarded-for": "203.0.113.9", "x-forwarded-host": "omb-u-1.fly.dev",
+      cookie: `${cookieName}=${cookie}`, origin, ...extra,
+    });
+    const page = { "sec-fetch-site": "same-origin", "sec-fetch-dest": "empty" };
+    try {
+      acceptLegacyOrigins(["https://omb-u-1.fly.dev"]);
+      expect(resolve(forwarded("https://omb-u-1.fly.dev"), "/api/bots", "POST").auth?.kind).toBe("session");
+      expect(resolve(forwarded("https://OMB-U-1.fly.dev "), "/api/bots", "POST").auth?.kind).toBe("session");
+      expect(resolve(forwarded("https://omb-u-1.fly.dev", browser.token, page), "/api/bots", "POST").auth?.kind).toBe("session");
+      expect(resolve(forwarded("https://omb-u-1.fly.dev"), "/api/events").auth?.kind).toBe("session");
+      expect(isSameOrigin(request({ host: "omb-u-1.homes.example", "x-forwarded-proto": "https", origin: "https://omb-u-1.fly.dev", upgrade: "websocket" }))).toBe(true);
+      expect(provesSameOrigin(request({ host: "omb-u-1.homes.example", "x-forwarded-proto": "https", origin: "https://omb-u-1.fly.dev" }))).toBe(true);
+      // Only the exact origin: not another app on the same provider, its http twin, a port, or a name X-Forwarded-Host gives.
+      for (const origin of ["https://omb-u-2.fly.dev", "http://omb-u-1.fly.dev", "https://omb-u-1.fly.dev:8443", "https://evil.example"]) {
+        const refused = resolve(forwarded(origin), "/api/bots", "POST");
+        expect(refused, origin).toMatchObject({ auth: null, status: 403, error: "forbidden: cross-origin request" });
+      }
+      expect(isSameOrigin(request({ host: "omb-u-1.homes.example", "x-forwarded-proto": "https", "x-forwarded-host": "evil.example", origin: "https://evil.example" }))).toBe(false);
+      // Never loopback trust: the former address is a remote page's, so a request with no session is still refused.
+      expect(resolve({ host: "127.0.0.1:8799", origin: "https://omb-u-1.fly.dev" }).auth).toBeNull();
+    } finally {
+      acceptLegacyOrigins([]);
+    }
+    const unconfigured = resolve(forwarded("https://omb-u-1.fly.dev"), "/api/bots", "POST");
+    expect(unconfigured).toMatchObject({ auth: null, status: 403, error: "forbidden: cross-origin request" });
+    expect(isSameOrigin(request({ host: "omb-u-1.homes.example", "x-forwarded-proto": "https", "x-forwarded-host": "omb-u-1.fly.dev", origin: "https://omb-u-1.fly.dev" }))).toBe(false);
+  });
+
   it("lets a browser sign-in's session make changes only when the browser says the request is its own page's", () => {
     const { credential } = sessions.openPairing({ browser: true, owner: "ada@example.test" });
     const signedIn = sessions.exchange({ code: credential, label: "Chrome on Mac", source: "1.2.3.4", browser: true });
@@ -374,6 +541,13 @@ describe("resolveRequestAuth", () => {
       expect(refused.status).toBe(403);
     }
     expect(resolve(cloud, "/api/bots", "POST").error).toBe("forbidden: this browser's session makes changes only from its own page");
+    const connectorRefresh = "/api/bots/bot-1/connector-cards/card-1/status";
+    const notItsPage: Record<string, string>[] = [{}, { "sec-fetch-site": "same-site" }, { "sec-fetch-site": "cross-site" }, { origin: "https://evil.example" }];
+    for (const headers of notItsPage) {
+      expect(resolve({ ...cloud, ...headers }, connectorRefresh, "GET").auth, JSON.stringify(headers)).toBeNull();
+    }
+    expect(resolve({ ...cloud, "sec-fetch-site": "same-origin" }, connectorRefresh, "GET").auth?.kind).toBe("session");
+    expect(resolve({ ...cloud, "sec-fetch-site": "same-site" }, "/api/bots", "GET").auth?.kind).toBe("session");
     const paired = pairedToken();
     expect(resolve({ host: "omb-u-0123456789ab.fly.dev", "x-forwarded-proto": "https", cookie: `${cookieName}=${paired}` }, "/api/bots", "POST").auth?.kind).toBe("session");
     expect(provesSameOrigin(request({ host: "a.example", origin: "http://a.example" }))).toBe(true);
@@ -418,6 +592,7 @@ describe("resolveRequestAuth", () => {
     ["POST", "/api/instances/claude-work/auth/sign-out"],
     ["GET", "/api/usage?from=2026-09-01&to=2026-09-30"],
     ["GET", "/api/usage.csv?from=2026-09-01&to=2026-09-30"],
+    ["GET", "/api/usage/insights?from=2026-09-01&to=2026-09-30"],
     ["POST", "/api/keys/test"],
     ["GET", "/api/fleet"],
     ["POST", "/api/fleet/workspaces"],
@@ -450,6 +625,28 @@ describe("resolveRequestAuth", () => {
     expect(remote.status).toBe(401);
     expect(remote.error).toMatch(/expired or was revoked; pair this device again/);
     expect(resolve({ host: "127.0.0.1:8799", cookie: `${cookieName}=${token}` })).toMatchObject({ auth: null, status: 401 });
+  });
+});
+
+describe("a listener on the local network (openmausbot serve --lan)", () => {
+  // SAFETY: only headers, method and the socket peer are read
+  const fromPeer = (remoteAddress: string, headers: Record<string, string>) => ({ headers, method: "GET", socket: { remoteAddress } }) as unknown as IncomingMessage;
+  const gate = (dir: string) => ({ sessions: new SessionRegistry({ file: join(dir, "sessions.json") }), cookieName: "omb_session_test", streamPath: "/api/events", url: new URL("/api/bots", "http://x") });
+
+  it("never makes another machine the owner, whatever Host it writes", () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-auth-lan-"));
+    try {
+      for (const peer of ["192.168.1.50", "::ffff:192.168.1.50", "100.101.102.103", "fd12::5"]) {
+        const spoofed = resolveRequestAuth(fromPeer(peer, { host: "127.0.0.1:8799" }), gate(dir));
+        expect([peer, spoofed.auth]).toEqual([peer, null]);
+        expect(isProxied(fromPeer(peer, { host: "localhost" }))).toBe(true);
+      }
+      for (const peer of ["127.0.0.1", "::1", "::ffff:127.0.0.1"]) {
+        expect(resolveRequestAuth(fromPeer(peer, { host: "127.0.0.1:8799" }), gate(dir)).auth?.kind, peer).toBe("loopback");
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -558,12 +755,21 @@ describe("loopback trust: owner on one person's machine, service on a shared wor
     }
   });
 
+  it("lets a local check count the engines that can start a bot, as update.sh does, but no caller through a proxy", () => {
+    expect(check("GET", "/api/health/engines", { trust: "service" }).auth).toEqual({ kind: "loopback", scopes: ["client"], trust: "service" });
+    expect(check("POST", "/api/health/engines", { trust: "service" }).auth).toBeNull();
+    expect(check("GET", "/api/health/engines", { trust: "service", headers: { "x-forwarded-for": "203.0.113.9" } }).auth).toBeNull();
+  });
+
   it("still admits a real session with its own scopes on a service-trust server", () => {
     const admin = sessions.issue({ label: "Laptop", scopes: ["admin", "client"] });
     const member = sessions.issue({ label: "Phone", scopes: ["client"] });
     expect(check("PUT", "/api/config", { trust: "service", headers: { authorization: `Bearer ${admin.token}` } }).auth?.kind).toBe("session");
     expect(check("POST", "/api/bots/bot-1/messages", { trust: "service", headers: { authorization: `Bearer ${member.token}` } }).auth?.kind).toBe("session");
     expect(check("PUT", "/api/config", { trust: "service", headers: { authorization: `Bearer ${member.token}` } }).status).toBe(403);
+    // PATCH too: a member cannot flip owner switches such as "Open sites on this server" (browserEngine.egress).
+    expect(check("PATCH", "/api/config", { trust: "service", headers: { authorization: `Bearer ${member.token}` } }).status).toBe(403);
+    expect(check("PATCH", "/api/config", { trust: "service", headers: { authorization: `Bearer ${admin.token}` } }).auth?.kind).toBe("session");
   });
 
   it("ignores service trust while the desktop capability is in force", () => {
@@ -686,6 +892,23 @@ describe("a browser on this machine is not the owner", () => {
     expect(check({ host: "127.0.0.1:8799" }, "/api/bots", "GET", desktop).auth?.kind).toBe("loopback");
     const relay = { host: "127.0.0.1:8799", "x-openmausbot-companion": "1", "x-openmausbot-companion-device": "phone-1", "x-openmausbot-companion-auth": "relay-secret" };
     expect(check(relay, "/api/bots/b/messages", "POST", desktop).auth?.kind).toBe("loopback");
+  });
+
+  it("does not lend the owner header to another page in the desktop window's session", () => {
+    const desktop = { desktopToken: "owner-token-123" };
+    const owner = { "x-openmausbot-desktop-owner": "owner-token-123" };
+    const savedServer = { host: "127.0.0.1:8799", origin: "http://localhost:8080", "sec-fetch-site": "cross-site", "sec-fetch-mode": "no-cors", "sec-fetch-dest": "empty" };
+    const otherPort = { ...savedServer, origin: "http://127.0.0.1:3000", "sec-fetch-site": "same-site" };
+    const { origin: _origin, ...imageTag } = { ...savedServer, "sec-fetch-dest": "image" };
+    for (const headers of [savedServer, otherPort, imageTag, { ...socket, ...owner }]) {
+      for (const [method, path] of [["POST", "/api/routines"], ["PATCH", "/api/bots/bot-1"], ["PUT", "/api/config"], ["GET", "/api/bots"]]) {
+        const refused = check({ ...headers, ...owner }, path, method, desktop);
+        expect(refused.auth, `${method} ${path} ${JSON.stringify(headers)}`).toBeNull();
+        expect(refused.status).toBe(401);
+      }
+    }
+    expect(check({ ...navigation, ...owner }, "/api/bots", "GET", desktop).auth?.kind).toBe("loopback");
+    expect(check({ ...ownUi, ...owner }, "/api/config", "PUT", desktop).auth?.kind).toBe("loopback");
   });
 
   it("still admits a browser that signed in", () => {

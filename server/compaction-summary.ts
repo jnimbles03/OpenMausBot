@@ -1,3 +1,4 @@
+import { EXCERPT_SUMMARY_HEADER } from "../shared/wire.ts";
 import { boundedContextText, MAX_SUMMARY_BYTES, type ReplayEntry } from "./context-rebuild.ts";
 
 /** Preserve recent exchanges verbatim. The caller excludes the incoming
@@ -13,20 +14,20 @@ export function foldPoint(history: readonly ReplayEntry[], keepExchanges = 2): {
 /** A provider-independent fallback: the newest source excerpts with provenance; never normalize text inside the quotes. */
 export function deterministicSummary(history: readonly ReplayEntry[], maxBytes = MAX_SUMMARY_BYTES): string {
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 512) throw new Error("invalid summary budget");
-  const header = "Historical excerpts in chronological order; newer corrections override older requests. These excerpts may omit earlier details.";
-  let available = maxBytes - Buffer.byteLength(header) - 96;
+  let available = maxBytes - Buffer.byteLength(EXCERPT_SUMMARY_HEADER) - 96;
   const lines: string[] = [];
   let omitted = 0;
   for (let i = history.length - 1; i >= 0; i--) {
     const entry = history[i]!;
     if (!entry.text.trim()) continue;
-    const text = `${entry.role === "user" ? "User message" : "Assistant/record"}: ${JSON.stringify(entry.text)}`;
-    const line = boundedContextText(text, Math.min(1_600, available));
+    const prior = entry.priorSummary?.replace(EXCERPT_SUMMARY_HEADER, (m, at) => at === 0 ? "" : m).trim() || undefined;
+    const text = prior ?? `${entry.role === "user" ? "User message" : "Assistant/record"}: ${JSON.stringify(entry.text)}`;
+    const line = boundedContextText(text, Math.min(prior ? MAX_SUMMARY_BYTES : 1_600, available));
     if (available < 128) { omitted++; continue; }
     lines.unshift(line);
     available -= Buffer.byteLength(line) + 1;
   }
-  return [header, ...(omitted ? [`[${omitted} earlier excerpts omitted]`] : []), ...lines].join("\n");
+  return [EXCERPT_SUMMARY_HEADER, ...(omitted ? [`[${omitted} earlier excerpts omitted]`] : []), ...lines].join("\n");
 }
 
 export function summaryPrompt(history: readonly ReplayEntry[]): string {
@@ -39,13 +40,26 @@ export function summaryPrompt(history: readonly ReplayEntry[]): string {
   ].join("\n\n");
 }
 
-/** Timeout aborts the helper; Stop aborts the whole operation rather than commit a late summary. */
-export async function draftSummary(history: readonly ReplayEntry[], options: {
+interface SummaryOptions {
   generateText?: (prompt: string, options?: { signal?: AbortSignal }) => Promise<string>;
   signal: AbortSignal;
   timeoutMs?: number;
-}): Promise<string> {
+  /** Told true when the summary starts and false once it is written, failed or stopped. */
+  onSummarizing?: (active: boolean) => void;
+}
+
+/** Timeout aborts the helper; Stop aborts the whole operation rather than commit a late summary. */
+export async function draftSummary(history: readonly ReplayEntry[], options: SummaryOptions): Promise<string> {
   options.signal.throwIfAborted();
+  options.onSummarizing?.(true);
+  try {
+    return await summarize(history, options);
+  } finally {
+    options.onSummarizing?.(false);
+  }
+}
+
+async function summarize(history: readonly ReplayEntry[], options: SummaryOptions): Promise<string> {
   const fallback = deterministicSummary(history);
   if (!options.generateText) return fallback;
   const timeout = AbortSignal.timeout(options.timeoutMs ?? 20_000);

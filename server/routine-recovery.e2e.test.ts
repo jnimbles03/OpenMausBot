@@ -1,7 +1,7 @@
 // Unattended routine runs that recover by themselves: the real server and Claude driver, with the fake engine's mode
 // read from a file at each launch, and the stall watchdog's twenty minutes brought forward by a marker file.
 import { type ChildProcess, spawn } from "node:child_process";
-import { closeSync, openSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { closeSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, expect, it } from "vitest";
@@ -13,8 +13,9 @@ import { hostTimeout } from "./testing/host-timeout.ts";
 import { openSse, type SseRecorder } from "./testing/sse.ts";
 
 const STALLED = "No activity for 20 minutes — the routine was stopped";
-const SIGN_IN = "This bot's AI is signed out. Sign in again in Settings → Model providers.";
+const SIGN_IN = "This bot's AI is signed out. Sign in again in Settings → AI.";
 const ROUTINE_HEADER = '[Routine "Inbox brief" — do this now:]';
+const DEAD_TOOL_SERVER = "MCP server could not start; check its command and installation";
 
 let fixture: VerificationServer | undefined;
 let restarted: ChildProcess | undefined;
@@ -47,14 +48,14 @@ async function server(env: NodeJS.ProcessEnv = {}) {
   ].join("\n"), { mode: 0o700 });
   engine("happy");
   await api("PATCH", "/api/instances/claude", { cli: wrapper });
-  // Chief first makes the starter its team's Chief, which answers a teammate's failed run with a Team incidents turn of
+  // Chief first makes the starter its team's Chief, which answers a teammate's failed run with a Problems to look at turn of
   // its own on the same engine. Stepped down, what these runs tell the owner is theirs alone.
   const starter = (await api("GET", "/api/bots")).bots.find((candidate: any) => candidate.chiefOfStaff);
   await api("PATCH", `/api/bots/${starter.id}`, { chiefOfStaff: false });
   const bot = (await runControlOmb(["new-bot", "--name", "Inbox bot", "--url", url]) as any).bot;
   events = await openSse(`${url}/api/events`, { origin: url });
   const routine = async (name = "Inbox brief") => (await api("POST", "/api/routines", {
-    name, prompt: "Summarise my inbox.", botId: bot.id, schedule: { type: "cron", expression: "0 7 * * *", timeZone: "Europe/London" },
+    name, prompt: "Summarise my inbox.", botId: bot.id, enabled: false, schedule: { type: "cron", expression: "0 7 * * *", timeZone: "Europe/London" },
   })).routine;
   const runs = async () => {
     try { return (await api("GET", "/api/routines")).runs as any[]; } catch { return []; }
@@ -79,29 +80,7 @@ async function server(env: NodeJS.ProcessEnv = {}) {
   return { url, dataDir, logPath, api, bot, engine, dump, engineHas, engineAnnounced, routine, runs, run, runNow, notified, prompts };
 }
 
-it("starts a routine again once after its engine stalls, and it completes in the same conversation", async () => {
-  const s = await server({ OMB_TEST_STALL_CLOCK: "1" });
-  s.engine("hang", { FAKE_CLAUDE_RELEASE: join(s.dataDir, "release") });
-  const { id } = await s.runNow((await s.routine()).id);
-  await s.engineHas();
-  const { threadId } = await s.run(id);
-  await s.engineAnnounced(threadId, 1);
-
-  writeFileSync(join(s.dataDir, "stall-turns"), "");
-  await expect.poll(() => s.run(id), { timeout: hostTimeout(15_000) }).toMatchObject({
-    status: "queued", retried: "stalled", threadId, attention: `Starting again shortly after the AI stalled: ${STALLED}`,
-  });
-  rmSync(join(s.dataDir, "stall-turns"));
-  writeFileSync(join(s.dataDir, "release"), "");
-
-  await expect.poll(async () => (await s.run(id))?.status, { timeout: hostTimeout(60_000) }).toBe("completed");
-  expect(await s.run(id)).toMatchObject({ retried: "stalled", threadId, output: "released" });
-  expect(JSON.stringify(JSON.parse(readFileSync(s.dump, "utf8")).prompt)).toContain("this run's first start stopped when its AI stalled before it finished");
-  expect((await s.prompts(threadId)).filter((text) => text.includes(ROUTINE_HEADER))).toHaveLength(2);
-  expect(s.notified().filter((notification) => notification.kind === "routine-failed")).toEqual([]);
-}, hostTimeout(120_000));
-
-it("fails a routine that stalls again on its retry, with a record that says so", async () => {
+it("never starts a routine again that the turn watchdog stopped as stalled: it fails at once, and its owner hears once", async () => {
   const s = await server({ OMB_TEST_STALL_CLOCK: "1" });
   s.engine("hang");
   const { id } = await s.runNow((await s.routine()).id);
@@ -110,19 +89,71 @@ it("fails a routine that stalls again on its retry, with a record that says so",
   // The marker stalls only the turns already watched, and quiet, when it is written.
   await s.engineAnnounced(threadId, 1);
   writeFileSync(join(s.dataDir, "stall-turns"), "");
-  await expect.poll(async () => (await s.run(id))?.retried, { timeout: hostTimeout(15_000) }).toBe("stalled");
-  rmSync(join(s.dataDir, "stall-turns"));
-  await s.engineHas("this run's first start stopped when its AI stalled");
-  await s.engineAnnounced(threadId, 2);
-  writeFileSync(join(s.dataDir, "stall-turns"), "");
 
-  const error = `Failed after one automatic retry: ${STALLED}`;
-  await expect.poll(async () => (await s.run(id))?.status, { timeout: hostTimeout(90_000) }).toBe("failed");
-  expect(await s.run(id)).toMatchObject({ retried: "stalled", error });
+  await expect.poll(async () => (await s.run(id))?.status, { timeout: hostTimeout(30_000) }).toBe("failed");
+  const failed = await s.run(id);
+  expect(failed).toMatchObject({ error: STALLED });
+  expect(failed.retried).toBeUndefined();
   await expect.poll(() => s.notified().filter((notification) => notification.kind === "routine-failed"), { timeout: hostTimeout(15_000) })
-    .toEqual([expect.objectContaining({ title: "Inbox bot's routine failed", body: `Inbox brief: ${error}` })]);
+    .toEqual([expect.objectContaining({ title: "Inbox bot's routine failed", body: `Inbox brief: ${STALLED}` })]);
+  expect((await s.prompts(threadId)).filter((text) => text.includes(ROUTINE_HEADER))).toHaveLength(1);
+}, hostTimeout(120_000));
+
+it("starts a routine that crashed again once, and it completes in the same conversation", async () => {
+  const s = await server();
+  s.engine("exit-early");
+  const { id } = await s.runNow((await s.routine()).id);
+  await expect.poll(async () => (await s.run(id))?.retried, { timeout: hostTimeout(30_000) }).toBe("failed");
+  const { threadId } = await s.run(id);
+  expect(await s.run(id)).toMatchObject({ status: "queued" });
+  s.engine("happy");
+
+  await expect.poll(async () => (await s.run(id))?.status, { timeout: hostTimeout(60_000) }).toBe("completed");
+  expect(await s.run(id)).toMatchObject({ retried: "failed", threadId });
+  const second = JSON.stringify(JSON.parse(readFileSync(s.dump, "utf8")).prompt);
+  expect(second).toContain("this run's first start failed before it finished");
+  expect(second).toContain("The routine's instructions are in the message above and are not repeated here.");
+  // The crashed start left no session to resume, so the conversation is replayed: the instructions arrive once, not twice.
+  expect(second.split("Summarise my inbox.")).toHaveLength(2);
+  expect((await s.prompts(threadId)).filter((text) => text.includes(ROUTINE_HEADER))).toHaveLength(1);
+  expect(s.notified().filter((notification) => notification.kind === "routine-failed")).toEqual([]);
+}, hostTimeout(120_000));
+
+it("fails a routine that crashes again on its retry, says so, and never retries it a second time", async () => {
+  const s = await server();
+  s.engine("exit-early");
+  const { id } = await s.runNow((await s.routine()).id);
+  await expect.poll(async () => (await s.run(id))?.status, { timeout: hostTimeout(90_000) }).toBe("failed");
+  const failed = await s.run(id);
+  expect(failed).toMatchObject({ retried: "failed", error: expect.stringMatching(/^Failed after one automatic retry: /) });
+  await expect.poll(() => s.notified().filter((notification) => notification.kind === "routine-failed"), { timeout: hostTimeout(15_000) })
+    .toEqual([expect.objectContaining({ title: "Inbox bot's routine failed", body: `Inbox brief: ${failed.error}` })]);
+  expect((await s.prompts(failed.threadId)).filter((text) => text.includes(ROUTINE_HEADER))).toHaveLength(1);
   expect(await s.runs()).toHaveLength(1);
 }, hostTimeout(150_000));
+
+it("starts a routine whose tool server is dead once, not twice: one request to the AI, and the run row says why it failed", async () => {
+  const s = await server();
+  const requests = join(s.dataDir, "claude-requests.ndjson");
+  const sent = () => { try { return readFileSync(requests, "utf8").split("\n").filter(Boolean).length; } catch { return 0; } };
+  s.engine("api-error", { FAKE_CLAUDE_API_ERROR: DEAD_TOOL_SERVER, FAKE_CLAUDE_PROMPTS: requests });
+  const { id } = await s.runNow((await s.routine()).id);
+  await expect.poll(async () => (await s.run(id))?.status, { timeout: hostTimeout(30_000) }).toBe("failed");
+  const failed = await s.run(id);
+  expect(failed.error).toContain(DEAD_TOOL_SERVER);
+  expect(failed.retried).toBeUndefined();
+  // Longer than the 15 seconds a second start would have waited.
+  await new Promise((resolve) => setTimeout(resolve, 20_000));
+  expect(await s.run(id)).toMatchObject({ status: "failed" });
+  expect(sent()).toBe(1);
+  expect((await s.prompts(failed.threadId)).filter((text) => text.includes(ROUTINE_HEADER))).toHaveLength(1);
+
+  s.engine("api-error", { FAKE_CLAUDE_PROMPTS: requests });
+  const passing = await s.runNow((await s.routine("Calendar check")).id);
+  await expect.poll(async () => (await s.run(passing.id))?.status, { timeout: hostTimeout(90_000) }).toBe("failed");
+  expect(await s.run(passing.id)).toMatchObject({ retried: "provider" });
+  expect(sent()).toBe(3);
+}, hostTimeout(180_000));
 
 it("picks a run that a restart cut off up again once on the next start, and never runs it twice", async () => {
   const s = await server();
@@ -146,7 +177,7 @@ it("picks a run that a restart cut off up again once on the next start, and neve
   expect(JSON.stringify(JSON.parse(readFileSync(s.dump, "utf8")).prompt)).toContain("this run's first start was cut off when OpenMausBot restarted");
   await new Promise((resolve) => setTimeout(resolve, 3_000));
   const sent = await s.prompts(threadId);
-  expect(sent.filter((text) => text.includes(ROUTINE_HEADER))).toHaveLength(2);
+  expect(sent.filter((text) => text.includes(ROUTINE_HEADER))).toHaveLength(1);
   expect(sent.join("\n")).not.toContain("restarted while your previous turn here was running");
   expect(await s.runs()).toHaveLength(1);
   // The cut turn's own job is closed, so nothing can take it up again beside the second start.
@@ -179,7 +210,7 @@ it("keeps an ACP engine's run that a graceful shutdown cut off, and starts it on
   await restart();
   const { bot } = await cli("new-bot", "--name", "Inbox bot");
   await cli("set-model", "--bot", bot.id, "--instance", "cline", "--model", "cline-default");
-  const { routine } = await api("POST", "/api/routines", { name: "Inbox brief", prompt: "Summarise my inbox.", botId: bot.id,
+  const { routine } = await api("POST", "/api/routines", { name: "Inbox brief", prompt: "Summarise my inbox.", botId: bot.id, enabled: false,
     schedule: { type: "cron", expression: "0 7 * * *", timeZone: "Europe/London" } });
   const { run } = await api("POST", `/api/routines/${routine.id}/run`);
   const read = async () => ((await api("GET", "/api/routines").catch(() => ({ runs: [] }))).runs as any[]).find((candidate) => candidate.id === run.id);

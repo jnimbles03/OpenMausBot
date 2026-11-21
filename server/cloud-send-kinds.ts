@@ -5,6 +5,7 @@
 // computer go of an app event My Cloud now collects. Admin scope; My Cloud takes an item only over its owner's session.
 import { createHash } from "node:crypto";
 import { lstatSync, readdirSync, readFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { join } from "node:path";
 import { z } from "zod";
 
@@ -19,8 +20,11 @@ import type { AppTriggerManager } from "./app-triggers.ts";
 import type { CalendarCall, CalendarCallManager } from "./calendar-calls.ts";
 import type { CloudOwner } from "./cloud-owner-lines.ts";
 import type { CloudSendItem } from "./cloud-send.ts";
+import { keptDefaultBot, retireUnusedStarter, takeArrivingDefaultBot } from "./default-bot.ts";
+import { watchAsMade } from "./host/default-watch.ts";
 import { IMPORTED_SKILLS_DIR, readImportedSkills, storeImportedSkills, type ImportedSkillInput } from "./imported-skills.ts";
 import type { RequestAuth } from "./request-auth.ts";
+import { withCheckFields } from "./routine-load.ts";
 import type { Routine, RoutineManager, RoutineRun } from "./routines.ts";
 import type { RouteContext } from "./routes/table.ts";
 import { installLibrarySkill, readLibrarySkillFile, readSkillLibraryIndex, setLibrarySkillReviewState, updateLibrarySkill, type SkillLibraryEntry } from "./skill-library.ts";
@@ -32,22 +36,22 @@ import { restorePaths, validRelative } from "./workspace-backup-paths.ts";
 const SHARED_ROOT = "/omb-data";
 const FINISHED = new Set(["completed", "failed", "cancelled", "missed"]);
 const KIND_BODY_MAX = 8 * 1024 * 1024;
-const ROUTINE_FIELDS = ["name", "prompt", "target", "botId", "groupId", "runOn", "schedule", "durationMinutes", "timeoutMinutes", "attachments", "continuity",
-  "overlap", "runOnStartup", "sourceThreadId", "resultsThreadId", "createdAt"] as const;
+const ROUTINE_FIELDS = ["name", "prompt", "target", "botId", "groupId", "runOn", "schedule", "durationMinutes", "timeoutMinutes", "attachments", "continuity", "sameConversation", "modelSelection",
+  "overlap", "runOnStartup", "sourceThreadId", "resultsThreadId", "createdAt", "checks", "access", "deliver"] as const;
 const CALL_FIELDS = ["name", "description", "botIds", "schedule", "durationMinutes", "attachments", "roomId", "createdAt"] as const;
-const WEBHOOK_FIELDS = ["name", "prompt", "botId", "runOn", "delivery", "groupId", "eventTypes", "maxPendingRuns", "resultsThreadId", "createdAt"] as const;
-const APP_EVENT_FIELDS = ["name", "prompt", "botId", "runOn", "app", "event", "accountId", "config", "filter", "sourceThreadId"] as const;
+const WEBHOOK_FIELDS = ["name", "prompt", "botId", "runOn", "delivery", "groupId", "eventTypes", "payloadFilter", "maxPendingRuns", "sameConversation", "resultsThreadId", "createdAt"] as const;
+const APP_EVENT_FIELDS = ["name", "prompt", "botId", "runOn", "app", "event", "accountId", "config", "filter", "sourceThreadId", "sameConversation"] as const;
 /** Prose that may name this computer's data folder. */
 const TEXTS = ["prompt", "description", "output", "error"] as const;
 export const MOVE_BOT_FIELDS: readonly string[] = Object.values(MOVE_BOT_PARTS).flat();
 
 export interface MoveKindsDeps {
   dataDir: string;
-  store: Pick<Store, "bots" | "bot" | "group" | "patchBot" | "setChiefOfStaff" | "appendMessage">;
+  store: Pick<Store, "bots" | "bot" | "group" | "patchBot" | "setChiefOfStaff" | "appendMessage" | "messagesFor">;
   routines(): Pick<RoutineManager, "listRoutines" | "listRuns" | "adopt"> | null;
   calls(): Pick<CalendarCallManager, "list" | "adopt"> | null;
   webhooks(): Pick<WebhookManager, "list" | "adopt"> | null;
-  appEvents(): Pick<AppTriggerManager, "list" | "adopt" | "remove"> | null;
+  appEvents(): Pick<AppTriggerManager, "list" | "adopt" | "remove" | "service"> | null;
   /** The person's Claude Code skills while this server uses them where they are; a move keeps them as imported skills. */
   claudeCodeSkills(): ImportedSkillInput[];
   instanceExists(id: string): boolean;
@@ -139,16 +143,23 @@ export function moveBotParts(bot: BotRecord, hash: (value: unknown) => string): 
 }
 
 /** This server's automations and skill extras, as a move compares them: automations only of the bots it carries, and a
- * definition apart from its switch, its address and its counts. */
-export function moveItems(deps: MoveKindsDeps, bots: ReadonlySet<string>): CloudSendItem[] {
+ * definition apart from its switch, its address and its counts. `only`: a move of that one bot into a team carries its
+ * own routines and the library skills it uses; its calls, webhooks and app events, and the person's imported skills,
+ * stay. */
+export function moveItems(deps: MoveKindsDeps, bots: ReadonlySet<string>, only?: Pick<BotRecord, "id" | "assignedSkills">): CloudSendItem[] {
   const items: CloudSendItem[] = [];
   const add = (kind: MoveKind, id: string, label: string, parts: Record<string, string>, bot?: string) =>
     items.push({ key: itemKey.moved(kind, id), kind, label: label.slice(0, 200), id, ...(bot ? { bot } : {}), parts });
   const routines = deps.routines();
   for (const routine of routines?.listRoutines() ?? []) {
-    if (!bots.has(routine.botId)) continue;
+    if (!bots.has(routine.botId) || (only && (routine.botId !== only.id || routine.target !== "bot"))) continue;
     add("routine", routine.id, routine.name, { def: definitionHash(routine, ROUTINE_FIELDS, deps.dataDir),
       runs: hashOf(finishedRuns(routines!, routine.id).map((run) => run.id).sort()) }, routine.botId);
+  }
+  if (only) {
+    const uses = new Set(only.assignedSkills ?? []);
+    for (const { entry } of librarySkills()) if (uses.has(entry.name)) add("library-skill", entry.name, entry.name, { text: entry.sha256.slice(0, 24) || EMPTY, state: entry.reviewState });
+    return items;
   }
   for (const call of deps.calls()?.list() ?? []) {
     if (call.botIds.every((id) => bots.has(id))) add("call", call.id, call.name, { def: definitionHash(call, CALL_FIELDS, deps.dataDir) }, call.botIds[0]);
@@ -164,8 +175,15 @@ export function moveItems(deps: MoveKindsDeps, bots: ReadonlySet<string>): Cloud
   return items;
 }
 
-/** Each automation here and whether it is on, for the switch that turns on there what was on here. */
-export function automationSwitches(deps: MoveKindsDeps): Array<{ key: string; on: boolean }> {
+/** The bot has a routine here the person set up or changed: a move counts it as in use, so the routine goes with it. */
+export function automatedBot(deps: Pick<MoveKindsDeps, "routines">, botId: string): boolean {
+  return (deps.routines()?.listRoutines() ?? []).some((routine) => routine.botId === botId && !watchAsMade(routine));
+}
+
+/** Each automation here and whether it is on, for the switch that turns on there what was on here; `bot`: that bot's
+ * routines only. */
+export function automationSwitches(deps: MoveKindsDeps, bot?: string): Array<{ key: string; on: boolean }> {
+  if (bot !== undefined) return (deps.routines()?.listRoutines() ?? []).filter((routine) => routine.botId === bot && routine.target === "bot").map((routine) => ({ key: itemKey.moved("routine", routine.id), on: routine.enabled }));
   return [
     ...(deps.routines()?.listRoutines() ?? []).map((routine) => ({ key: itemKey.moved("routine", routine.id), on: routine.enabled })),
     ...(deps.calls()?.list() ?? []).map((call) => ({ key: itemKey.moved("call", call.id), on: call.nextRunAt !== null })),
@@ -174,10 +192,11 @@ export function automationSwitches(deps: MoveKindsDeps): Array<{ key: string; on
   ];
 }
 
-/** The finished runs of this server's routines, by id with their routine's. */
-export function routineRunIds(deps: MoveKindsDeps): Array<{ id: string; routine: string }> {
+/** The finished runs of this server's routines, by id with their routine's; `bot`: that bot's routines' only. */
+export function routineRunIds(deps: MoveKindsDeps, bot?: string): Array<{ id: string; routine: string }> {
   const routines = deps.routines();
-  return routines ? routines.listRuns().filter((run) => FINISHED.has(run.status) && run.triggerSource !== "webhook")
+  const kept = bot === undefined ? null : new Set(routines?.listRoutines().filter((routine) => routine.botId === bot && routine.target === "bot").map((routine) => routine.id));
+  return routines ? routines.listRuns().filter((run) => FINISHED.has(run.status) && run.triggerSource !== "webhook" && (!kept || kept.has(run.routineId)))
     .map((run) => ({ id: run.id, routine: run.routineId })).sort((a, b) => a.id.localeCompare(b.id)) : [];
 }
 
@@ -189,14 +208,15 @@ function parseKey(key: string | null): { kind: Kind; id: string } | null {
   return (kind === "imported-skill" || kind === "library-skill") && !isSkillName(match[2]!) ? null : { kind, id: match[2]! };
 }
 
-/** One item's whole record on this server, for a move to carry; null when it is not here. */
-export function kindRecord(deps: MoveKindsDeps, kind: Kind, id: string): { record: unknown; runs?: RoutineRun[] } | null {
+/** One item's whole record on this server, for a move to carry; null when it is not here. A routine's `changedAt` says
+ * when it last changed here, for a move to keep the side that changed it last. */
+export function kindRecord(deps: MoveKindsDeps, kind: Kind, id: string): { record: unknown; runs?: RoutineRun[]; changedAt?: number } | null {
   if (kind === "bot") { const bot = deps.store.bot(id); return bot ? { record: pick(bot, MOVE_BOT_FIELDS) } : null; }
   if (kind === "routine") {
     const routines = deps.routines();
     const routine = routines?.listRoutines().find((candidate) => candidate.id === id);
     // Its switch goes along for the switch that turns on there what was on here; My Cloud takes it switched off.
-    return routine ? { record: { id, ...pick(routine, ROUTINE_FIELDS), enabled: routine.enabled }, runs: finishedRuns(routines!, id) } : null;
+    return routine ? { record: { id, ...pick(routine, ROUTINE_FIELDS), enabled: routine.enabled }, runs: finishedRuns(routines!, id), changedAt: routine.updatedAt } : null;
   }
   if (kind === "call") { const call = deps.calls()?.list().find((candidate) => candidate.id === id); return call ? { record: call } : null; }
   if (kind === "webhook") { const webhook = deps.webhooks()?.list().find((candidate) => candidate.id === id); return webhook ? { record: webhook } : null; }
@@ -206,11 +226,13 @@ export function kindRecord(deps: MoveKindsDeps, kind: Kind, id: string): { recor
   return skill ? { record: skill } : null;
 }
 
+/** `final`: sending it again cannot help until the person changes something, so the move goes on without it. */
 class Refused extends Error {
   status: number;
-  constructor(status: number, message: string) { super(message); this.status = status; }
+  final: boolean;
+  constructor(status: number, message: string, final = false) { super(message); this.status = status; this.final = final; }
 }
-const refuse = (status: number, message: string): never => { throw new Refused(status, message); };
+const refuse = (status: number, message: string, final = false): never => { throw new Refused(status, message, final); };
 
 const routineSchema = z.object({ id: z.string().regex(/^[\w-]{1,128}$/u), name: z.string().max(200), prompt: z.string().max(100_000), target: z.enum(["bot", "room-goal"]),
   botId: z.string().min(1).max(128), groupId: z.string().max(128).optional(), runOn: z.enum(["maus", "cloud"]), schedule: z.record(z.string(), z.unknown()),
@@ -229,6 +251,9 @@ const botFieldsSchema = z.object({
   playbooks: z.array(playbookSchema).max(50).nullable().optional(),
   installedPackage: z.record(z.string(), z.unknown()).nullable().optional(),
   assignedSkills: z.array(z.string().max(64)).max(200).nullable().optional(),
+  defaultBot: z.object({ person: z.string().max(320).optional() }).strict().nullable().optional(),
+  sidebarHidden: z.boolean().nullable().optional(),
+  welcomed: z.boolean().nullable().optional(),
 }).strict();
 const skillFileSchema = z.object({ path: z.string().max(400).refine(validRelative), content: z.string().max(512 * 1024), executable: z.boolean() });
 const importedSkillSchema = z.object({ name: z.string().refine(isSkillName), skillMd: z.string().max(512 * 1024), files: z.array(skillFileSchema).max(200),
@@ -241,7 +266,7 @@ const librarySkillSchema = z.object({ text: z.string().max(512 * 1024), entry: z
 
 /** My Cloud sets a bot's move-only fields as they are on this computer: absent ones it clears, its own projects it keeps
  * beside the ones that arrive, and an engine, team or library skill it lacks it leaves out. */
-function applyBotFields(deps: MoveKindsDeps, id: string, raw: unknown): void {
+function applyBotFields(deps: MoveKindsDeps, id: string, raw: unknown, source: ArrivingSource = {}): void {
   const bot = deps.store.bot(id) ?? refuse(409, "This bot is not on My Cloud yet.");
   const parsed = botFieldsSchema.safeParse(raw);
   if (!parsed.success) refuse(400, "send the bot's fields as this computer holds them");
@@ -250,6 +275,8 @@ function applyBotFields(deps: MoveKindsDeps, id: string, raw: unknown): void {
   const set = <K extends keyof BotRecord>(key: K, value: BotRecord[K] | undefined) => { if (Object.hasOwn(fields, key)) patch[key] = value as BotRecord[K]; };
   set("hidden", fields.hidden ?? undefined);
   set("pinned", fields.pinned ?? undefined);
+  set("sidebarHidden", fields.sidebarHidden ?? undefined);
+  set("welcomed", fields.welcomed ?? undefined);
   set("managedSections", fields.managedSections ? [...new Set(fields.managedSections.filter(Boolean))] : undefined);
   set("fallback", fields.fallback ? fields.fallback.filter((entry) => deps.instanceExists(entry.instanceId)) : undefined);
   if (fields.projects) {
@@ -266,10 +293,16 @@ function applyBotFields(deps: MoveKindsDeps, id: string, raw: unknown): void {
   if (Object.hasOwn(fields, "chiefOfStaff") && fields.chiefOfStaff !== true) patch.chiefOfStaff = fields.chiefOfStaff ?? undefined;
   if (fields.chiefOfStaff === true) delete patch.hidden;
   deps.store.patchBot(id, patch);
-  if (fields.chiefOfStaff === true) {
+  // A MausBot arriving where the person's own MausBot stays (takeArrivingDefaultBot) doesn't take the crown from this
+  // place's Chief, whichever bot that is, also when a later pass sends its Chief fields without its MausBot mark.
+  const keepsCrown = (fields.defaultBot || source.defaultBot) && keptDefaultBot(deps.store, id)
+    && deps.store.bots.some((other) => other.id !== id && other.chiefOfStaff);
+  if (fields.chiefOfStaff === true && !keepsCrown) {
     deps.store.setChiefOfStaff(id);
     if (patch.managedSections) deps.store.patchBot(id, { managedSections: patch.managedSections });
   }
+  if (fields.defaultBot) takeArrivingDefaultBot(deps.store, id, source.computer);
+  retireUnusedStarter(deps.store, deps.dataDir);
 }
 
 /** A routine as it arrives: off unless My Cloud switched it on, with its finished runs My Cloud lacks. */
@@ -277,9 +310,9 @@ function adoptRoutine(deps: MoveKindsDeps, raw: unknown, runs: unknown, from: st
   const routines = deps.routines() ?? refuse(503, "My Cloud's routines are not ready yet.");
   const parsed = routineSchema.safeParse(raw);
   if (!parsed.success) refuse(400, "send the routine as this computer holds it");
-  const routine = rebased({ id: parsed.data!.id, ...pick(parsed.data!, ROUTINE_FIELDS) }, from, deps.dataDir) as unknown as Routine;
+  const routine = withCheckFields(rebased({ id: parsed.data!.id, ...pick(parsed.data!, ROUTINE_FIELDS) }, from, deps.dataDir) as unknown as Routine);
   if (!deps.store.bot(routine.botId)) refuse(409, "This routine's bot is not on My Cloud yet.");
-  if (routine.target === "room-goal" && (!routine.groupId || !deps.store.group(routine.groupId))) refuse(409, "This routine's room is not on My Cloud yet.");
+  if (routine.target === "room-goal" && routine.groupId && !deps.store.group(routine.groupId)) refuse(409, "This routine's room is not on My Cloud yet.");
   const arriving = (Array.isArray(runs) ? runs : []).flatMap((run) => {
     const checked = runSchema.safeParse(run);
     return checked.success && checked.data.routineId === routine.id && FINISHED.has(checked.data.status) ? [rebased(checked.data, from, deps.dataDir) as unknown as RoutineRun] : [];
@@ -298,10 +331,10 @@ function adoptRoutine(deps: MoveKindsDeps, raw: unknown, runs: unknown, from: st
   deps.arrived?.();
 }
 
-async function adopt(deps: MoveKindsDeps, kind: Kind, id: string, raw: unknown, runs: unknown, from: string, owner: CloudOwner): Promise<void> {
+async function adopt(deps: MoveKindsDeps, kind: Kind, id: string, raw: unknown, runs: unknown, from: string, owner: CloudOwner, source: ArrivingSource = {}): Promise<void> {
   if (!record(raw) && kind !== "bot") refuse(400, "send the item's record");
   const same = (value: unknown) => record(value) && (value.id === undefined || value.id === id);
-  if (kind === "bot") return applyBotFields(deps, id, raw);
+  if (kind === "bot") return applyBotFields(deps, id, raw, source);
   if (kind === "routine") return adoptRoutine(deps, raw, runs, from, owner);
   if (!same(raw) && kind !== "imported-skill" && kind !== "library-skill") refuse(400, "the record names another item");
   if (kind === "call") {
@@ -317,6 +350,10 @@ async function adopt(deps: MoveKindsDeps, kind: Kind, id: string, raw: unknown, 
   }
   if (kind === "app-event") {
     const triggers = deps.appEvents() ?? refuse(503, "My Cloud's app events are not ready yet.");
+    const service = triggers.service();
+    if (!service.available) refuse(409, service.reason === "self-hosted"
+      ? "This app automation stays on the computer it came from: My Cloud uses its own Composio key, so it cannot watch apps. Use a schedule or a webhook here instead."
+      : "This app automation stays on the computer it came from: connected apps are not set up on My Cloud. Set them up here, then make it again.", true);
     await triggers.adopt({ ...rebased(raw as unknown as AppTrigger, from, deps.dataDir), id });
     return;
   }
@@ -344,7 +381,15 @@ async function adopt(deps: MoveKindsDeps, kind: Kind, id: string, raw: unknown, 
   }
 }
 
-const putSchema = z.object({ v: z.literal(1), key: z.string().max(200), dataDir: z.string().min(1).max(4096), record: z.unknown(), runs: z.array(z.unknown()).max(2_000).optional() });
+const putSchema = z.object({ v: z.literal(1), key: z.string().max(200), dataDir: z.string().min(1).max(4096), record: z.unknown(), runs: z.array(z.unknown()).max(2_000).optional(),
+  computer: z.string().max(120).optional(), sourceDefault: z.boolean().optional() });
+
+type ArrivingSource = { computer?: string; defaultBot?: boolean };
+
+/** This computer's name as a person knows it, which a MausBot that moves away is named for when the place it goes keeps its own. */
+function thisComputerName(): string {
+  return (process.env.OMB_ENVIRONMENT_LABEL?.trim() || hostname()).replace(/\.local$/iu, "").slice(0, 120);
+}
 
 /** False when the path is not this route. */
 export async function moveKindsRoute(deps: MoveKindsDeps, { req, res, path, method, url, auth, json, readBody }: RouteContext): Promise<boolean> {
@@ -355,7 +400,7 @@ export async function moveKindsRoute(deps: MoveKindsDeps, { req, res, path, meth
       const key = parseKey(url.searchParams.get("key"));
       const found = key && kindRecord(deps, key.kind, key.id);
       if (!found) json(res, 404, { error: "not here" });
-      else json(res, 200, { v: 1, dataDir: deps.dataDir, ...found });
+      else json(res, 200, { v: 1, dataDir: deps.dataDir, ...(key.kind === "bot" ? { computer: thisComputerName() } : {}), ...found });
       return true;
     }
     if (method === "PUT") {
@@ -364,7 +409,7 @@ export async function moveKindsRoute(deps: MoveKindsDeps, { req, res, path, meth
       const body = putSchema.safeParse(await readBody(req, KIND_BODY_MAX));
       const key = body.success ? parseKey(body.data.key) : null;
       if (!body.success || !key) { json(res, 400, { error: "send { v: 1, key, dataDir, record }" }); return true; }
-      await adopt(deps, key.kind, key.id, body.data.record, body.data.runs, body.data.dataDir, owner);
+      await adopt(deps, key.kind, key.id, body.data.record, body.data.runs, body.data.dataDir, owner, { computer: body.data.computer, defaultBot: body.data.sourceDefault });
       json(res, 200, { v: 1, ok: true });
       return true;
     }
@@ -377,7 +422,7 @@ export async function moveKindsRoute(deps: MoveKindsDeps, { req, res, path, meth
     json(res, 405, { error: "method not allowed" });
   } catch (error) {
     const status = error instanceof Refused ? error.status : Number.isInteger((error as { status?: unknown }).status) ? (error as { status: number }).status : 500;
-    json(res, status, { error: (error as Error).message?.slice(0, 300) || "It could not be moved." });
+    json(res, status, { error: (error as Error).message?.slice(0, 300) || "It could not be moved.", ...(error instanceof Refused && error.final ? { final: true } : {}) });
   }
   return true;
 }

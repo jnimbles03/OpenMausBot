@@ -98,7 +98,6 @@ beforeAll(async () => {
   writeFileSync(titleFile, "Safari footer fix");
   writeFileSync(join(data, "config.json"), JSON.stringify({
     // a room task's first message is titled by the engine of whoever answers it
-    features: { llmThreadTitles: true },
     instances: {
       quick: {
         driver: "claudeAgent", displayName: "Quick fixture", config: { cli: FAKE_CLAUDE },
@@ -435,11 +434,13 @@ describe("Auto rooms ask the decision model who answers", { timeout: 90_000 }, (
 
     it("the OpenRouter key from API keys is never sent to an operator's base URL; a key of its own still is", async () => {
       const SHARED = "sk-or-v1-e2e-shared-value-4c7a1f";
-      const cleared = await api("PUT", "/api/config", { decider: { openrouterKey: "" } });
-      expect(cleared.body.decider).toMatchObject({ provider: "openrouter", configured: false, enabled: false });
+      // No own key of any kind: the Jev key saved earlier would otherwise come first.
+      const cleared = await api("PUT", "/api/config", { decider: { openrouterKey: "", key: "" } });
+      expect(cleared.body.decider).toMatchObject({ configured: false, enabled: false });
 
       const keyed = await api("PUT", "/api/config", { openrouter: { key: SHARED } });
       expect(keyed.status).toBe(200);
+      // OpenRouter stays the chosen provider in Settings, still with no key of its own.
       expect(keyed.body.decider).toEqual({ provider: "openrouter", model: MODEL, api: "chat", configured: false, enabled: false, jobs: { roomRouting: true } });
       expect((await api("PUT", "/api/config", { decider: { enabled: true } })).status).toBe(400);
       expect(await api("POST", "/api/decider/test", {})).toMatchObject({ body: { ok: false, reason: "no_key" } });

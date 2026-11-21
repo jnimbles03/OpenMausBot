@@ -29,10 +29,12 @@ function ended(phase: "expired" | "failed", message?: string): DeviceSignInStatu
 }
 
 /** `autoStart` begins at once and opens Anthropic's page; `onDone` hears the outcome so an account list can close it. */
-export function ClaudeSignIn({ instanceId, autoStart = false, onDone }: {
+export function ClaudeSignIn({ instanceId, autoStart = false, onDone, onStart }: {
   instanceId: string;
   autoStart?: boolean;
   onDone?: (signedIn: boolean) => void;
+  /** A sign-in is starting. */
+  onStart?: () => void;
 }) {
   const { refreshInstances, refreshModels } = useStore();
   const [auth, setAuth] = useState<DeviceSignInStatus | null>(null);
@@ -64,6 +66,7 @@ export function ClaudeSignIn({ instanceId, autoStart = false, onDone }: {
   const start = async () => {
     setBusy("start");
     setError(null);
+    onStart?.();
     try {
       const { auth: next }: { auth: DeviceSignInStatus } = await api(`${base}/start`, { method: "POST" });
       setCode("");
@@ -151,9 +154,9 @@ export function ClaudeSignIn({ instanceId, autoStart = false, onDone }: {
               spellCheck={false}
               autoFocus
               placeholder={t("accounts.claude.codePlaceholder")}
-              className="min-w-0 flex-1 rounded-lg border border-hairline/40 bg-inset px-3 py-2 font-mono text-[12.5px] text-ink outline-none focus:border-accent-border"
+              className="min-w-0 flex-1 rounded-lg border border-hairline/40 bg-inset px-3 py-2 font-mono text-[13px] text-ink outline-none focus:border-accent-border"
             />
-            <button type="submit" disabled={busy !== null || code.trim().length < 8} className="flex shrink-0 items-center gap-1.5 rounded-lg bg-accent px-3 py-2 text-[12.5px] font-semibold text-white hover:brightness-110 disabled:opacity-50">
+            <button type="submit" disabled={busy !== null || code.trim().length < 8} className="flex shrink-0 items-center gap-1.5 rounded-lg bg-accent px-3 py-2 text-[13px] font-semibold text-white hover:brightness-110 disabled:opacity-50">
               {busy === "finish" && <Loader2 size={13} className="animate-spin" />}
               {busy === "finish" ? t("engineSetup.claude.finishing") : t("accounts.claude.finish")}
             </button>
@@ -180,7 +183,7 @@ export function ClaudeSignIn({ instanceId, autoStart = false, onDone }: {
           type="button"
           disabled={busy !== null}
           onClick={() => void start()}
-          className="flex items-center justify-center gap-2 rounded-lg bg-accent px-3 py-2 text-[12.5px] font-semibold text-white hover:brightness-110 disabled:opacity-50"
+          className="flex items-center justify-center gap-2 rounded-lg bg-accent px-3 py-2 text-[13px] font-semibold text-white hover:brightness-110 disabled:opacity-50"
         >
           {busy === "start" ? <Loader2 size={14} className="animate-spin" /> : <LogIn size={14} />}
           {busy === "start" ? t("engineSetup.claude.starting") : auth || error ? t("engineSetup.device.tryAgain") : t("engineSetup.claude.start")}

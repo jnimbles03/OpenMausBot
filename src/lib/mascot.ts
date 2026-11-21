@@ -2,6 +2,7 @@ import { CURSOR_STATES, type CursorState } from "@/components/CursorAvatar";
 import { botShowsUnread } from "./bot-unread";
 import { lastNonReceipt } from "./receipts";
 import type { MausColor } from "../../shared/wire";
+import type { LocaleKey } from "@/locales";
 
 export { MAUS_COLOR_NAMES, type MausColor } from "../../shared/wire";
 
@@ -58,7 +59,25 @@ export const MAUS_COLORS = {
   yellow: "#D8A729",
   teal: "#01A492",
   coral: "#E5634E",
+  silver: "#A8ADB4",
+  chrome: "#B3BAC4",
 } satisfies Record<MausColor, string>;
+
+export const MAUS_COLOR_LABEL = {
+  green: "mascotColor.green", blue: "mascotColor.blue", red: "mascotColor.red", orange: "mascotColor.orange",
+  purple: "mascotColor.purple", cyan: "mascotColor.cyan", pink: "mascotColor.pink", yellow: "mascotColor.yellow",
+  teal: "mascotColor.teal", coral: "mascotColor.coral", silver: "mascotColor.silver",
+  chrome: "mascotColor.chrome",
+} as const satisfies Record<MausColor, LocaleKey>;
+
+export const CHROME_GRADIENT: [string, string, string] = ["#F1F4F7", "#AEB8C3", "#66717E"];
+export const CHROME_EYES = "#1E2833";
+
+export function colorSwatch(color: MausColor): string {
+  if (color !== "chrome") return MAUS_COLORS[color];
+  const [light, mid, edge] = CHROME_GRADIENT;
+  return `radial-gradient(circle at 34% 26%, #ffffff 0%, ${light} 20%, ${mid} 55%, ${edge} 100%)`;
+}
 
 export const MAUS_MOTIONS = [
   "arrive",
@@ -131,13 +150,20 @@ export type MascotBotProfile = {
   messages?: MascotMessage[];
 };
 
+const isFailedStep = (message: MascotMessage | undefined) => message?.kind === "activity" && message.tool?.ok === false;
+
+/** The conversation ended on a failed step: the turn's error row, or a tool that failed with nothing after it. */
+export function endedOnFailure(messages: readonly MascotMessage[] | undefined): boolean {
+  return isFailedStep(lastNonReceipt(messages));
+}
+
 export function stateForBot(bot: MascotBotProfile): MausState {
   const pinned = normalizeState(bot.mascotExpression);
   if (pinned) return pinned;
 
   const last = lastNonReceipt(bot.messages);
 
-  if (last?.kind === "activity" && last.tool?.ok === false) return "alerting";
+  if (isFailedStep(last)) return "alerting";
   if (bot.busy) return "working";
   if (botShowsUnread(bot)) return "notifying";
   if (last?.kind === "options") return "curious";

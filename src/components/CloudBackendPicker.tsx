@@ -1,7 +1,7 @@
 import type { CloudBackend } from "../../shared/wire";
 import { cn } from "@/lib/cn";
-import { useStore } from "@/state/store";
 import { t } from "@/lib/i18n";
+import { sameFields, useStoreSelector } from "@/state/store-select";
 
 export function CloudBackendPicker({
   value,
@@ -12,12 +12,12 @@ export function CloudBackendPicker({
   compact?: boolean;
   onChange: (backend: CloudBackend) => void;
 }) {
-  const { state } = useStore();
+  const state = useStoreSelector((s) => ({ config: s.config }), sameFields);
   if (state.config?.cloudHome) return null;
   return (
     <div className="mt-3 rounded-lg bg-inset p-3">
       <div className="text-[12px] font-medium text-ink">{compact ? t("botAccess.cloud.provider") : t("botAccess.cloud.backend")}</div>
-      <div className="mt-0.5 text-[11.5px] text-ink-secondary">
+      <div className="mt-0.5 text-[12px] text-ink-secondary">
         {compact
           ? value === "vps" ? t("botAccess.cloud.vpsDescription") : t("botAccess.cloud.hostedDescription")
           : value === "vps"

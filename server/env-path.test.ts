@@ -1,13 +1,14 @@
 import { execFile } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, join, relative } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   augmentedPath,
   findCliCandidates,
   harnessHome,
+  registerFallbackPathDir,
   registerPathDir,
   resetPathCache,
   resetPathCacheForTests,
@@ -87,7 +88,7 @@ describe("augmentedPath", () => {
   posixIt("keeps the last login-shell PATH available during a rescan", async () => {
     const shell = join(homedir(), "fake-login-shell");
     const rcOnlyBin = join(homedir(), "rc-only", "bin");
-    writeFileSync(shell, `#!/bin/sh\nprintf '__OMB_PATH__%s' '${rcOnlyBin}'\n`);
+    writeFileSync(shell, `#!/bin/sh\nprintf '__OMB_PATH__%s__OMB_END__' '${rcOnlyBin}'\n`);
     chmodSync(shell, 0o755);
 
     const previousShell = process.env.SHELL;
@@ -111,6 +112,224 @@ describe("augmentedPath", () => {
     }
   });
 
+  posixIt("runs the login-shell probe in its own session, so an interactive shell cannot take over the terminal", async () => {
+    const shell = join(homedir(), "fake-login-shell");
+    const rcOnlyBin = join(homedir(), "rc-only", "bin");
+    // Answers only when it leads its own process group, as a detached (setsid) child does; an attached one shares the server's.
+    writeFileSync(shell, `#!/bin/sh\n[ "$(ps -o pgid= -p $$ | tr -d ' ')" = "$$" ] && printf '__OMB_PATH__%s__OMB_END__' '${rcOnlyBin}'\n`);
+    chmodSync(shell, 0o755);
+
+    const saved = { SHELL: process.env.SHELL, VITEST: process.env.VITEST };
+    try {
+      process.env.SHELL = shell;
+      delete process.env.VITEST;
+      resetPathCacheForTests();
+
+      augmentedPath();
+      await vi.waitFor(() => expect(augmentedPath().split(delimiter)).toContain(rcOnlyBin));
+    } finally {
+      if (saved.SHELL === undefined) delete process.env.SHELL;
+      else process.env.SHELL = saved.SHELL;
+      if (saved.VITEST === undefined) delete process.env.VITEST;
+      else process.env.VITEST = saved.VITEST;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt("uses the login-shell PATH once the shell exits, even when its rc leaves a job holding stdout open", async () => {
+    const shell = join(homedir(), "fake-login-shell");
+    const rcOnlyBin = join(homedir(), "rc-only", "bin");
+    const jobPid = join(homedir(), "rc-job.pid");
+    writeFileSync(shell, `#!/bin/sh\nprintf '__OMB_PATH__%s__OMB_END__' '${rcOnlyBin}'\nsleep 30 &\necho $! > '${jobPid}'\n`);
+    chmodSync(shell, 0o755);
+
+    const saved = { SHELL: process.env.SHELL, VITEST: process.env.VITEST };
+    try {
+      process.env.SHELL = shell;
+      delete process.env.VITEST;
+      resetPathCacheForTests();
+
+      augmentedPath();
+      await vi.waitFor(() => expect(augmentedPath().split(delimiter)).toContain(rcOnlyBin), { timeout: 3000 });
+    } finally {
+      if (existsSync(jobPid)) {
+        try {
+          process.kill(Number(readFileSync(jobPid, "utf8").trim()));
+        } catch {}
+      }
+      if (saved.SHELL === undefined) delete process.env.SHELL;
+      else process.env.SHELL = saved.SHELL;
+      if (saved.VITEST === undefined) delete process.env.VITEST;
+      else process.env.VITEST = saved.VITEST;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt("drops a login-shell probe whose output passes 1 MiB", async () => {
+    const shell = join(homedir(), "fake-login-shell");
+    const rcOnlyBin = join(homedir(), "rc-only", "bin");
+    const shellPid = join(homedir(), "flood-shell.pid");
+    const finished = join(homedir(), "flood-finished");
+    writeFileSync(
+      shell,
+      `#!/bin/sh\necho $$ > '${shellPid}'\nprintf '__OMB_PATH__%s__OMB_END__\\n' '${rcOnlyBin}'\nhead -c 2000000 /dev/zero\n: > '${finished}'\n`,
+    );
+    chmodSync(shell, 0o755);
+    // /proc/<pid>/stat: a killed process its parent has not reaped yet (state Z) still answers kill(pid, 0).
+    const procState = (pid: number) => {
+      try {
+        return readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]?.[0] ?? "?";
+      } catch {
+        return "?";
+      }
+    };
+    const alive = (pid: number) => {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        return false;
+      }
+      return procState(pid) !== "Z";
+    };
+
+    const saved = { SHELL: process.env.SHELL, VITEST: process.env.VITEST };
+    try {
+      process.env.SHELL = shell;
+      delete process.env.VITEST;
+      resetPathCacheForTests();
+
+      augmentedPath();
+      const pid = await vi.waitFor(
+        () => {
+          const written = existsSync(shellPid) ? Number(readFileSync(shellPid, "utf8").trim()) : 0;
+          expect(written).toBeGreaterThan(0);
+          return written;
+        },
+        { timeout: 5000 },
+      );
+      await vi.waitFor(() => expect(alive(pid), `probe shell state ${procState(pid)}`).toBe(false), { timeout: 5000 });
+      expect(existsSync(finished)).toBe(false);
+      expect(augmentedPath().split(delimiter)).not.toContain(rcOnlyBin);
+    } finally {
+      if (saved.SHELL === undefined) delete process.env.SHELL;
+      else process.env.SHELL = saved.SHELL;
+      if (saved.VITEST === undefined) delete process.env.VITEST;
+      else process.env.VITEST = saved.VITEST;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt("waits for the login shell's whole answer, even when the rest arrives after the shell exits", async () => {
+    const shell = join(homedir(), "fake-login-shell");
+    const firstBin = join(homedir(), "first", "bin");
+    const restBin = join(homedir(), "rest", "bin");
+    const shellPid = join(homedir(), "split-shell.pid");
+    const go = join(homedir(), "split-answer.go");
+    // The shell exits after half its answer; a job holding its stdout writes the rest once the test says go (bounded at 10 s).
+    writeFileSync(
+      shell,
+      [
+        "#!/bin/sh",
+        `echo $$ > '${shellPid}'`,
+        `printf '__OMB_PATH__%s' '${firstBin}'`,
+        `(i=0; while [ ! -e '${go}' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; printf ':%s__OMB_END__' '${restBin}') &`,
+        "",
+      ].join("\n"),
+    );
+    chmodSync(shell, 0o755);
+
+    const saved = { SHELL: process.env.SHELL, VITEST: process.env.VITEST };
+    try {
+      process.env.SHELL = shell;
+      delete process.env.VITEST;
+      resetPathCacheForTests();
+
+      augmentedPath();
+      const pid = await vi.waitFor(() => {
+        const written = existsSync(shellPid) ? Number(readFileSync(shellPid, "utf8").trim()) : 0;
+        expect(written).toBeGreaterThan(0);
+        return written;
+      });
+      // Gone from the process table = reaped, and Node emits "exit" as it reaps.
+      await vi.waitFor(() => expect(() => process.kill(pid, 0)).toThrow());
+      writeFileSync(go, "");
+      await vi.waitFor(() => expect(augmentedPath().split(delimiter)).toContain(restBin), { timeout: 5000 });
+      expect(augmentedPath().split(delimiter)).toContain(firstBin);
+    } finally {
+      if (saved.SHELL === undefined) delete process.env.SHELL;
+      else process.env.SHELL = saved.SHELL;
+      if (saved.VITEST === undefined) delete process.env.VITEST;
+      else process.env.VITEST = saved.VITEST;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt("stops reading once the login shell's answer is complete, ignoring a background job's later output", async () => {
+    const shell = join(homedir(), "fake-login-shell");
+    const rcOnlyBin = join(homedir(), "rc-only", "bin");
+    const jobStatus = join(homedir(), "late-job.status");
+    writeFileSync(
+      shell,
+      `#!/bin/sh\nprintf '__OMB_PATH__%s__OMB_END__' '${rcOnlyBin}'\n(head -c 800000 /dev/zero; echo $? > '${jobStatus}') &\n`,
+    );
+    chmodSync(shell, 0o755);
+
+    const saved = { SHELL: process.env.SHELL, VITEST: process.env.VITEST };
+    try {
+      process.env.SHELL = shell;
+      delete process.env.VITEST;
+      resetPathCacheForTests();
+
+      augmentedPath();
+      await vi.waitFor(() => expect(augmentedPath().split(delimiter)).toContain(rcOnlyBin));
+      // A write nobody reads any more ends the job by SIGPIPE (141) on macOS and can fail with an error (1) on Linux;
+      // 0 would mean it was all read.
+      await vi.waitFor(() => expect(existsSync(jobStatus) && readFileSync(jobStatus, "utf8").trim()).toMatch(/^[1-9]\d*$/), {
+        timeout: 5000,
+      });
+      expect(augmentedPath().split(delimiter)).toContain(rcOnlyBin);
+    } finally {
+      if (saved.SHELL === undefined) delete process.env.SHELL;
+      else process.env.SHELL = saved.SHELL;
+      if (saved.VITEST === undefined) delete process.env.VITEST;
+      else process.env.VITEST = saved.VITEST;
+      resetPathCacheForTests();
+    }
+  });
+
+  posixIt("keeps the login-shell PATH in the same order after a rescan", async () => {
+    const knownBin = join(homedir(), ".local", "bin");
+    mkdirSync(knownBin, { recursive: true });
+    const shell = join(homedir(), "fake-login-shell");
+    const rcOnlyBin = join(homedir(), "rc-only", "bin");
+    writeFileSync(shell, `#!/bin/sh\nprintf '__OMB_PATH__%s__OMB_END__' '${rcOnlyBin}'\n`);
+    chmodSync(shell, 0o755);
+
+    const saved = { PATH: process.env.PATH, SHELL: process.env.SHELL, VITEST: process.env.VITEST };
+    const restore = (key: keyof typeof saved) => {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    };
+    try {
+      process.env.PATH = join(homedir(), "bare-path");
+      process.env.SHELL = shell;
+      delete process.env.VITEST;
+      resetPathCacheForTests();
+
+      augmentedPath();
+      await vi.waitFor(() => expect(augmentedPath().split(delimiter)).toContain(rcOnlyBin));
+      const afterProbe = augmentedPath();
+
+      resetPathCache();
+      expect(augmentedPath()).toBe(afterProbe);
+    } finally {
+      restore("PATH");
+      restore("SHELL");
+      restore("VITEST");
+      resetPathCacheForTests();
+    }
+  });
+
   posixIt("keeps a sealed fixture off machine-wide install dirs and the login shell (#2035)", async () => {
     // Real directories on this machine: Homebrew's codex lives in one of them.
     const machineDirs = ["/opt/homebrew/bin", "/usr/local/bin"].filter((dir) => existsSync(dir));
@@ -119,7 +338,7 @@ describe("augmentedPath", () => {
     const shell = join(homedir(), "fake-login-shell");
     const ran = join(homedir(), "login-shell-ran");
     const rcOnlyBin = join(homedir(), "rc-only", "bin");
-    writeFileSync(shell, `#!/bin/sh\n: > '${ran}'\nprintf '__OMB_PATH__%s' '${rcOnlyBin}'\n`);
+    writeFileSync(shell, `#!/bin/sh\n: > '${ran}'\nprintf '__OMB_PATH__%s__OMB_END__' '${rcOnlyBin}'\n`);
     chmodSync(shell, 0o755);
 
     const saved = { PATH: process.env.PATH, SHELL: process.env.SHELL, VITEST: process.env.VITEST };
@@ -343,6 +562,27 @@ IF EXIST "%dp0%\\node.exe" (
 endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\pkg\\bin\\ombfake.js" %*
 `;
 
+// ...and for one whose bin is an extensionless `#!/usr/bin/env node` script — cmd-shim keeps the
+// package.json bin name verbatim (droid, grok)
+const EXTENSIONLESS_SHIM = `@ECHO off
+GOTO start
+:find_dp0
+SET dp0=%~dp0
+EXIT /b
+:start
+SETLOCAL
+CALL :find_dp0
+
+IF EXIST "%dp0%\\node.exe" (
+  SET "_prog=%dp0%\\node.exe"
+) ELSE (
+  SET "_prog=node"
+  SET PATHEXT=%PATHEXT:;.JS;=;%
+)
+
+endLocal & goto #_undefined_# 2>NUL || title %COMSPEC% & "%_prog%"  "%dp0%\\node_modules\\pkg\\bin\\ombfake" %*
+`;
+
 // ...and npm's own npm.cmd / npx.cmd, which Node's installer puts beside
 // node.exe with CRLF endings: the CLI entry sits in a variable, next to a
 // helper script
@@ -419,6 +659,26 @@ winOnly("resolveCli (Windows)", () => {
     expect(resolveCli("ombfake", [], { PATH: "", PATHEXT: ".CMD" })).toEqual({ command: "ombfake", args: [] });
   });
 
+  it("preserves the DeepSeek desktop shim's Electron CLI entry point", () => {
+    const exe = join(dir, "DeepSeek Harness.exe");
+    const archive = join(dir, "resources", "app.asar");
+    const shim = join(dir, "dsh.cmd");
+    writeFileSync(exe, "MZ");
+    mkdirSync(join(dir, "resources"));
+    writeFileSync(archive, "");
+    writeFileSync(shim, [
+      "@echo off",
+      'set "ELECTRON_RUN_AS_NODE=1"',
+      '"%~dp0DeepSeek Harness.exe" --expose-internals "%~dp0resources\\app.asar\\dsh\\cli.js" %*',
+      "exit /b %errorlevel%",
+    ].join("\r\n"));
+    expect(resolveCli(shim, ["--profile", "acp"])).toEqual({
+      command: exe,
+      args: ["--expose-internals", join(archive, "dsh", "cli.js"), "--profile", "acp"],
+      env: { ELECTRON_RUN_AS_NODE: "1" },
+    });
+  });
+
   it("parses an npm .cmd shim down to `node <cli.js>`, never the shim's own node.exe", async () => {
     shimWith("ombfake.cmd", JS_SHIM, "ombfake.js", "console.log('js target ' + process.argv.slice(2).join(','));\n");
     onPath();
@@ -429,6 +689,18 @@ winOnly("resolveCli (Windows)", () => {
       execFile(r.command, r.args, (err, out) => (err ? reject(err) : resolve(out))),
     );
     expect(stdout.trim()).toBe("js target -p,hi");
+  });
+
+  it("parses an npm .cmd shim down to the extensionless node script it wraps (#3594)", async () => {
+    shimWith("ombfake.cmd", EXTENSIONLESS_SHIM, "ombfake", "#!/usr/bin/env node\nconsole.log('shim target ' + process.argv.slice(2).join(','));\n");
+    onPath();
+    const r = resolveCli("ombfake", ["-p", "hi"]);
+    expect(r.command.toLowerCase()).toMatch(/node(\.exe)?$/);
+    expect(r.args).toEqual([join(dir, "node_modules", "pkg", "bin", "ombfake"), "-p", "hi"]);
+    const stdout = await new Promise<string>((resolve, reject) =>
+      execFile(r.command, r.args, (err, out) => (err ? reject(err) : resolve(out))),
+    );
+    expect(stdout.trim()).toBe("shim target -p,hi");
   });
 
   it.each(["npm", "npx"] as const)("parses npm's own %s.cmd down to `node <cli.js>`, not its prefix helper", async (name) => {
@@ -467,6 +739,61 @@ winOnly("resolveCli (Windows)", () => {
     expect(stdout.trim()).toBe("shebang a,b");
   });
 
+  it("resolves a Cursor PowerShell -File shim to powershell.exe and the sibling script", async () => {
+    const ps1 = join(dir, "cursor-agent.ps1");
+    mkdirSync(join(dir, "versions"), { recursive: true });
+    writeFileSync(join(dir, "versions", "promote-staged.cmd"), "@echo off\r\n");
+    writeFileSync(ps1, 'Write-Output ("cursor " + ($args -join ","))\r\n');
+    writeFileSync(join(dir, "cursor-agent.cmd"), [
+      "@echo off",
+      'if exist "%~dp0versions\\promote-staged.cmd" call "%~dp0versions\\promote-staged.cmd"',
+      'set "SCRIPT_DIR=%~dp0"',
+      '%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%SCRIPT_DIR%\\cursor-agent.ps1" %*',
+    ].join("\r\n"));
+    onPath();
+    const root = process.env.SystemRoot || process.env.WINDIR || "";
+    const resolved = resolveCli("cursor-agent", ["--version"]);
+    expect(resolved.command.toLowerCase()).toBe(join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe").toLowerCase());
+    expect(resolved.args).toEqual(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1, "--version"]);
+    const stdout = await new Promise<string>((resolve, reject) => {
+      execFile(resolved.command, resolved.args, (err, out) => (err ? reject(err) : resolve(out)));
+    });
+    expect(stdout.trim()).toBe("cursor --version");
+  });
+
+  it("resolves a bare powershell.exe -File sibling from PATH", () => {
+    const ps1 = join(dir, "tool.ps1");
+    writeFileSync(ps1, 'Write-Output ("tool " + ($args -join ","))\r\n');
+    writeFileSync(join(dir, "tool.cmd"), 'powershell.exe -NoProfile -File "%SCRIPT_DIR%\\tool.ps1" %*\r\n');
+    onPath();
+    const resolved = resolveCli("tool", ["--version"]);
+    expect(resolved.command.toLowerCase()).toMatch(/powershell\.exe$/);
+    expect(resolved.args).toEqual(["-NoProfile", "-File", ps1, "--version"]);
+  });
+
+  it("leaves a non-sibling or -Command PowerShell launcher as the .cmd", () => {
+    const outside = join(dir, "..", "omb-outside.ps1");
+    const escaped = join(dir, "escaped.cmd");
+    const commanded = join(dir, "commanded.cmd");
+    writeFileSync(outside, "Write-Output no\r\n");
+    writeFileSync(escaped, '%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -File "%SCRIPT_DIR%\\..\\omb-outside.ps1" %*\r\n');
+    writeFileSync(commanded, 'powershell.exe -Command "Write-Output hi"\r\n');
+    writeFileSync(join(dir, "ok.ps1"), "Write-Output ok\r\n");
+    const mixedCommand = join(dir, "mixed-command.cmd");
+    const mixedSlash = join(dir, "mixed-c.cmd");
+    writeFileSync(mixedCommand, 'powershell.exe -Command "Write-Output hi" -File "%SCRIPT_DIR%\\ok.ps1"\r\n');
+    writeFileSync(mixedSlash, 'powershell.exe /c "Write-Output hi" -File "%SCRIPT_DIR%\\ok.ps1"\r\n');
+    onPath();
+    try {
+      expect(resolveCli("escaped", ["--version"]).command.toLowerCase()).toBe(escaped.toLowerCase());
+      expect(resolveCli("commanded", []).command.toLowerCase()).toBe(commanded.toLowerCase());
+      expect(resolveCli("mixed-command", []).command.toLowerCase()).toBe(mixedCommand.toLowerCase());
+      expect(resolveCli("mixed-c", []).command.toLowerCase()).toBe(mixedSlash.toLowerCase());
+    } finally {
+      rmSync(outside, { force: true });
+    }
+  });
+
   it("never crosses the no-shell boundary for an unparseable shim", () => {
     const shim = join(dir, "ombfake.cmd");
     writeFileSync(shim, "@ECHO OFF\ncustom-launcher %*\n");
@@ -483,6 +810,31 @@ winOnly("resolveCli (Windows)", () => {
     const resolved = resolveCli("ombfake", ["--mcp-config", payload]);
     expect(resolved.command.toLowerCase()).toBe(shim.toLowerCase());
     expect(resolved.args).toEqual(["--mcp-config", payload]);
+  });
+
+  it("resolves portable Hermes to embedded Python without interpreting arguments", () => {
+    const root = join(dir, "portable Hermes & tools");
+    mkdirSync(join(root, "hermes_cli"), { recursive: true });
+    writeFileSync(join(root, "hermes_cli", "main.py"), "");
+    const shim = join(root, "hermes.bat");
+    writeFileSync(shim, '"%PYTHON_EXE%" -m hermes_cli.main %*\r\n');
+    const args = ["acp", 'a b & c | %PATH% "quoted"', "你好"];
+    const resolved = resolveCli(shim, args);
+    expect(resolved.command).toBe(join(root, "python_embedded", "python.exe"));
+    expect(resolved.args[0]).toBe("-c");
+    expect(resolved.args.slice(2)).toEqual([root, ...args]);
+    expect(resolveCli(`"${shim}"`, args)).toEqual(resolved);
+    expect(resolveCli(relative(process.cwd(), shim), args)).toEqual(resolved);
+  });
+
+  it("does not treat unrelated batch files or incomplete layouts as portable Hermes", () => {
+    const shim = join(dir, "hermes.bat");
+    writeFileSync(shim, '"%PYTHON_EXE%" -m hermes_cli.main %*\r\n');
+    expect(resolveCli(shim, ["acp"])).toEqual({ command: shim, args: ["acp"] });
+    mkdirSync(join(dir, "hermes_cli"));
+    writeFileSync(join(dir, "hermes_cli", "main.py"), "");
+    writeFileSync(shim, "custom-launcher %*\r\n");
+    expect(resolveCli(shim, ["acp"])).toEqual({ command: shim, args: ["acp"] });
   });
 
   it("hands an unknown CLI back untouched so spawn reports its own ENOENT", () => {
@@ -558,6 +910,62 @@ describe("registerPathDir", () => {
       expect(augmentedPath().split(delimiter)[0]).toBe(missing);
       registerPathDir(missing);
       expect(augmentedPath().split(delimiter).filter((d) => d === missing)).toHaveLength(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("registerFallbackPathDir", () => {
+  let originalPath: string | undefined;
+  afterEach(() => {
+    process.env.PATH = originalPath;
+    resetPathCacheForTests();
+  });
+
+  posixIt("keeps an app-installed directory last even when the inherited PATH already lists it first", () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-fallback-path-"));
+    originalPath = process.env.PATH;
+    try {
+      const own = join(dir, "own-bin");
+      const fallback = join(dir, "app-bin");
+      mkdirSync(own);
+      mkdirSync(fallback);
+      process.env.PATH = [fallback, own].join(delimiter);
+      resetPathCacheForTests();
+      registerFallbackPathDir(fallback);
+      const path = augmentedPath().split(delimiter);
+      expect(path.at(-1)).toBe(fallback);
+      expect(path.filter((entry) => entry === fallback)).toHaveLength(1);
+      expect(path.indexOf(own)).toBeLessThan(path.indexOf(fallback));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  posixIt("puts an app-installed directory after PATH and the vendors' own folders, so a person's copy wins", () => {
+    const dir = mkdtempSync(join(tmpdir(), "omb-fallback-path-"));
+    originalPath = process.env.PATH;
+    try {
+      const own = join(dir, "own-bin");
+      const fallback = join(dir, "app-bin");
+      mkdirSync(own);
+      mkdirSync(fallback);
+      for (const folder of [own, fallback]) writeFileSync(join(folder, "fake-tool"), "#!/bin/sh\n", { mode: 0o755 });
+      process.env.PATH = own;
+      resetPathCacheForTests();
+      registerFallbackPathDir(fallback);
+      const path = augmentedPath().split(delimiter);
+      expect(path.at(-1)).toBe(fallback);
+      expect(path.indexOf(own)).toBeLessThan(path.indexOf(fallback));
+      expect(findCliCandidates("fake-tool")).toEqual([join(own, "fake-tool"), join(fallback, "fake-tool")]);
+      // A vendor default folder (~/.opencode/bin) also comes first.
+      const vendor = join(homedir(), ".opencode", "bin");
+      mkdirSync(vendor, { recursive: true });
+      resetPathCache();
+      const rescanned = augmentedPath().split(delimiter);
+      expect(rescanned.indexOf(vendor)).toBeLessThan(rescanned.indexOf(fallback));
+      rmSync(join(homedir(), ".opencode"), { recursive: true, force: true });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

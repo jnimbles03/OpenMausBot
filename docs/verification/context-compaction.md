@@ -1,9 +1,43 @@
 # Conversation context compaction
 
+## Who compacts
+
+An engine that keeps its own session and compacts it (Claude Code, Codex:
+`nativeCompaction` in the driver's capabilities) is left to do so. OpenMausBot
+does not summarize such a conversation before a turn, does not replace its
+session, and shows the engine's compaction as a note in the chat when the
+engine reports it (Claude Code's `compact_boundary`, Codex's
+`contextCompaction` item). **Compact now** asks the engine first: for Claude
+Code that is its own `/compact` on a fork of the session, as for a warm
+summary below, and the conversation moves to that fork.
+
+OpenMausBot's own fold (below) is what compacts in every other case:
+
+- an engine with no compaction of its own that OpenMausBot is told of (the API
+  models, Pi, Muse Code, ACP agents);
+- a session its engine left uncompacted: the last measured prompt is within
+  10,000 tokens or 5% (whichever is closer) of the model's window, or of
+  `OMB_CLAUDE_AUTOCOMPACT` when that is lower (190,000 by default). Claude Code
+  compacts about 33,000 tokens below that point and Codex at 90% of its
+  window, so a healthy session never reads this high;
+- Claude Code with `DISABLE_AUTO_COMPACT` or `DISABLE_COMPACT` in the
+  account's environment: the fold runs at the thresholds under Bounds;
+- `context.compactAt` set in config.json: the fold runs there for every
+  engine, as it did before engines were left to compact themselves;
+- Compact now when the engine cannot run its own (no session open or parked,
+  a Claude Code too old to fork, Codex).
+
+```sh
+pnpm exec vitest run server/host/conversation-compaction.test.ts server/context-compaction.e2e.test.ts
+```
+
+## OpenMausBot's fold
+
 Long direct conversations can summarize older exchanges before the next turn.
 The full transcript, its branches and attachments are retained. The new session
 gets a bounded summary plus recent exchanges; later turns resume that session.
-A visible, expandable note explains what was summarized, even with tool chips off.
+A visible, expandable note explains what was summarized, even with tool chips off;
+when no model wrote the summary, it says the agent continues from recent excerpts only.
 
 ## Exercise the real path
 
@@ -23,6 +57,127 @@ busy/idle state. The route accepts no agent-written summary or file path.
 From 80% of a known window, the bot's 1:1 header shows the figure with a
 **Compact now** button that calls this route (hidden again once a compaction
 record is newer than the last reply).
+
+## Warm summaries: summarizing while the conversation is idle
+
+Both kinds of compaction above run when the next turn starts, on the person's
+time. On a Team trial every first answer slower than 35 s was Claude Code
+summarizing a conversation of about 162k tokens at the start of the person's
+turn (35 to 58 s, warm cache or not). A warm summary writes that summary in
+the idle gap after the turn before, while the prompt cache is still warm, so
+the next turn starts small.
+
+- **When:** a direct conversation (not a room or a routine's run) whose turn
+  ended with 100k tokens or more of context gets one about 3 minutes later.
+  Claude Code summarizes by itself about 33,000 tokens below
+  `OMB_CLAUDE_AUTOCOMPACT` (200,000 by default, so near 167k). A conversation
+  within 27,000 tokens of that point (140k) gets its summary about 10 seconds
+  after the turn, since one more turn of tool work can reach that point; a
+  message sent meanwhile is not held up and the summary is dropped, and
+  after one dropped that way the conversation goes back to the 3 minutes
+  until a summary is written. Within
+  7,000 tokens of it (160k) it starts one second after the turn, because the next turn
+  would summarize anyway; a message sent meanwhile shows "context compaction
+  started (auto)" and its turn starts when the summary is written (at most 3
+  minutes, then the turn goes on without it). For an engine
+  OpenMausBot folds for, the fold runs while idle once the conversation is at
+  85% of the threshold its next turn would fold at.
+- **Claude Code:** `/compact` with instructions to keep the person's latest
+  requests and every open question (open question cards are named), on a
+  fork of the session (`--resume <session> --fork-session`) launched with
+  the live process's exact contract, as the keep-warm ping is. It therefore
+  reads the cached prompt start and keeps the conversation's tool list. No
+  tool can run in it, and the engine hooks never hear it. When it finishes,
+  the conversation moves to the fork: the old process is closed, and the
+  next turn resumes the fork.
+- **Word for word:** the person's last two messages and everything since
+  count as not yet seen by the new session. The next turn sends them on the
+  existing "not seen yet" path, which is saved with the conversation.
+- **Shown in the chat:** the line "summarized this conversation while it was
+  idle; the latest messages carry on word for word", in the language of the
+  conversation's person (`server.warmSummary.summarized`). OpenMausBot's fold
+  shows its usual summary note instead.
+- **A turn that starts meanwhile wins:** the summary is abandoned and nothing
+  changes. The exception is a turn that would summarize at its start anyway,
+  which waits (up to 3 minutes) for the summary already being written rather
+  than writing a second one.
+- **Skipped while work is due:**
+  - a message waiting in the queue;
+  - a teammate working on this conversation's request, or one whose answer
+    it awaits;
+  - a wait that fired and will carry on here;
+  - the workspace's spend limit reached.
+
+  It is retried, every 2 minutes for up to 50 minutes after the turn (the
+  cache's life), while the bot is busy, memory is short, or one of the bot's
+  routines is due.
+- **Opening the conversation:** the app's presence ping names the chat that
+  is open. That starts a summary the next turn needs right away, and keeps
+  the conversation's engine process alive for 10 minutes past the person's
+  last activity.
+- **Turning it off:** `context.autoCompact: false` turns warm summaries off
+  with the rest of automatic compaction; `OMB_WARM_SUMMARY=0` turns off only
+  warm summaries. The summary's model call is booked to the bot like a
+  keep-warm ping.
+
+```sh
+pnpm exec vitest run server/warm-summary.e2e.test.ts
+pnpm exec vitest run server/warm-summary.test.ts server/host/warm-summary-host.test.ts server/drivers/claude-warm-summary.test.ts server/thread-presence.test.ts server/routes/presence.test.ts
+```
+
+The fixture runs the real server with the fake Claude Code:
+
+- the conversation grows 20k tokens a turn from 110k;
+- Claude Code's own compaction fires at 162k and takes 6 s (standing in for
+  35 to 58 s);
+- warm summaries run at 1/100 of their delays (`OMB_WARM_SUMMARY_TIME_SCALE`).
+
+It proves:
+
+| Case | Time to the next reply |
+|---|---|
+| Off: the turn waits for the CLI's compaction | about 6.2 s |
+| On: the conversation was summarized while idle | about 0.3 s |
+| A message sent while the summary it needs is written | about 5.4 s (the rest of that summary, not a second one) |
+| A message sent during a summary it did not need | under 0.5 s; the fork is dropped |
+
+It also proves:
+
+- the summary ran on a persisted fork with `/compact`, and the next turn
+  resumed that fork;
+- the last two exchanges reached the engine word for word, and the first did
+  not.
+
+The times are kept in
+`<tmp>/openmausbot-verification-evidence/warm-summary-timings.jsonl`. No live
+model runs: whether a real Claude Code honours `--fork-session` for
+`/compact` in print mode is checked only by the fake.
+
+## The engine's own count of the window
+
+`POST /api/bots/:id/context` with `{ "threadId": "owned-thread-id" }` asks the
+engine process that holds the conversation what fills its window and answers
+`{ threadId, breakdown }` (`shared/context-breakdown.ts`). It needs the same
+access as sending a message, starts no turn, makes no model call and writes
+nothing: the question and its answer stay out of the conversation's native log.
+
+`breakdown` is `null`, never an estimate, when:
+
+- the engine has no such count (today only Claude Code answers
+  `get_context_usage`, from 2.1.325; an older CLI refuses the request);
+- no engine process holds the conversation: before its first turn, or after
+  the idle process was closed;
+- that process still holds what the next turn replaces: after Start fresh or
+  a rewind, and from a summary until the turn that starts the engine on it;
+- the engine did not answer within 5 seconds.
+
+```sh
+pnpm exec vitest run server/context-breakdown.e2e.test.ts server/drivers/claude-context-usage.test.ts
+pnpm exec vitest run server/drivers/claude.test.ts -t "context read"
+```
+
+The fixture's fake engine answers with `FAKE_CLAUDE_CONTEXT_USAGE`; what a real
+Claude Code counts is not exercised by any test.
 
 ## Rooms
 
@@ -259,11 +414,13 @@ those at the top level. A URL inside a command is left as the command ran.
 `context` settings in config.json are optional. `autoCompact: false` disables
 automatic folding, `compactAt` is a fraction below 1 or a token count, and
 `rebuildBytes` controls replay size (default 24,000 bytes). Context-only settings
-do not reload provider processes. The default threshold is 80% of the known
+do not reload provider processes. For an engine that does not compact itself
+the default threshold is 80% of the known
 model window; a real latest-prompt measurement wins over a transcript estimate,
 except an ACP agent's own reading, which is shown and does not time compaction.
 Summed input tokens across tool rounds are never treated as context size.
-For Claude, the threshold and post-compaction regrowth floor also leave 10%
+For Claude with a `compactAt` set or its own compaction switched off, the
+threshold and post-compaction regrowth floor also leave 10%
 headroom below the selected account's numeric native-compaction setting.
 That account's setting takes precedence over the inherited launch environment.
 Native `auto`/`off` settings supply no known numeric bound; other engines keep

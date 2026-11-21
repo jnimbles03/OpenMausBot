@@ -1,9 +1,13 @@
 // A tiny real message through an engine the person just connected, so setup can say it works or what to fix.
 import type { ProviderInstance } from "./contracts.ts";
-import { engineFailureMessage } from "./drivers/engine-errors.ts";
+import { engineFailureKind, engineFailureMessage } from "./drivers/engine-errors.ts";
 import { redactSecretsInText } from "./redact.ts";
+import { userError } from "./user-errors.ts";
+import type { ServerErrorBody } from "../shared/server-text.ts";
+import type { AiTestReason } from "../shared/ai-ranking.ts";
 
-export type EngineCheck = { ok: true } | { ok: false; error: string } | { ok: null };
+/** `reason`: the failure's kind, for the welcome's usage analytics; `error` stays the words people read. */
+export type EngineCheck = { ok: true } | ({ ok: false; reason?: AiTestReason } & ServerErrorBody) | { ok: null };
 
 const PROMPT = "This is a connection check. Reply with the single word OK.";
 const TIMEOUT_MS = 90_000;
@@ -18,22 +22,44 @@ export function engineCheckError(name: string, message: string): string {
   return said ? `${name} couldn't answer: ${said}` : `${name} didn't answer. Check again in a minute.`;
 }
 
+export function engineCheckReason(message: string): AiTestReason {
+  if (SIGNED_OUT.test(message)) return "signed_out";
+  return engineFailureKind(message) ?? "other";
+}
+
 const running = new Map<string, Promise<EngineCheck>>();
 
-/** `ok: null` for an engine without a one-shot call to check with; one check per engine at a time. */
-export function checkEngine(instance: Pick<ProviderInstance, "instanceId" | "displayName" | "driverKind" | "generateText">): Promise<EngineCheck> {
-  if (!instance.generateText) return Promise.resolve({ ok: null });
+export type CheckableEngine = Pick<ProviderInstance, "instanceId" | "displayName" | "driverKind" | "generateText" | "generateMemoryText">;
+
+/** `ok: null` for an engine without a one-off call to check with; one check per engine at a time. A check that outlasts
+ * `timeoutMs` fails then, whatever the engine does, and tells the engine to stop. */
+export function checkEngine(instance: CheckableEngine, options: { timeoutMs?: number } = {}): Promise<EngineCheck> {
+  // Codex and the ACP engines have only the background call: a fresh process with no tools, which is all a check needs.
+  const call = instance.generateText ?? instance.generateMemoryText;
+  if (!call) return Promise.resolve({ ok: null });
   const name = instance.displayName || instance.driverKind;
   const existing = running.get(instance.instanceId);
   if (existing) return existing;
-  const pending = (async (): Promise<EngineCheck> => {
-    try {
-      const answer = await instance.generateText!(PROMPT, { timeoutMs: TIMEOUT_MS, signal: AbortSignal.timeout(TIMEOUT_MS) });
-      return answer.trim() ? { ok: true } : { ok: false, error: `${name} answered with nothing. Check again in a minute.` };
-    } catch (error) {
-      return { ok: false, error: engineCheckError(name, error instanceof Error ? error.message : String(error)) };
-    }
-  })().finally(() => running.delete(instance.instanceId));
+  const timeoutMs = options.timeoutMs ?? TIMEOUT_MS;
+  const pending = new Promise<EngineCheck>((resolve) => {
+    const stop = new AbortController();
+    const timer = setTimeout(() => {
+      stop.abort();
+      resolve({ ok: false, reason: "timeout", ...userError("serverError.engineCheck.timeout", { name, seconds: String(Math.round(timeoutMs / 1000)) }) });
+    }, timeoutMs);
+    timer.unref?.();
+    // Wrapped so a call that throws synchronously fails the check too.
+    new Promise<string>((answer) => answer(call.call(instance, PROMPT, { timeoutMs, signal: stop.signal })))
+      .then((answer): EngineCheck => answer.trim() ? { ok: true } : { ok: false, reason: "empty", error: `${name} answered with nothing. Check again in a minute.` },
+        (error): EngineCheck => {
+          const message = error instanceof Error ? error.message : String(error);
+          return { ok: false, reason: engineCheckReason(message), error: engineCheckError(name, message) };
+        })
+      .then((result) => {
+        clearTimeout(timer);
+        resolve(result);
+      });
+  }).finally(() => running.delete(instance.instanceId));
   running.set(instance.instanceId, pending);
   return pending;
 }

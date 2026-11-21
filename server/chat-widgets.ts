@@ -1,9 +1,12 @@
 // A bot's widget tree is normalised, scrubbed of secrets and given its text fallback here, once; everything after reads the stored message.
+import { tagsDevs } from "../shared/devs-mention.ts";
 import {
-  parseWidgetInput, resolveWidgetAction, widgetActions, widgetFields, widgetToText, WIDGET_LIMITS,
+  parseWidgetInput, resolveWidgetAction, widgetActions, widgetFieldOptions, widgetFields, widgetToText, WIDGET_LIMITS,
   type WidgetAction, type WidgetNode, type WidgetPayload, type WidgetRoot, type WidgetSettled,
 } from "../shared/widget.ts";
 import type { MausColor } from "../shared/wire.ts";
+import type { ChatApps } from "./chat-apps.ts";
+import type { BotFolders } from "./pages/bundle.ts";
 import { createOptionsCard } from "./options-card.ts";
 import { isSecretName, mask, redactSecretsInText } from "./redact.ts";
 import type { Message } from "./store.ts";
@@ -16,16 +19,22 @@ export interface AgentCardStore {
 }
 
 export type AgentCardResult =
-  /** `masked`: something in the widget read as a secret and was stored masked. */
-  | { ok: true; messageId: string; masked?: true }
+  /** `masked`: something in the widget read as a secret and was stored masked. `leftOut`: a folder page's sentence naming
+   * the files it left out. */
+  | { ok: true; messageId: string; masked?: true; leftOut?: string }
   | { ok: false; status: 400 | 403 | 404 | 409; error: string };
 
-const ROOM_REFUSAL = "Widgets are not available in rooms yet. Answer in text.";
 const NO_SUCH_WIDGET = "No widget with that id in this conversation.";
 const EMPTY_FALLBACK = "[widget]";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/** A room's row names the bot that wrote it. A direct thread's never does: there a bot-authored row carrying `from` is
+ * replayed as another bot's line. */
+export function speakerIn(store: Pick<AgentCardStore, "groupByThread">, threadId: string, bot: { id: string; name: string; color: MausColor }): Pick<Message, "from"> {
+  return store.groupByThread(threadId) ? { from: { botId: bot.id, name: bot.name, color: bot.color } } : {};
 }
 
 /** Every string loses its secrets. Under an action's `payload` and a chart's `data` rows the keys are the bot's, so they are
@@ -62,6 +71,14 @@ function stillDistinct(root: WidgetRoot): boolean {
   return new Set(labels).size === labels.length && new Set(names).size === names.length;
 }
 
+const DEVS_TAP_REFUSAL = "widget: a tap can't tag @devs; only words the person types send a bug report to the MausBot team. Show no button or option for it: ask them in your message to type @devs and what went wrong.";
+
+/** A press is recorded as the person's message, but a tap is never their own @devs tag: a bot asks them to type it instead. */
+function offersDevsTap(root: WidgetRoot): boolean {
+  if (widgetActions(root).some((entry) => !entry.client && tagsDevs(entry.label))) return true;
+  return widgetFields(root).some((field) => widgetFieldOptions(field.node).some((option) => tagsDevs(String(option.label ?? "")) || tagsDevs(String(option.value ?? ""))));
+}
+
 function stable(value: unknown): string {
   return JSON.stringify(value, (_key, inner: unknown) => (isRecord(inner)
     ? Object.fromEntries(Object.entries(inner).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)))
@@ -88,38 +105,60 @@ function canonicalWidget(input: Record<string, unknown>): CanonicalWidget {
   if (!stillDistinct(root)) {
     return { ok: false, status: 400, error: "widget: two actions or fields read the same once secrets were removed; give each a plain, distinct label and name." };
   }
+  if (offersDevsTap(root)) return { ok: false, status: 400, error: DEVS_TAP_REFUSAL };
   const text = clip(redactSecretsInText(given?.trim() || widgetToText(root)));
   // The bot is told when the scrub changed what it wrote: a payload field it named `key` for an id reads back masked.
   return { ok: true, root, text: text || EMPTY_FALLBACK, masked: stable(root) !== stable(parsed.value) };
 }
 
 /** The route has already checked that the conversation is the calling bot's own. */
-export function createAgentCard(args: {
+export interface AgentCardArgs {
   store: AgentCardStore;
   bot: { id: string; name: string; color: MausColor };
   threadId: string;
   input: unknown;
   /** The row a widget call wrote: the calling session made it, so it is never offered back to it as unseen. */
   authored?(messageId: string): void;
-}): AgentCardResult {
+  /** The server built this card from records, not the bot. */
+  serverCard?: true;
+  apps?: Pick<ChatApps, "createAppCard" | "recordMcpAppCall">;
+  /** The bot's own folders, for a page shown from a folder. */
+  folders?: BotFolders;
+}
+
+export type McpAppCardInput = { tool: "mcp_app" } & Record<string, unknown>;
+
+export function createAgentCard(args: AgentCardArgs & { input: McpAppCardInput }): Promise<AgentCardResult>;
+export function createAgentCard(args: AgentCardArgs & { folders: BotFolders }): AgentCardResult | Promise<AgentCardResult>;
+export function createAgentCard(args: AgentCardArgs): AgentCardResult;
+export function createAgentCard(args: AgentCardArgs): AgentCardResult | Promise<AgentCardResult> {
   const { store, bot, threadId, input } = args;
   if (!isRecord(input) || input.tool === undefined) return createOptionsCard(args);
+  if (input.tool === "mcp_app") {
+    if (!args.apps?.recordMcpAppCall) return Promise.resolve({ ok: false, status: 400, error: "MCP apps are not available on this computer." });
+    return args.apps.recordMcpAppCall({ bot, threadId, input, ...(args.authored ? { authored: args.authored } : {}) });
+  }
+  if (input.tool === "show_html" || input.tool === "update_html") {
+    if (!args.apps) return { ok: false, status: 400, error: "Pages are not available on this computer." };
+    return args.apps.createAppCard({ bot, threadId, input, ...(args.authored ? { authored: args.authored } : {}), ...(args.folders ? { folders: args.folders } : {}) });
+  }
   if (input.tool !== "show_widget" && input.tool !== "update_widget") {
     return { ok: false, status: 400, error: "tool: must be show_widget or update_widget." };
   }
-  if (store.groupByThread(threadId)) return { ok: false, status: 409, error: ROOM_REFUSAL };
 
   if (input.tool === "show_widget") {
     const widget = canonicalWidget(input);
     if (!widget.ok) return widget;
-    // No `from`: in a direct thread a bot-authored row carrying one is replayed as another bot's line.
-    const message = store.appendMessage(threadId, { role: "bot", kind: "widget", text: widget.text, widget: { v: 1, root: widget.root } });
+    const message = store.appendMessage(threadId, { role: "bot", kind: "widget", text: widget.text, widget: { v: 1, root: widget.root }, ...speakerIn(store, threadId, bot), ...(args.serverCard ? { serverCard: true as const } : {}) });
     args.authored?.(message.id);
     return { ok: true, messageId: message.id, ...(widget.masked ? { masked: true as const } : {}) };
   }
 
   const existing = store.messagesFor(threadId).find((message) => message.id === input.widget_id);
-  if (!existing || existing.kind !== "widget" || !existing.widget || (existing.from && existing.from.botId !== bot.id)) {
+  // A server-built card keeps `serverCard` through an edit, and that mark is what replay and presses trust; only the server
+  // may edit it, and a bot is told nothing more than that the id is missing.
+  if (!existing || existing.kind !== "widget" || !existing.widget || (existing.from && existing.from.botId !== bot.id) ||
+      (existing.serverCard && !args.serverCard)) {
     return { ok: false, status: 404, error: NO_SUCH_WIDGET };
   }
   if (existing.widget.settled) return { ok: false, status: 409, error: "The person already answered that widget. Show a new one." };

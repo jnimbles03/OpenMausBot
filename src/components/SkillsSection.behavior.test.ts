@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SkillsLibrarySkillWire } from "../../shared/wire";
 
 const fixture = vi.hoisted(() => ({ values: [] as unknown[], index: 0, modal: vi.fn(), request: vi.fn() }));
+vi.mock("@/state/store-select", async (importOriginal) => (await import("@/testing/plain-store-select")).plainStoreSelect(await importOriginal()));
 vi.mock("react", async (original) => ({
   ...await original<typeof import("react")>(),
   useState: (initial: unknown) => {
@@ -30,7 +31,7 @@ type Props = { children?: ReactNode; onClick?: () => void; disabled?: boolean; [
 function nodes(value: ReactNode): ReactElement<Props>[] {
   return Children.toArray(value).flatMap((child) => isValidElement<Props>(child) ? [child, ...nodes(child.props.children)] : []);
 }
-const skill = (name = "order-audit"): SkillsLibrarySkillWire => ({ name, description: "Audit orders", source: "local-import", enabled: false, tags: [], version: null, importedAt: "2026-10-02T00:00:00Z", warnings: [], assignedBots: [] });
+const skill = (name = "order-audit"): SkillsLibrarySkillWire => ({ name, description: "Audit orders", source: "local-import", enabled: false, everyBot: false, tags: [], version: null, importedAt: "2026-10-02T00:00:00Z", warnings: [], assignedBots: [] });
 const source = "---\nname: order-audit\ndescription: Audit orders\n---\n\nCheck every line item.";
 const response = (body: unknown, ok = true) => ({ ok, json: async () => body });
 function render(bot = false) {
@@ -71,6 +72,15 @@ describe("Skills library review and assignment controls", () => {
     expect(fixture.values[5]).toBeNull();
     expect(fixture.values[2]).toBe("Skill integrity mismatch");
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it("makes a reviewed skill available to every bot from the library", async () => {
+    named(render(), "Every bot").props.onClick!();
+    await flush();
+    expect(fetch).toHaveBeenCalledWith("/api/skills-library/order-audit", expect.objectContaining({
+      method: "PATCH",
+      body: '{"everyBot":true}',
+    }));
   });
 
   it("blocks a simultaneous second assignment and reads current assignments before the next PUT", async () => {

@@ -134,8 +134,10 @@ unasserted user outcome.
 
 `scripts/testing/usage-details-ui.e2e.test.ts` checks the header's **More** menu,
 usage breakdown, clipboard success and refusal, and responsive geometry at
-390, 800, 1100 and 1600 px. It checks that opening bot settings folds the sidebar
-without changing its saved density and closing settings restores it. Evidence
+390, 800, 1100 and 1600 px. It checks that opening Advanced's bot settings at 1100
+folds the sidebar without changing its saved density and closing settings
+restores it, and that Simple's 320px bot panel keeps the 280px sidebar open
+beside a chat of at least 440 at 1040 px, folding it at 1039. Evidence
 includes screenshots and a `.usage-details.json` next to the fixture log.
 These are renderer checks, not native Windows caption-button verification.
 
@@ -143,6 +145,42 @@ It runs when an agent-browser binary resolves and is skipped with a printed
 reason otherwise; `OMB_UI_E2E=1` forces the verified download. The `ui-smoke`
 job in `.github/workflows/ci.yml` runs it on Ubuntu 24.04 and uploads the
 screenshot; it is not one of the required checks.
+
+## Mobile text and code blocks
+
+```sh
+OMB_UI_E2E=1 pnpm exec vitest run scripts/testing/mobile-code-blocks-ui.e2e.test.ts
+pnpm exec vitest run src/components/ChatMarkdown.block-actions.test.ts src/components/ChatMarkdown.test.ts src/lib/copy-text.test.ts
+```
+
+The browser recipe sends a synthetic reply through a disposable fake-engine
+server and renders it in the real chat. Its five blocks cover plaintext,
+highlighted code, an unknown language, an omitted language, and indented code.
+Copy preserves only the selected block's text, including whitespace; Wrap and
+Unwrap affect only that block and leave the copied source unchanged.
+
+At narrow widths and on coarse-pointer or no-hover devices, the labeled actions
+occupy their own row with at least 44px touch targets. Check 320px and 390px
+portrait, landscape and tablet widths, and a desktop with a fine pointer.
+Long tokens must wrap within the bubble when Wrap is selected; unwrapped code
+can scroll horizontally inside its block without widening the page. Copy keeps
+a stable mobile label while its icon shows success or failure; a persistent
+live region exposes the feedback to assistive technology. Keyboard focus has
+an outline.
+
+A hosted Linux runner has no mouse, so its headless Chrome reports no hover.
+The recipe starts Chrome with a fine, hovering pointer and runs the desktop
+pass before touch emulation starts: once touch emulation is switched on or
+off, Chrome goes back to the host's own pointer.
+
+This is mobile web renderer coverage in an isolated Chromium profile. It does
+not verify the separately maintained native iOS or Android clients, physical
+devices, or Safari. Clipboard permissions are confined to the fixture origin;
+the refusal case replaces only that disposable page's clipboard writer.
+
+| Before: small icon-only actions | After: labeled touch controls |
+| --- | --- |
+| ![Before at 390px](assets/mobile-code-blocks/before-390.png) | ![After at 390px](assets/mobile-code-blocks/after-390.png) |
 
 ## Thinking timer across thread switches
 
@@ -188,13 +226,97 @@ checks that the finished reply still moves a following transcript to its end.
 pnpm exec vitest run src/state/store.test.ts src/components/ChatView.follow.test.ts
 ```
 
+## What a bot is doing right now
+
+While a step runs, the working line names it ("Running scrape.py", "Searching the
+web for “Acme construction leads”", "Reading linkedin.com"), with the whole command on
+hover. Once the step has run past the quiet notice it adds how it is doing: the
+time since its last output, or what its own processes show ("waiting on the
+network", "busy, no output yet", "idle, no output yet"). A click on the line,
+or Enter on it, unfolds the **Now** card: the current ask's steps, a running
+command's last lines of output and **Open activity**, which opens the Activity
+panel at this run. A second click or Escape folds it. A working bot's sidebar
+row shows the same step in place of its last message.
+
+A scripted call with `hold` stays running until `FAKE_CLAUDE_RELEASE` exists;
+`hold: "busy"`, `"idle"` or `"network"` also keeps a stand-in process that
+burns CPU, sleeps or holds a loopback connection, as the call's command would.
+The quiet-status knobs cross into the fixture, so the sign of life shows in
+seconds:
+
+```sh
+OMB_ACP_QUIET_NOTICE_MS=10000 OMB_ACP_QUIET_TICK_MS=2000 FAKE_CLAUDE_RELEASE=/tmp/release \
+node --experimental-strip-types scripts/control-omb.ts ui launch --tool-calls \
+  '[{"name":"WebSearch","input":{"query":"Acme construction leads"},"ok":true},
+    {"name":"Bash","input":{"command":"cd ~/acme && python3 scrape.py --pages 40"},"hold":"busy"}]'
+```
+
+Expected after a sent message: `Working · 15s · Running scrape.py · busy, no
+output yet`, the button `What Pepper is doing` with `aria-expanded="false"`,
+and, once clicked, a card listing `Searched the web for “Acme construction leads”` and
+`Running scrape.py`. Claude Code prints a command's output only when it ends,
+so streamed output needs an engine that sends it: `--engine codex` adds the
+fake Codex app-server, and `FAKE_CODEX_COMMAND`, `FAKE_CODEX_COMMAND_OUTPUT`
+(JSON chunks), `FAKE_CODEX_COMMAND_OUTPUT_MS` and `FAKE_CODEX_COMMAND_GATE`
+script its command. A bot moved to the `codex` instance then shows `last
+output just now` and the command's last two lines in the card.
+
+## A reply as it streams
+
+The bot's words appear as they arrive, keyed by the id the server streams each
+message under, and the saved message takes the streamed bubble's place in the
+same frame. One command streams every scripted case through the real renderer,
+once per engine, and checks each frame:
+
+```sh
+node --experimental-strip-types scripts/verify-live-reply.ts \
+  --engines claude,codex,acp,cline,copilot --out .omb-scratch/verify-evidence/live-reply
+```
+
+Each engine gets its own fixture (`ui launch --engine codex|acp|cline|copilot`);
+its fake plays the case named by a marker in the prompt from
+`FAKE_STREAM_SCRIPT` at `FAKE_STREAM_CADENCE` (the cases are
+`server/testing/live-reply-cases.ts`: short and long replies, Markdown, code
+fences, math, emoji and right-to-left text, links and images, text and tools
+interleaved, two messages in a row, a blank message, thinking, Stop, a steer,
+an error, a reconnect, a chat switch, and a room with two bots). Expected: a
+`pass` for every case in the printed table, which is also written to
+`results.md` with each case's screenshot and evidence. Steering is checked
+where the fake steers (Claude).
+
+`--engines opencode` with `OMB_VERIFY_OPENCODE_CLI` set to an OpenCode the
+recipe downloaded and checked against `server/drivers/acp/opencode-release.ts`
+runs real prompts on a free model OpenCode offers with no sign-in, in the
+fixture's temporary home.
+
+The engine-level checks, which need no browser, are
+`server/drivers/acp/live-reply-matrix.test.ts` (every ACP engine),
+`server/drivers/claude-live-reply.test.ts`, and the case runs in
+`server/drivers/codex.test.ts`, `server/drivers/pi.test.ts` and
+`server/drivers/openai-chat-tools.test.ts` (each OpenAI-compatible provider).
+The client's checks are `src/state/live-reply.test.ts`,
+`src/components/ChatView.live-reply.test.ts` and
+`src/components/ChatMarkdown.streaming.test.ts`.
+
+The before-and-after screenshots were removed because they showed real example
+data; run the `scripts/control-omb.ts ui launch` command above to see the
+working line and the Now card.
+
+The checks are `server/step-summary.test.ts` (the words and their redaction),
+`server/harness/live-steps.test.ts` and `server/harness/bus.test.ts` (one path
+for every engine, the sign of life, the output's last lines),
+`server/bot-visibility.test.ts` (a step reaches only someone who may see the
+chat), `src/components/TurnPresence.test.ts`,
+`src/components/ChatView.live-status.test.ts` (the line and the card) and
+`src/components/Sidebar.simple-mode.test.ts` (the sidebar row).
+
 ## Bot setup and MCP access recipe
 
 `scripts/testing/bot-tools-ui.e2e.test.ts` uses the same full-app launcher and
 optional `OMB_UI_E2E=1` gate. It verifies profile-only role creation, closing
 and reopening the dialog during a slow creation without duplicate submissions, recovery
 when the preset PATCH fails after creation, the composer’s Tools shortcut,
-optional setup ideas, Paste config importing disabled servers, refreshed
+optional setup ideas, a pasted config added from Add MCP server that stays off when it doesn't answer, refreshed
 per-bot MCP switches and saved opt-outs, and modal Tab/Escape containment.
 The MCP command is an inert fixture command; no real accounts are connected.
 The advisory renderer job runs both recipes. Runtime mounting, direct/channel

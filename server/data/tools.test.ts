@@ -106,10 +106,17 @@ describe("the statement gate", () => {
     ["SHOW TABLES", { kind: "read", materialisable: false }],
     ["EXPLAIN SELECT 1", { kind: "read", materialisable: false }],
     ["EXPLAIN ANALYZE SELECT 1", { kind: "read", materialisable: false }],
+    ["EXPLAIN ANALYZE WITH a AS (SELECT 1) SELECT * FROM a", { kind: "read", materialisable: false }],
     ["SELECT comment, load, \"set\", copy AS attach FROM t", { kind: "read", materialisable: true }],
     ["SELECT ';' AS semi, 'DROP TABLE t' AS s FROM t -- ; DELETE", { kind: "read", materialisable: true }],
     ["SELECT \"a;b\" FROM t /* ; INSERT */", { kind: "read", materialisable: true }],
     ["SELECT $$x;y$$", { kind: "read", materialisable: true }],
+    ["SELECT $tag$x;y$tag$, $a$ $$ $b$ $a$", { kind: "read", materialisable: true }],
+    ["SELECT E'it\\'s; DROP' AS s, 'a\\' AS plain", { kind: "read", materialisable: true }],
+    ["SELECT 1 /* a /* ; b */ DELETE */ AS x", { kind: "read", materialisable: true }],
+    ["SELECT 1; -- end\r", { kind: "read", materialisable: true }],
+    ["SELECT 1 AS α$a$, 'é' AS e", { kind: "read", materialisable: true }],
+    ["SELECT E'\\''\n'\\'', 'a' -- c\r\n  'b'", { kind: "read", materialisable: true }],
     ["CREATE TABLE x AS SELECT 1", { kind: "create", target: "x" }],
     ["CREATE OR REPLACE TABLE s.x AS SELECT 1", { kind: "create", target: "s.x" }],
     ["create or replace view \"My View\" as select 1", { kind: "create", target: "\"My View\"" }],
@@ -124,6 +131,14 @@ describe("the statement gate", () => {
     "SET threads = 1", "PRAGMA memory_limit = '1GB'", "ATTACH 'x.db' AS x", "COPY t TO 'out.csv'", "CALL something()",
     "INSTALL httpfs", "LOAD httpfs", "CREATE TABLE t (a INT)", "CREATE SCHEMA s", "CREATE INDEX i ON t(a)",
     "WITH a AS (SELECT 1) DELETE FROM t", "WITH a(x) AS (SELECT 1) INSERT INTO t SELECT * FROM a", "EXPLAIN ANALYZE DELETE FROM t",
+    "EXPLAIN ANALYZE WITH x AS (SELECT 1) DELETE FROM victim", "EXPLAIN WITH x AS (SELECT 1) INSERT INTO t SELECT * FROM x",
+    "EXPLAIN /* plan */ ANALYZE -- run\nWITH x AS (SELECT 1) UPDATE t SET a = 1", "EXPLAIN EXPLAIN ANALYZE DELETE FROM t",
+    "EXPLAIN ANALYZE (DELETE FROM t)", "EXPLAIN ANALYZE CREATE TABLE x AS SELECT 1", "EXPLAIN ANALYZE",
+    "EXPLAIN ANALYZE /* outer /* inner */ SELECT */ DELETE FROM t",
+    "EXPLAIN ANALYZE WITH x AS (SELECT E'\\') SELECT 1 --') DELETE FROM t",
+    "EXPLAIN ANALYZE WITH x AS (SELECT $a$ ) SELECT 1 -- $a$) DELETE FROM t",
+    "EXPLAIN ANALYZE WITH x AS (SELECT 1 AS α$a$ ) DELETE FROM t -- $a$) SELECT 1",
+    "EXPLAIN ANALYZE WITH x AS (SELECT E'\\''\n'\\') SELECT 1 --') DELETE FROM t",
     "BEGIN", "EXPORT DATABASE 'd'", "TRUNCATE t",
   ])("refuses %s", (sql) => {
     expect(classifySql(sql).kind).toBe("refused");
@@ -135,6 +150,17 @@ describe("the statement gate", () => {
     expect(await failure(Promise.resolve().then(() => classifySql("SELECT 'oops")))).toMatchObject({ code: "invalid_input" });
     expect(await failure(Promise.resolve().then(() => classifySql("   ")))).toMatchObject({ code: "invalid_input" });
     expect(classifySql("SELECT 1;")).toEqual({ kind: "read", materialisable: true });
+    for (const sql of ["SHOW TABLES; --x\rDELETE FROM t", "SHOW TABLES /* ; */; /* /* */ */ DELETE FROM t", "SELECT (1; DELETE FROM t)"]) {
+      expect(await failure(Promise.resolve().then(() => classifySql(sql)))).toMatchObject({ code: "invalid_input", message: "One statement per call." });
+    }
+    expect(await failure(Promise.resolve().then(() => classifySql("SELECT 1 /* a /* b */")))).toMatchObject({ code: "invalid_input", message: "Unterminated comment." });
+    expect(await failure(Promise.resolve().then(() => classifySql("SELECT $a$ x $b$")))).toMatchObject({ code: "invalid_input", message: "Unterminated dollar-quoted string." });
+    expect(await failure(Promise.resolve().then(() => classifySql("SELECT 1E'\\' --'")))).toMatchObject({ code: "invalid_input", message: "Put a space before E'…' so the string reads one way." });
+    expect(classifySql("SELECT 1E'a'")).toEqual({ kind: "read", materialisable: true });
+    for (const space of ["\u00a0", "\u200b", "\u3000", "\ufeff"]) {
+      expect(await failure(Promise.resolve().then(() => classifySql(`EXPLAIN ANALYZE WITH x AS (SELECT 1 AS ${space}$a$ ) SELECT 1 1 -- $a$) DELETE FROM t`))))
+        .toMatchObject({ code: "invalid_input", message: "Replace non-ASCII spaces with plain spaces." });
+    }
   });
 });
 
@@ -205,8 +231,8 @@ describe("sources", () => {
     expect(folder.map((plan) => plan.stem).sort()).toEqual(["stuff_csv", "stuff_json", "stuff_parquet", "stuff_tsv"]);
     const csvFamily = folder.find((plan) => plan.stem === "stuff_csv")!.reader;
     const forward = dir.replace(/\\/g, "/");
-    expect(csvFamily).toBe(`read_csv(['${forward}/**/*.csv', '${forward}/**/*.txt'], union_by_name=true, filename=true)`);
-    expect(folder.find((plan) => plan.stem === "stuff_parquet")!.reader).toBe(`read_parquet('${forward}/**/*.parquet', union_by_name=true, filename=true)`);
+    expect(csvFamily).toBe(`read_csv(['${forward}/**/*.[cC][sS][vV]', '${forward}/**/*.[tT][xX][tT]'], union_by_name=true, filename=true)`);
+    expect(folder.find((plan) => plan.stem === "stuff_parquet")!.reader).toBe(`read_parquet('${forward}/**/*.[pP][aA][rR][qQ][uU][eE][tT]', union_by_name=true, filename=true)`);
     expect(folder.find((plan) => plan.stem === "stuff_tsv")!.reader).toContain("delim='\t'");
   });
 
@@ -268,6 +294,18 @@ describe("data_load", () => {
     expect(database.calls.at(-2)!.sql).toMatch(/^CREATE TABLE "orders_2024_2"/);
   });
 
+  it("shortens a 63-character name to fit the suffix that keeps it unique", async () => {
+    const { ctx } = context();
+    const dir = freshDir();
+    writeFileSync(join(dir, "data.csv"), "id\n1\n");
+    const long = "t".repeat(63);
+    await loadData(ctx, { source: join(dir, "data.csv"), name: long });
+    const second = await loadData(ctx, { source: join(dir, "data.csv"), name: long, replace: false });
+    const third = await loadData(ctx, { source: join(dir, "data.csv"), name: long, replace: false });
+    expect(second.tables[0]!.name).toBe(`${"t".repeat(61)}_2`);
+    expect(third.tables[0]!.name).toBe(`${"t".repeat(61)}_3`);
+  });
+
   it("snapshots a database read-only, detaches it even on failure, and never records the password", async () => {
     const { ctx, database, sheet } = context();
     const out = await loadData(ctx, { source: "postgres://bob:hunter2@db/shop" });
@@ -292,6 +330,19 @@ describe("data_load", () => {
 });
 
 describe("data_describe saved results", () => {
+  it.each(['"Revenue ""USD"""', ' main . "分析" ', "café"])("routes identifier %j to catalog resolution", async (target) => {
+    const { ctx, database } = context();
+    database.resolveTable = async (name) => {
+      database.calls.push({ method: "resolveTable", target: name });
+      return "main.resolved";
+    };
+    const result = await runDataTool(ctx, "data_describe", { target });
+    expect(result.isError).toBeUndefined();
+    expect(database.calls.map((call) => call.method)).toEqual(["resolveTable", "describe"]);
+    expect(result.structuredContent).toHaveProperty("name");
+    expect(result.structuredContent).not.toHaveProperty("sql");
+  });
+
   it("reads the latest saved SQL after a person edits it, without rerunning queries", async () => {
     const { ctx, database, sheet } = context();
     await showCard(ctx, { kind: "table", sql: "SELECT 1", title: "First" });
@@ -432,7 +483,7 @@ describe("data_show", () => {
     const card = sheet.card("c_1")!;
     expect(card).toMatchObject({ status: "ready", result: "c_1", rowCount: 12, truncated: false, by: "bot", sql: "SELECT * FROM orders" });
     expect(card.columns).toHaveLength(2);
-    expect(database.calls.find((call) => call.method === "materialise")).toMatchObject({ sql: `SELECT * FROM (SELECT * FROM orders) LIMIT ${DATA_LIMITS.showTableRowsMax}`, name: "c_1" });
+    expect(database.calls.find((call) => call.method === "materialise")).toMatchObject({ sql: `SELECT * FROM (SELECT * FROM orders\n) LIMIT ${DATA_LIMITS.showTableRowsMax}`, name: "c_1" });
   });
 
   it("points a card at a loaded table through resolveTable", async () => {
@@ -554,8 +605,8 @@ describe("data_show", () => {
     const card = sheet.card("c_1")!;
     expect(card).toMatchObject({ kind: "chart", title: "bar of count by region", status: "ready", result: "c_1", chart: { type: "bar", x: "region" }, vegaLite: { mark: "bar", columns: ["region", "n"] } });
     const materialised = database.calls.find((call) => call.method === "materialise")!;
-    expect(materialised.sql).toBe("SELECT region, count(*) AS n FROM (SELECT * FROM orders) GROUP BY ALL");
-    expect(database.calls.some((call) => call.sql === "SELECT * FROM (SELECT * FROM orders) LIMIT 0")).toBe(true);
+    expect(materialised.sql).toBe("SELECT region, count(*) AS n FROM (SELECT * FROM orders\n) GROUP BY ALL");
+    expect(database.calls.some((call) => call.sql === "SELECT * FROM (SELECT * FROM orders\n) LIMIT 0")).toBe(true);
     database.onRun = (sql) => (sql.startsWith("SELECT count(*)") ? { columns: [{ name: "n", type: "BIGINT" }], rows: [[3]], rowCount: 1, truncated: false, elapsedMs: 1 } : undefined);
     const whole = await showCard(ctx, { kind: "chart", sql: "SELECT * FROM small", chart: { type: "scatter", x: "a", y: "b" } });
     expect(whole.reduction).toEqual({ method: "none", inputRows: 3, outputRows: 3 });
@@ -604,7 +655,7 @@ describe("data_show", () => {
     const out = await showCard(ctx, { kind: "chart", sql: "SELECT a, b FROM t", vegaLite: { mark: "line" }, limit: 100 });
     expect(out.reduction).toEqual({ method: "none", inputRows: 1234, outputRows: 3 });
     expect(sheet.card("c_1")!.vegaLite).toEqual({ mark: "line", validated: true });
-    expect(database.calls.find((call) => call.method === "materialise")!.sql).toBe("SELECT * FROM (SELECT a, b FROM t) LIMIT 101");
+    expect(database.calls.find((call) => call.method === "materialise")!.sql).toBe("SELECT * FROM (SELECT a, b FROM t\n) LIMIT 101");
     expect(await failure(showCard(ctx, { kind: "chart", sql: "SELECT 1", vegaLite: { nope: true } }))).toMatchObject({ code: "spec_invalid" });
   });
 
@@ -621,6 +672,86 @@ describe("data_show", () => {
 });
 
 describe("data_export", () => {
+  it.each(["png", "svg"] as const)("keeps both concurrent %s exports instead of overwriting one", async (format) => {
+    const { ctx } = context();
+    await showCard(ctx, { kind: "chart", sql: "SELECT a FROM t", chart: { type: "pie", x: "a" }, title: "Share" });
+    const entered = deferred();
+    const finish = deferred();
+    let count = 0;
+    const render = async () => {
+      const n = ++count;
+      if (n === 2) entered.resolve();
+      await finish.promise;
+      return `image ${n}`;
+    };
+    ctx.renderer = { svg: render, png: async () => Buffer.from(await render()) };
+    const first = exportData(ctx, { id: "c_1", format });
+    const second = exportData(ctx, { id: "c_1", format });
+    await entered.promise;
+    finish.resolve();
+    const [a, b] = await Promise.all([first, second]);
+    expect(readFileSync(a.path, "utf8")).toBe("image 1");
+    expect(readFileSync(b.path, "utf8")).toBe("image 2");
+    expect(a.path).not.toBe(b.path);
+  });
+
+  it("reserves distinct CSV destinations before either database copy finishes", async () => {
+    const { ctx, database } = context();
+    const original = database.run.bind(database);
+    const entered = deferred();
+    const finish = deferred();
+    let count = 0;
+    database.run = async (sql, options) => {
+      if (sql.startsWith("COPY ")) {
+        if (++count === 2) entered.resolve();
+        await finish.promise;
+      }
+      return original(sql, options);
+    };
+    const first = exportData(ctx, { sql: "SELECT 1", format: "csv" });
+    const second = exportData(ctx, { sql: "SELECT 2", format: "csv" });
+    await entered.promise;
+    finish.resolve();
+    const [a, b] = await Promise.all([first, second]);
+    expect(a.path).not.toBe(b.path);
+    expect(existsSync(a.path)).toBe(true);
+    expect(existsSync(b.path)).toBe(true);
+  });
+
+  it("recognizes a pending export through another allowed directory alias", async () => {
+    const { ctx, dir } = context();
+    await showCard(ctx, { kind: "chart", sql: "SELECT a FROM t", chart: { type: "pie", x: "a" } });
+    symlinkSync(join(dir, "work"), join(dir, "work-alias"), "junction");
+    ctx.exportRoots = () => [join(dir, "work"), join(dir, "work-alias")];
+    const entered = deferred();
+    const finish = deferred();
+    let count = 0;
+    ctx.renderer.svg = async () => {
+      const n = ++count;
+      if (n === 2) entered.resolve();
+      await finish.promise;
+      return `image ${n}`;
+    };
+    const first = exportData(ctx, { id: "c_1", format: "svg", path: join(dir, "work", "same.svg") });
+    const second = exportData(ctx, { id: "c_1", format: "svg", path: join(dir, "work-alias", "same.svg") });
+    await entered.promise;
+    finish.resolve();
+    const [a, b] = await Promise.all([first, second]);
+    expect(readFileSync(a.path, "utf8")).toBe("image 1");
+    expect(readFileSync(b.path, "utf8")).toBe("image 2");
+  });
+
+  it("releases a destination when rendering fails before creating its file", async () => {
+    const { ctx, dir } = context();
+    await showCard(ctx, { kind: "chart", sql: "SELECT a FROM t", chart: { type: "pie", x: "a" }, title: "Share" });
+    const render = ctx.renderer.png;
+    ctx.renderer.png = async () => { throw new Error("renderer failed"); };
+    await expect(exportData(ctx, { id: "c_1", format: "png" })).rejects.toThrow("renderer failed");
+    ctx.renderer.png = render;
+    const next = await exportData(ctx, { id: "c_1", format: "png" });
+    expect(next.path).toBe(join(dir, "work", "share.png"));
+  });
+
   it("writes csv with COPY TO under the first allowed folder and numbers a repeat", async () => {
     const { ctx, database, dir } = context();
     await showCard(ctx, { kind: "table", sql: "SELECT * FROM orders", title: "Paid orders" });
@@ -632,7 +763,7 @@ describe("data_export", () => {
     expect(again.path).toBe(join(dir, "work", "paid_orders-2.csv"));
     const parquet = await exportData(ctx, { sql: "SELECT 1 AS one", format: "parquet", path: "out/one" });
     expect(parquet.path).toBe(join(dir, "work", "out", "one.parquet"));
-    expect(database.calls.at(-1)!.sql).toBe(`COPY (SELECT * FROM (SELECT 1 AS one)) TO '${parquet.path}' (FORMAT parquet)`);
+    expect(database.calls.at(-1)!.sql).toBe(`COPY (SELECT * FROM (SELECT 1 AS one\n)) TO '${parquet.path}' (FORMAT parquet)`);
     const xlsx = await exportData(ctx, { sql: "SELECT 1", format: "xlsx", path: join(dir, "Downloads") });
     expect(xlsx.path).toBe(join(dir, "Downloads", "query.xlsx"));
     expect(database.calls.at(-1)!.sql).toContain("(FORMAT xlsx, HEADER true)");

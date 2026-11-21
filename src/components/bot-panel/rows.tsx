@@ -1,16 +1,21 @@
-import type { ReactNode } from "react";
-import { ChevronLeft, ChevronRight, type LucideIcon } from "lucide-react";
+import type { ReactNode, Ref } from "react";
+import { Check, ChevronLeft, ChevronRight, Trash2, type LucideIcon } from "lucide-react";
 
 import { cn } from "@/lib/cn";
-import { t } from "@/lib/i18n";
+import { useAdvancedMode } from "@/lib/interface-mode";
 import { MAUS_COLORS, type MausColor } from "@/lib/mascot";
+import { ELEVATED_CONTROL, ELEVATED_HOVER } from "../elevated";
 import { Switch } from "../SettingsPrimitives";
 
 export const rowCls = "flex min-h-[46px] items-center gap-2.5 px-3.5 py-[11px]";
-const titleCls = "text-[13.5px] font-medium text-ink";
-const hintCls = "mt-px text-[12.5px] leading-[1.35] text-ink-secondary";
+export const roundButtonCls = `flex size-[34px] shrink-0 items-center justify-center rounded-full text-ink ${ELEVATED_CONTROL} ${ELEVATED_HOVER} [:root[data-skin=daylight]_&]:shadow-[0_1px_3px_rgb(28_28_28/0.12)]`;
+const titleCls = "text-[14px] font-medium text-ink";
+const hintCls = "mt-px text-[13px] leading-[1.35] text-ink-secondary";
 export const buttonCls =
-  "inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-[9px] bg-control px-3.5 text-[13px] font-medium text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50";
+  "inline-flex h-8 shrink-0 items-center justify-center gap-1.5 rounded-[8px] bg-control px-3.5 text-[13px] font-medium text-ink hover:bg-raised-hover disabled:cursor-not-allowed disabled:opacity-50";
+/** The panel's action rows, New conversation and Add a routine: flat like every other row, so the only fill in the
+ * tab is the conversation you are in. */
+export const panelActionCls = "flex h-9 min-w-0 items-center gap-2.5 rounded-[8px] [&>svg]:size-4 px-3.5 text-[14px] font-medium text-ink transition-colors hover:bg-ink/[0.04]";
 export const chipCls = (on: boolean) =>
   cn(
     "rounded-full px-2.5 py-1 text-[12px] transition-colors disabled:cursor-not-allowed disabled:opacity-50",
@@ -19,31 +24,41 @@ export const chipCls = (on: boolean) =>
 
 export function CardLabel({ children, action }: { children: ReactNode; action?: ReactNode }) {
   return (
-    <div className="mx-1 mb-2 mt-5 flex min-h-5 items-center justify-between gap-3 text-[12.5px] text-ink-secondary">
+    <div className="mx-3.5 mb-2 mt-5 flex min-h-5 items-center justify-between gap-3 text-[13px] font-semibold text-ink-secondary">
       <span className="min-w-0 truncate">{children}</span>
       {action}
     </div>
   );
 }
 
-export function LabelAction({ children, onClick, ...rest }: { children: ReactNode; onClick: () => void; "aria-label"?: string; "data-panel-action"?: string }) {
+export function LabelAction({ children, onClick, ...rest }: { children: ReactNode; onClick: () => void; "aria-label"?: string; "data-panel-action"?: string; "data-panel-automations"?: string }) {
   return (
-    <button type="button" {...rest} onClick={onClick} className="shrink-0 rounded-[5px] px-1 py-px text-[12.5px] text-ink-secondary hover:bg-ink/[0.04] hover:text-ink">
+    <button type="button" {...rest} onClick={onClick} className="inline-flex shrink-0 items-center gap-0.5 rounded-[6px] px-1 py-px text-[13px] font-normal text-ink-secondary hover:bg-ink/[0.04] hover:text-ink">
       {children}
+      <ChevronRight size={12} aria-hidden="true" className="text-ink-tertiary rtl:-scale-x-100" />
     </button>
   );
 }
 
 export function Card({ label, action, anchor, children }: { label?: ReactNode; action?: ReactNode; anchor?: string; children: ReactNode }) {
+  const advanced = useAdvancedMode();
   return (
     <section data-panel-card={anchor}>
       {label ? <CardLabel action={action}>{label}</CardLabel> : <div className="h-3.5" />}
-      <div className="divide-y divide-ink/[0.05] overflow-hidden rounded-[14px] border border-ink/[0.04] bg-ink/[0.03]">{children}</div>
+      <div
+        data-panel-card-surface=""
+        className={cn(
+          "divide-y divide-ink/[0.05] overflow-hidden max-md:rounded-[16px] max-md:border-hairline max-md:bg-card",
+          advanced ? "rounded-[12px] border border-ink/[0.04] bg-ink/[0.03]" : "rounded-[12px] bg-composer ring-1 ring-inset ring-ink/[0.06] max-md:border max-md:ring-0",
+        )}
+      >
+        {children}
+      </div>
     </section>
   );
 }
 
-function RowText({ title, hint }: { title: ReactNode; hint?: ReactNode }) {
+export function RowText({ title, hint }: { title: ReactNode; hint?: ReactNode }) {
   return (
     <div className="min-w-0 flex-1">
       <div className={titleCls}>{title}</div>
@@ -52,21 +67,23 @@ function RowText({ title, hint }: { title: ReactNode; hint?: ReactNode }) {
   );
 }
 
-function RowIcon({ icon: Icon }: { icon: LucideIcon }) {
+export function RowIcon({ icon: Icon }: { icon: LucideIcon }) {
   return (
-    <span className="flex size-7 shrink-0 items-center justify-center rounded-lg bg-ink/[0.05] text-ink-secondary" aria-hidden="true">
-      <Icon size={15} />
+    <span className="flex size-4 shrink-0 items-center justify-center text-ink-secondary max-md:size-8 max-md:rounded-full max-md:bg-ink/[0.05]" aria-hidden="true">
+      <Icon size={16} />
     </span>
   );
 }
 
 export function BotSwitch({ color, checked, ...props }: Parameters<typeof Switch>[0] & { color: MausColor }) {
-  return <Switch {...props} checked={checked} style={checked ? { backgroundColor: MAUS_COLORS[color] } : undefined} />;
+  const greyBot = color === "silver" || color === "chrome";
+  return <Switch {...props} checked={checked} style={checked && !greyBot ? { backgroundColor: MAUS_COLORS[color] } : undefined} />;
 }
 
-export function SwitchRow({ title, hint, checked, onChange, disabled, color, label, tooltip, extra, ...rest }: {
+export function SwitchRow({ title, hint, icon, checked, onChange, disabled, color, label, tooltip, extra, ...rest }: {
   title: ReactNode;
   hint?: ReactNode;
+  icon?: LucideIcon;
   checked: boolean;
   onChange: () => void;
   disabled?: boolean;
@@ -78,6 +95,7 @@ export function SwitchRow({ title, hint, checked, onChange, disabled, color, lab
 }) {
   return (
     <div {...rest} className={rowCls}>
+      {icon && <RowIcon icon={icon} />}
       <RowText title={title} hint={hint} />
       {extra}
       <BotSwitch
@@ -103,6 +121,7 @@ export function NavRow({ title, hint, value, icon, onClick, drill = true, danger
   danger?: boolean;
   disabled?: boolean;
   tooltip?: string;
+  ref?: Ref<HTMLButtonElement>;
   "data-panel-row"?: string;
   "data-panel-page"?: string;
 }) {
@@ -116,12 +135,12 @@ export function NavRow({ title, hint, value, icon, onClick, drill = true, danger
       className={cn(rowCls, "w-full text-left enabled:hover:bg-ink/[0.03] disabled:cursor-default disabled:opacity-45")}
     >
       {icon && <RowIcon icon={icon} />}
-      <div className="min-w-0 flex-1">
+      <div className="min-w-[45%] flex-1">
         <div className={cn(titleCls, danger && "text-danger")}>{title}</div>
         {hint && <div className={hintCls}>{hint}</div>}
       </div>
       {value !== undefined && value !== null && value !== "" && (
-        <span className="inline-flex max-w-[45%] shrink-0 items-center gap-1 truncate text-[13px] text-ink-secondary">{value}</span>
+        <span className="inline-flex min-w-0 max-w-[45%] items-center gap-1 text-[13px] text-ink-secondary"><span className="truncate">{value}</span></span>
       )}
       {drill && <ChevronRight size={15} className="shrink-0 text-ink-tertiary" aria-hidden="true" />}
     </button>
@@ -151,7 +170,7 @@ export function ColRow({ children, ...rest }: { children: ReactNode; "data-panel
 export function NoteRow({ children, tone }: { children: ReactNode; tone?: "warn" }) {
   return (
     <div className={rowCls}>
-      <div className={cn("text-[12.5px] leading-[1.35]", tone === "warn" ? "text-warning" : "text-ink-secondary")}>{children}</div>
+      <div className={cn("text-[13px] leading-[1.35]", tone === "warn" ? "text-warning" : "text-ink-secondary")}>{children}</div>
     </div>
   );
 }
@@ -196,8 +215,8 @@ export function Segmented<V extends string>({ options, value, onChange, label, a
           title={option.tooltip}
           onClick={() => onChange(option.value)}
           className={cn(
-            "min-w-0 flex-auto truncate whitespace-nowrap rounded-full px-1.5 py-1.5 text-[12.5px] transition-colors disabled:cursor-not-allowed disabled:opacity-50",
-            value === option.value ? "bg-control font-medium text-ink" : "text-ink-secondary enabled:hover:text-ink",
+            "min-w-0 flex-auto truncate whitespace-nowrap rounded-full px-1.5 py-1.5 text-[13px] transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+            value === option.value ? "bg-ink/[0.14] text-ink" : "text-ink-secondary enabled:hover:text-ink",
           )}
         >
           {option.label}
@@ -221,11 +240,80 @@ export function SegmentedRow<V extends string>({ title, hint, footer, ...segment
   );
 }
 
-export function SoonBadge() {
+export function TrashButton({ label, onClick, disabled, ...rest }: {
+  label: string;
+  onClick: () => void;
+  disabled?: boolean;
+  "data-panel-action"?: string;
+}) {
   return (
-    <span className="shrink-0 rounded-full bg-control px-2 py-px text-[10.5px] font-medium text-ink-secondary">
-      {t("botSettings.simple.soon")}
-    </span>
+    <button
+      type="button"
+      {...rest}
+      aria-label={label}
+      title={label}
+      disabled={disabled}
+      onClick={onClick}
+      className="flex size-7 shrink-0 items-center justify-center rounded-lg text-ink-tertiary hover:bg-ink/[0.05] hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+    >
+      <Trash2 size={14} aria-hidden="true" />
+    </button>
+  );
+}
+
+export function RadioRow({ title, hint, checked, onClick, disabled, ...rest }: {
+  title: ReactNode;
+  hint?: ReactNode;
+  checked: boolean;
+  onClick: () => void;
+  disabled?: boolean;
+  "data-panel-choice"?: string;
+}) {
+  return (
+    <button
+      type="button"
+      {...rest}
+      role="radio"
+      aria-checked={checked}
+      disabled={disabled}
+      onClick={onClick}
+      className={cn(rowCls, "w-full text-left enabled:hover:bg-ink/[0.03] disabled:cursor-not-allowed disabled:opacity-50")}
+    >
+      <RowText title={title} hint={hint} />
+      <span className="flex w-4 shrink-0 text-ink">{checked && <Check size={16} aria-hidden="true" />}</span>
+    </button>
+  );
+}
+
+export function TextRow({ value, placeholder, label, action, disabled, onChange, onSubmit, ...rest }: {
+  value: string;
+  placeholder: string;
+  label: string;
+  action: string;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+  onSubmit: () => void;
+  "data-panel-form"?: string;
+}) {
+  return (
+    <form
+      {...rest}
+      className={rowCls}
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (value.trim() && !disabled) onSubmit();
+      }}
+    >
+      <input
+        value={value}
+        placeholder={placeholder}
+        aria-label={label}
+        disabled={disabled}
+        onChange={(event) => onChange(event.target.value)}
+        className="h-8 min-w-0 flex-1 rounded-lg border border-hairline bg-inset px-2.5 text-[13px] text-ink outline-none placeholder:text-ink-tertiary focus:border-accent-border disabled:opacity-50"
+      />
+      <button type="submit" disabled={disabled || !value.trim()} className={buttonCls}>{action}</button>
+    </form>
   );
 }
 
@@ -236,13 +324,13 @@ export function PageHeader({ back, title, intro, onBack }: { back: string; title
         type="button"
         data-panel-back
         onClick={onBack}
-        className="mt-0.5 inline-flex items-center gap-0.5 rounded-[7px] py-1 pl-0.5 pr-2 text-[13px] text-ink-secondary hover:bg-ink/[0.04] hover:text-ink"
+        className="mt-0.5 inline-flex items-center gap-0.5 rounded-[8px] py-1 pl-0.5 pr-2 text-[13px] text-ink-secondary hover:bg-ink/[0.04] hover:text-ink"
       >
         <ChevronLeft size={15} aria-hidden="true" />
         <span>{back}</span>
       </button>
       <h3 className="mx-1 mt-1.5 text-[18px] font-semibold text-ink">{title}</h3>
-      {intro && <p className="mx-1 mt-1.5 text-[12.5px] leading-normal text-ink-secondary">{intro}</p>}
+      {intro && <p className="mx-1 mt-1.5 text-[13px] leading-normal text-ink-secondary">{intro}</p>}
     </div>
   );
 }

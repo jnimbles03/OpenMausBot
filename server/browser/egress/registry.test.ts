@@ -1,11 +1,11 @@
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { createServer, type AddressInfo } from "node:net";
+import { connect, createServer, isIP, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { agentBrowserDevToolsPorts, agentBrowserStreamPorts } from "../../browser-engine.ts";
-import { BrowserEgress, OwnListeners, staticOwnPorts } from "./registry.ts";
+import { BrowserEgress, OwnListeners, staticOwnPorts, UNSHARED_NOTICE } from "./registry.ts";
 import type { ListenerOwnership } from "./ownership.ts";
 
 const noScans = { streamPorts: () => [], devToolsPorts: () => [] };
@@ -72,7 +72,10 @@ describe("one gate per browser session", () => {
   const ownership = { botOwned: async () => false } as unknown as ListenerOwnership;
   const egress = (config = {}) => {
     const value = new BrowserEgress();
-    value.configure({ host: "server", config: () => config, listeners: new OwnListeners("server", { env: {}, ...noScans }), ownership });
+    value.configure({ host: "server", config: () => config, listeners: new OwnListeners("server", { env: {}, ...noScans }), ownership, resolve: async (host) => {
+      const family = isIP(host);
+      return family ? [{ address: host, family }] : [];
+    } });
     return value;
   };
 
@@ -93,14 +96,15 @@ describe("one gate per browser session", () => {
     }
   });
 
-  it("applies the admin allow-list only on a self-hosted server", () => {
+  it("applies the admin allow-list and the owner's local-sites switch only on a self-hosted server", () => {
     const allow = { allow: ["10.0.0.0/8"] };
     expect(egress(allow).rules().allowed("10.1.2.3", 80)).toBe(true);
     const cloud = new BrowserEgress();
     cloud.configure({ host: "cloud", config: () => allow, listeners: new OwnListeners("cloud", { env: {}, ...noScans }), ownership });
     expect(cloud.rules().allowed("10.1.2.3", 80)).toBe(false);
-    expect(egress({ localNetwork: false }).rules().localNetwork).toBe(false);
-    expect(egress().rules().localNetwork).toBe(true);
+    // On a server the switch is off unless the owner turned it on.
+    expect(egress().rules().localNetwork).toBe(false);
+    expect(egress({ localNetwork: true }).rules().localNetwork).toBe(true);
   });
 
   it("turns a session's refusals into one page-health line, once", async () => {
@@ -169,7 +173,7 @@ describe("one gate per browser session", () => {
   });
 
   it("on MausBot Cloud says once, and only for those sites, when they load from the Cloud's own connection because the computer is away", async () => {
-    let device: { open(target: { host: string; port: number }): Promise<{ refused: string }> } | { away: string } | null = { away: "Mac" };
+    let device: { open(target: { host: string; port: number }): Promise<{ refused: string }> } | { away: string } | { unshared: true } | null = { away: "Mac" };
     const cloud = new BrowserEgress();
     cloud.configure({ host: "cloud", config: () => ({}), listeners: new OwnListeners("cloud", { env: {}, ...noScans }), ownership, resolve: async () => [], device: () => device });
     const port = await cloud.open("bot-1");
@@ -188,7 +192,22 @@ describe("one gate per browser session", () => {
       expect(cloud.takeNotice("bot-1"), "said again after it came back and went away again").toContain("The person's Mac is away");
       device = null;
       await socksCode(port, "www.google.com", 443);
-      expect(cloud.takeNotice("bot-1"), "nothing to say when no computer lends its connection").toBeNull();
+      expect(cloud.takeNotice("bot-1"), "nothing to say where this browser may not use a computer's connection").toBeNull();
+      device = { unshared: true };
+      await socksCode(port, "en.wikipedia.org", 443);
+      expect(cloud.takeNotice("bot-1"), "a site that loads from My Cloud anyway: nothing to say").toBeNull();
+      await socksCode(port, "www.instagram.com", 443);
+      expect(cloud.takeNotice("bot-1")).toBe(UNSHARED_NOTICE);
+      expect(UNSHARED_NOTICE).toContain("these sites open through their own computer's internet connection while OpenMausBot is open on it, signed in to MausBot Cloud");
+      expect(UNSHARED_NOTICE).not.toContain("use-my-computer");
+      await socksCode(port, "www.instagram.com", 443);
+      expect(cloud.takeNotice("bot-1"), "said once while none shares").toBeNull();
+      device = { away: "PC" };
+      await socksCode(port, "www.instagram.com", 443);
+      expect(cloud.takeNotice("bot-1"), "a computer that shares and then goes away is said in its own words").toContain("The person's PC is away");
+      device = { unshared: true };
+      await socksCode(port, "www.youtube.com", 443);
+      expect(cloud.takeNotice("bot-1"), "said again once sharing stopped").toBe(UNSHARED_NOTICE);
     } finally {
       await cloud.close();
     }
@@ -205,6 +224,37 @@ describe("one gate per browser session", () => {
         expect(await socksCode(otherPort, "www.instagram.com", 443), `${host}: its own way`).toBe(4);
         expect(offered, `${host} sent a connection to the person's computer`).toEqual([]);
       } finally { await other.close(); }
+    }
+  });
+});
+
+describe("a session's gate once its browser has ended", () => {
+  it("closes the listener and opens again on the same port", async () => {
+    const egress = new BrowserEgress();
+    egress.configure({ host: "server", config: () => undefined });
+    const port = await egress.open("bot-a");
+    expect(egress.sessions()).toEqual(["bot-a"]);
+    await egress.release("bot-a");
+    expect(egress.sessions()).toEqual([]);
+    await expect(new Promise((resolve, reject) => { const socket = connect(port, "127.0.0.1"); socket.once("connect", () => { socket.destroy(); resolve("open"); }); socket.once("error", reject); })).rejects.toMatchObject({ code: "ECONNREFUSED" });
+    expect(await egress.open("bot-a")).toBe(port);
+    await egress.close();
+  });
+
+  it("takes any free port when its old one was taken meanwhile", async () => {
+    const egress = new BrowserEgress();
+    egress.configure({ host: "server", config: () => undefined });
+    const port = await egress.open("bot-b");
+    await egress.release("bot-b");
+    const squatter = createServer().listen(port, "127.0.0.1");
+    await new Promise((resolve) => squatter.once("listening", resolve));
+    try {
+      const again = await egress.open("bot-b");
+      expect(again).not.toBe(port);
+      expect(again).toBeGreaterThan(0);
+    } finally {
+      squatter.close();
+      await egress.close();
     }
   });
 });

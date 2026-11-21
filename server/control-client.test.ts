@@ -2,7 +2,7 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
-  CONTROL_REFUSAL_PLAIN, CONTROL_UNCONFIRMED, CONTROL_WAIT_MS, controlRefusal, createControlClient,
+  CONTROL_REFUSAL_PLAIN, CONTROL_TURN_ENDED, CONTROL_UNCONFIRMED, CONTROL_WAIT_MS, controlRefusal, createControlClient,
 } from "./control-client.ts";
 
 const options = { url: "http://control.test/state", token: "fixture-token" };
@@ -38,6 +38,17 @@ describe("computer control client", () => {
       expect(controlRefusal(state)).toBe(busy.blockedReason);
     } finally { await control.close(); }
   }, 10_000);
+
+  it("carries what a call would open to the gate, and never answers such a call from the cache", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockImplementation(async () => Response.json({ held: false, helpOpen: false }));
+    const client = createControlClient({ url: "http://control.test/api/internal/computer-control?botId=b", token: "t", fetchImpl });
+    await client.state(false);
+    await client.state(false, { app: "Chrome", site: "calendar.google.com" });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+    const sent = new URL(String(fetchImpl.mock.calls[1]![0]));
+    expect(Object.fromEntries(sent.searchParams)).toEqual({ botId: "b", app: "Chrome", site: "calendar.google.com" });
+    expect(String(fetchImpl.mock.calls[0]![0])).toBe("http://control.test/api/internal/computer-control?botId=b");
+  });
 
   it("outlasts the harness's longest hold", async () => {
     const timeout = vi.spyOn(AbortSignal, "timeout");
@@ -96,9 +107,19 @@ describe("computer control client", () => {
     await expect(createControlClient({ ...options, fetchImpl }).state()).resolves.toEqual(unavailable);
   });
 
-  it.each([401, 403, 500])("fails closed for HTTP %i", async (status) => {
+  it.each([403, 500])("fails closed for HTTP %i", async (status) => {
     const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ held: false }, { status }));
     await expect(createControlClient({ ...options, fetchImpl }).state()).resolves.toEqual(unavailable);
+  });
+
+  it("says the turn ended, not 'retry in a few seconds', when the gate no longer accepts the turn's capability (401)", async () => {
+    const fetchImpl = vi.fn<typeof fetch>().mockResolvedValue(Response.json({ error: "unauthorized" }, { status: 401 }));
+    const state = await createControlClient({ ...options, fetchImpl }).state(true);
+    expect(state).toEqual({ held: true, helpOpen: false, blockedReason: CONTROL_TURN_ENDED });
+    expect(controlRefusal(state)).toBe(CONTROL_TURN_ENDED);
+    expect(CONTROL_TURN_ENDED).toMatch(/NOT performed/);
+    expect(CONTROL_TURN_ENDED).toMatch(/Retrying will not help/);
+    expect(CONTROL_TURN_ENDED).not.toMatch(/retry in a few seconds/i);
   });
 
   it("fails closed when the request rejects", async () => {

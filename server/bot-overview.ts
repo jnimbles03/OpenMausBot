@@ -7,11 +7,22 @@ import { cronScheduleLabel } from "../shared/cron-label.ts";
 export interface BotOverview {
   who: { name: string; title: string; blurb: string; soulLead: string };
   does: string[];
+  doesRoutines?: OverviewRoutineLine[];
+  /** The departments a Chief of Staff may also coordinate, "" for the unnamed department the English line calls "General". */
+  managedSections?: string[];
   reaches: string[];
   wont: string[];
   recent: Array<{ at: number; summary: string }>;
   grants?: BotOverviewGrant[];
   setup: SetupStep[];
+}
+
+export interface OverviewRoutineLine {
+  name: string;
+  paused?: true;
+  schedule: OverviewFacts["routines"][number]["schedule"];
+  nextRunAt?: number;
+  lastRun?: { status: string; at: number };
 }
 
 export interface BotOverviewGrant {
@@ -43,14 +54,14 @@ export interface OverviewFacts {
     | "cwd"
     | "autoApprove"
     | "approvalMode"
-    | "approvePeerComms"
-    | "peers"
     | "composio"
     | "connectorTools"
     | "browser"
     | "chiefOfStaff"
     | "managedSections"
   >;
+  /** A Chief in charge of every department, which therefore also gets each new one (server/department-grants.ts). */
+  allDepartments?: boolean;
   routines: Array<{
     id: string;
     name: string;
@@ -130,6 +141,17 @@ function latestRunFor(runs: OverviewFacts["runs"], routineId: string): OverviewF
     }
   }
   return best;
+}
+
+function routineLines(facts: OverviewFacts): OverviewRoutineLine[] {
+  return facts.routines.map((routine): OverviewRoutineLine => {
+    if (!routine.enabled) return { name: routine.name, paused: true, schedule: routine.schedule };
+    const latest = latestRunFor(facts.runs, routine.id);
+    return {
+      name: routine.name, schedule: routine.schedule, ...(routine.nextRunAt != null ? { nextRunAt: routine.nextRunAt } : {}),
+      ...(latest ? { lastRun: { status: latest.status, at: latest.finishedAt ?? latest.startedAt ?? latest.scheduledFor } } : {}),
+    };
+  });
 }
 
 function doesLines(facts: OverviewFacts): string[] {
@@ -221,13 +243,12 @@ function reachesLines(facts: OverviewFacts): string[] {
     lines.push("Connected apps could not be checked.");
   }
   if (facts.browserEnabled && facts.engine?.browserMcp && facts.bot.browser !== false && facts.bot.computer !== "off") lines.push("Has the built-in browser.");
-  if (facts.engine?.agentsMcp && facts.sectionPeers > 0 && facts.bot.peers?.length !== 0) {
-    const scope = facts.bot.chiefOfStaff && facts.bot.managedSections?.length ? "its allowed teams" : "its section";
-    lines.push(`Can talk to ${facts.sectionPeers} other bot${facts.sectionPeers === 1 ? "" : "s"} in ${scope}.`);
-  }
-  if (facts.bot.chiefOfStaff) lines.push("Coordinates its section as Chief of Staff.");
-  if (facts.bot.chiefOfStaff && facts.bot.managedSections?.length) {
-    lines.push(`May also coordinate these teams: ${facts.bot.managedSections.map(name => name || "General").join(", ")}.`);
+  const peers = facts.sectionPeers;
+  if (facts.engine?.agentsMcp && peers > 0) lines.push(peers === 1 ? "Can talk to the other bot." : `Can talk to all ${peers} other bots, in any department.`);
+  if (facts.bot.chiefOfStaff) lines.push("Coordinates its department as Chief of Staff.");
+  if (facts.bot.chiefOfStaff && facts.allDepartments) lines.push("In charge of every department, including new ones.");
+  else if (facts.bot.chiefOfStaff && facts.bot.managedSections?.length) {
+    lines.push(`Also in charge of these departments: ${facts.bot.managedSections.map(name => name || "General").join(", ")}.`);
   }
   return lines;
 }
@@ -237,8 +258,6 @@ function wontLines(facts: OverviewFacts): string[] {
   const mode = approvalModeFor(facts.bot);
   if (mode === "ask") lines.push("Command approvals use Ask mode; saved permissions and provider rules still apply.");
   if (mode === "custom") lines.push("Command approvals follow the provider's custom configuration.");
-  if (facts.bot.peers?.length === 0) lines.push("Cannot initiate contact with other bots.");
-  else if (mode !== "full" && facts.bot.approvePeerComms) lines.push("Asks before contacting other bots.");
   if (!couldUseApps(facts) || (facts.connectedApps.authoritative && facts.connectedApps.services.length === 0)) {
     lines.push("Has no connected apps.");
   }
@@ -257,6 +276,8 @@ export function buildBotOverview(facts: OverviewFacts): BotOverview {
       soulLead: soulLead(facts.bot.soul),
     },
     does: doesLines(facts),
+    doesRoutines: routineLines(facts),
+    ...(facts.bot.chiefOfStaff && facts.bot.managedSections?.length ? { managedSections: [...facts.bot.managedSections] } : {}),
     reaches: reachesLines(facts),
     wont: wontLines(facts),
     recent: facts.recent,

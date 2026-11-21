@@ -10,12 +10,15 @@ import {
   json,
   JSON_HEADERS,
   listConnectedAccounts,
+  readBoundedBody,
   sha256,
   upstreamError,
   type ConnectedAccountResponse,
   eventInstallation,
   type InstallationRow,
 } from "./common";
+import { eraseInstallation } from "./erase";
+import { requestFileUpload } from "./files";
 import { adoptSharedUser, me, shareUser } from "./sharing";
 import { createTrigger, deleteTrigger, getTriggerType, listTriggers, listTriggerTypes, updateTrigger } from "./triggers";
 
@@ -25,6 +28,8 @@ interface ComposioSession {
   headers: Record<string, string>;
   userId?: string;
   multiAccountConfigured: boolean;
+  /** The account cap Composio echoed, when it did. */
+  maxAccounts?: number;
   /** Project auth configs the Session was created with, by canonical toolkit slug. */
   authConfigs: AuthConfigMap;
 }
@@ -68,8 +73,8 @@ const sessionWireSchema = z.object({
 });
 type SessionWire = z.infer<typeof sessionWireSchema>;
 
-// A Session reaches a toolkit Composio doesn't manage auth for (HighLevel, a
-// BYO OAuth app) only if created with the project's auth config id under
+// A Session reaches a toolkit Composio doesn't manage auth for (a BYO OAuth
+// app) only if created with the project's auth config id under
 // `auth_configs`.
 const authConfigItemSchema = z.object({
   id: z.string().optional(),
@@ -97,9 +102,11 @@ const toolkitPageSchema = z.object({
 const linkResponseSchema = z.object({ redirect_url: z.string().optional() });
 const aliasRequestSchema = z.object({ alias: z.string().nullable().optional() });
 const MAX_MCP_BODY = 2 * 1024 * 1024;
+/** Ten accounts per app is the most Composio allows (its range is 2-10). A Session keeps the cap it was made with,
+ * so one made under a lower cap is raised in place before its next sign-in link. */
 const MULTI_ACCOUNT_CONFIG = {
   enable: true,
-  max_accounts_per_toolkit: 5,
+  max_accounts_per_toolkit: 10,
   require_explicit_selection: true,
 } as const;
 const MAX_AUTH_CONFIG_PAGES = 20;
@@ -159,6 +166,7 @@ function parseSession(value: SessionWire): ComposioSession {
     // creation, and recreating a Session would post the same config and get
     // the same echo back — strict equality here can only churn, never fix.
     multiAccountConfigured: multi?.enable === true,
+    maxAccounts: multi?.max_accounts_per_toolkit,
     authConfigs: Object.fromEntries(
       Object.entries(config?.auth_configs ?? {}).map(([slug, id]) => [canonicalToolkitSlug(slug), id]),
     ),
@@ -187,7 +195,9 @@ async function createSession(env: Env, userId: string, authConfigs: AuthConfigMa
     }),
   });
   if (!response.ok) throw new Error(await upstreamError(response, `Session creation failed (${response.status})`));
-  return parseSession(sessionWireSchema.parse(await response.json()));
+  const session = parseSession(sessionWireSchema.parse(await response.json()));
+  if (session.userId && session.userId !== userId) throw new Error("Composio created a Session for another user");
+  return { ...session, userId };
 }
 
 /** The project's own (not Composio-managed) auth configs: newest enabled one
@@ -246,6 +256,30 @@ function authConfigsKey(sessionId: string, wanted: AuthConfigMap) {
 /** Session ids this isolate already tried to upgrade once. If the fresh Session
  *  still doesn't echo multi-account, Composio isn't granting it. */
 const multiAccountUpgradeAttempted = new Set<string>();
+/** Session ids this isolate already raised to the current account cap. */
+const accountCapRaised = new Set<string>();
+
+/** A Session made under a lower account cap gets the current one, in place, so
+ *  its MCP endpoint stays. If Composio refuses or can't be reached, the old cap
+ *  stays, the next link tries again, and this link goes ahead. */
+async function raiseAccountCap(session: ComposioSession, env: Env) {
+  if (session.maxAccounts === undefined || session.maxAccounts >= MULTI_ACCOUNT_CONFIG.max_accounts_per_toolkit
+    || accountCapRaised.has(session.sessionId)) return;
+  const response = await composioRequest(env, `/tool_router/session/${encodeURIComponent(session.sessionId)}`, {
+    method: "PATCH",
+    body: JSON.stringify({ multi_account: MULTI_ACCOUNT_CONFIG }),
+  }).catch((error: unknown) => {
+    console.warn(JSON.stringify({ message: "account cap not raised", error: error instanceof Error ? error.message : String(error) }));
+    return null;
+  });
+  if (!response) return;
+  if (!response.ok) {
+    console.warn(JSON.stringify({ message: "account cap not raised", status: response.status }));
+    return;
+  }
+  accountCapRaised.add(session.sessionId);
+}
+
 /** Likewise for an `auth_configs` echo Composio leaves out, keyed by the map
  *  asked for so a new auth config still triggers one more upgrade. */
 const authConfigUpgradeAttempted = new Set<string>();
@@ -278,10 +312,11 @@ function forgetSession(sessionId: string) {
   verifiedSessions.delete(sessionId);
 }
 
-function verifiedSession(sessionId: string | null) {
+function verifiedSession(installation: InstallationRow) {
+  const sessionId = installation.session_id;
   if (!sessionId) return undefined;
   const entry = verifiedSessions.get(sessionId);
-  if (entry && Date.now() - entry.verifiedAt < VERIFIED_SESSION_TTL_MS) return entry.session;
+  if (entry && entry.session.userId === actingUser(installation) && Date.now() - entry.verifiedAt < VERIFIED_SESSION_TTL_MS) return entry.session;
   verifiedSessions.delete(sessionId);
   return undefined;
 }
@@ -308,29 +343,87 @@ async function limitSessionRequests(installation: InstallationRow, env: Env) {
   }
 }
 
-async function ensureSession(installation: InstallationRow, env: Env, ctx: ExecutionContext) {
+interface HeldSession {
+  session: ComposioSession;
+  /** True while the Session is one an earlier request checked, not one Composio confirmed for this request. */
+  reused: boolean;
+}
+
+/** The installation's Session. One this isolate checked in the last five minutes is used as it is, when it still covers
+ *  the project's auth configs: the row is this request's own read, so its Session id and user are current. */
+async function heldSession(installation: InstallationRow, env: Env, ctx: ExecutionContext): Promise<HeldSession> {
   await limitSessionRequests(installation, env);
-  return verifySession(installation, env, ctx);
+  const reused = verifiedSession(installation);
+  if (reused && sessionReady(reused, await projectAuthConfigs(env))) {
+    touchLastSeen(installation, env, ctx);
+    return { session: reused, reused: true };
+  }
+  return { session: await verifySession(installation, env, ctx), reused: false };
+}
+
+async function ensureSession(installation: InstallationRow, env: Env, ctx: ExecutionContext) {
+  return (await heldSession(installation, env, ctx)).session;
+}
+
+/** A request under the installation's Session. Composio answers 404 or 410 for a Session it dropped, having done nothing:
+ *  a reused Session is then looked up again and the request sent once more. Any failure has the next request look the
+ *  Session up again. */
+async function sessionRequest(
+  held: HeldSession,
+  installation: InstallationRow,
+  env: Env,
+  ctx: ExecutionContext,
+  path: (sessionId: string) => string,
+  init?: RequestInit,
+) {
+  let response = await composioRequest(env, path(held.session.sessionId), init);
+  if (held.reused && (response.status === 404 || response.status === 410)) {
+    forgetSession(held.session.sessionId);
+    await response.body?.cancel();
+    held.session = await verifySession(installation, env, ctx);
+    held.reused = false;
+    response = await composioRequest(env, path(held.session.sessionId), init);
+  }
+  if (!response.ok) forgetSession(held.session.sessionId);
+  return response;
+}
+
+async function currentInstallation(env: Env, id: string) {
+  const current = await env.DB.prepare("SELECT * FROM installations WHERE id = ?").bind(id).first<InstallationRow>();
+  if (!current || current.disabled_at !== null) throw json({ error: "unauthorized" }, 401);
+  return current;
 }
 
 async function verifySession(installation: InstallationRow, env: Env, ctx: ExecutionContext) {
   const authConfigs = await projectAuthConfigs(env);
-  const user = actingUser(installation);
-  let session = installation.session_id ? await getSession(env, installation.session_id) : null;
-  if (session && sessionReady(session, authConfigs) && (!session.userId || session.userId === user)) {
-    touchLastSeen(installation, env, ctx);
-  } else {
-    // Connected accounts are attached to this stable Composio user ID, so a
-    // Session recreated for it keeps every grant.
-    session = await createSession(env, user, authConfigs);
-    multiAccountUpgradeAttempted.add(session.sessionId);
-    authConfigUpgradeAttempted.add(authConfigsKey(session.sessionId, authConfigs));
-    await env.DB.prepare("UPDATE installations SET session_id = ?, last_seen_at = ? WHERE id = ?")
-      .bind(session.sessionId, Date.now(), installation.id)
-      .run();
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const user = actingUser(installation);
+    let session = installation.session_id ? await getSession(env, installation.session_id) : null;
+    if (session && sessionReady(session, authConfigs) && session.userId === user) {
+      const current = await currentInstallation(env, installation.id);
+      if (actingUser(current) !== user) {
+        Object.assign(installation, current);
+        continue;
+      }
+      touchLastSeen(installation, env, ctx);
+    } else {
+      session = await createSession(env, user, authConfigs);
+      multiAccountUpgradeAttempted.add(session.sessionId);
+      authConfigUpgradeAttempted.add(authConfigsKey(session.sessionId, authConfigs));
+      const userColumn = installation.shared_user_id === undefined ? "composio_user_id" : "COALESCE(shared_user_id, composio_user_id)";
+      const saved = await env.DB.prepare(
+        `UPDATE installations SET session_id = ?, last_seen_at = ? WHERE id = ? AND ${userColumn} = ? AND disabled_at IS NULL`,
+      ).bind(session.sessionId, Date.now(), installation.id, user).run();
+      if (!saved.meta.changes) {
+        Object.assign(installation, await currentInstallation(env, installation.id));
+        continue;
+      }
+      installation.session_id = session.sessionId;
+    }
+    rememberSession(session);
+    return session;
   }
-  rememberSession(session);
-  return session;
+  throw json({ error: "Connected apps changed. Try again." }, 503);
 }
 
 async function authenticate(request: Request, env: Env) {
@@ -358,12 +451,11 @@ async function register(request: Request, env: Env) {
 }
 
 async function proxyMcp(request: Request, installation: InstallationRow, env: Env, ctx: ExecutionContext) {
-  const declared = Number(request.headers.get("content-length") ?? "0");
-  if (declared > MAX_MCP_BODY) return json({ error: "MCP request is too large" }, 413);
-  const body = await request.arrayBuffer();
-  if (body.byteLength > MAX_MCP_BODY) return json({ error: "MCP request is too large" }, 413);
+  const body = await readBoundedBody(request, MAX_MCP_BODY);
+  if (!body) return json({ error: "MCP request is too large" }, 413);
   await limitSessionRequests(installation, env);
-  const reused = verifiedSession(installation.session_id);
+  Object.assign(installation, await currentInstallation(env, installation.id));
+  const reused = verifiedSession(installation);
   if (reused) touchLastSeen(installation, env, ctx);
   let session = reused ?? await verifySession(installation, env, ctx);
   const incomingMcpSession = request.headers.get("mcp-session-id");
@@ -406,24 +498,77 @@ async function proxyMcp(request: Request, installation: InstallationRow, env: En
   return new Response(response.body, { status: response.status, headers });
 }
 
-async function catalog(env: Env, url: URL) {
+/** The catalog is the same for every installation and changes rarely, so a page is kept: in this isolate, and in the
+ *  data center's cache where the Worker's hostname has one. The key is the cursor alone, never anything of the caller's. */
+const CATALOG_KEEP_SECONDS = 30 * 60;
+const CATALOG_PAGES_KEPT = 8;
+const catalogPages = new Map<string, { at: number; body: string; contentType: string }>();
+
+function catalogResponse(body: string, contentType: string) {
+  return new Response(body, { headers: { "content-type": contentType, "cache-control": "private, max-age=600" } });
+}
+
+function keepCatalogPage(cursor: string, body: string, contentType: string, at = Date.now()) {
+  catalogPages.delete(cursor);
+  catalogPages.set(cursor, { at, body, contentType });
+  for (const oldest of catalogPages.keys()) {
+    if (catalogPages.size <= CATALOG_PAGES_KEPT) break;
+    catalogPages.delete(oldest);
+  }
+}
+
+/** Cloudflare's per-data-center cache; absent outside Workers. */
+function edgeCache(): Cache | undefined {
+  return typeof caches === "undefined" ? undefined : (caches as unknown as { default?: Cache }).default;
+}
+
+function hasToolkits(body: string) {
+  try {
+    const page = JSON.parse(body) as { items?: unknown; data?: unknown };
+    const items = page.items ?? page.data;
+    return Array.isArray(items) && items.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+async function catalog(env: Env, url: URL, ctx?: Pick<ExecutionContext, "waitUntil">) {
   // The catalog runs past a thousand toolkits, so pass the caller's cursor through.
   const params = new URLSearchParams({ limit: "500", sort_by: "usage" });
-  const cursor = url.searchParams.get("cursor");
-  if (cursor && CATALOG_CURSOR.test(cursor)) params.set("cursor", cursor);
+  const asked = url.searchParams.get("cursor");
+  const cursor = asked && CATALOG_CURSOR.test(asked) ? asked : "";
+  if (cursor) params.set("cursor", cursor);
+  const kept = catalogPages.get(cursor);
+  if (kept && Date.now() - kept.at < CATALOG_KEEP_SECONDS * 1_000) return catalogResponse(kept.body, kept.contentType);
+  const edge = edgeCache();
+  const edgeKey = `https://catalog.invalid/v1/catalog?${new URLSearchParams({ cursor })}`;
+  const stored = await edge?.match(edgeKey).catch(() => undefined);
+  if (stored) {
+    const body = await stored.text();
+    const contentType = stored.headers.get("content-type") ?? "application/json";
+    const age = Number(stored.headers.get("age"));
+    keepCatalogPage(cursor, body, contentType, Date.now() - (Number.isFinite(age) ? age * 1_000 : 0));
+    return catalogResponse(body, contentType);
+  }
   const response = await fetch(`${env.COMPOSIO_TOOLKIT_BASE}/toolkits?${params}`, {
     headers: { accept: "application/json", "x-api-key": env.COMPOSIO_API_KEY },
     signal: AbortSignal.timeout(20_000),
   });
   if (!response.ok) return json({ error: await upstreamError(response, "Catalog unavailable") }, 502);
-  return new Response(response.body, {
-    headers: { "content-type": response.headers.get("content-type") ?? "application/json", "cache-control": "private, max-age=600" },
-  });
+  const body = await response.text();
+  const contentType = response.headers.get("content-type") ?? "application/json";
+  // A page with no toolkits is an upstream hiccup or the walk's end past the last page: never kept.
+  if (hasToolkits(body)) {
+    keepCatalogPage(cursor, body, contentType);
+    const put = edge?.put(edgeKey, new Response(body, { headers: { "content-type": contentType, "cache-control": `public, max-age=${CATALOG_KEEP_SECONDS}` } }))
+      .catch((error: unknown) => console.warn(JSON.stringify({ message: "catalog page not cached", error: error instanceof Error ? error.message : String(error) })));
+    if (put) ctx?.waitUntil(put);
+  }
+  return catalogResponse(body, contentType);
 }
 
 async function listSessionToolkits(
-  env: Env,
-  sessionId: string,
+  request: (path: (sessionId: string) => string) => Promise<Response>,
 ): Promise<ToolkitItem[]> {
   const toolkits: ToolkitItem[] = [];
   const seenCursors = new Set<string>();
@@ -433,10 +578,7 @@ async function listSessionToolkits(
     // Composio supports a server-side connected-only filter on this route.
     const params = new URLSearchParams({ limit: "50", is_connected: "true" });
     if (cursor) params.set("cursor", cursor);
-    const response = await composioRequest(
-      env,
-      `/tool_router/session/${encodeURIComponent(sessionId)}/toolkits?${params}`,
-    );
+    const response = await request((sessionId) => `/tool_router/session/${encodeURIComponent(sessionId)}/toolkits?${params}`);
     if (!response.ok) throw new Error(await upstreamError(response, "Toolkit inventory unavailable"));
     const body = toolkitPageSchema.parse(await response.json());
     toolkits.push(...(body.items ?? []));
@@ -521,9 +663,9 @@ async function connectedServices(
   env: Env,
   ctx: ExecutionContext,
 ) {
-  const session = await ensureSession(installation, env, ctx);
+  const held = await heldSession(installation, env, ctx);
   const [toolkits, accounts] = await Promise.all([
-    listSessionToolkits(env, session.sessionId),
+    listSessionToolkits((path) => sessionRequest(held, installation, env, ctx, path)),
     listConnectedAccounts(env, actingUser(installation), []).catch(() => []),
   ]);
   return json({
@@ -534,12 +676,10 @@ async function connectedServices(
 
 async function connectionStatus(url: URL, installation: InstallationRow, env: Env, ctx: ExecutionContext) {
   const slugs = [...new Set((url.searchParams.get("services") ?? "").split(",").map((slug) => slug.toLowerCase()).filter(Boolean))].slice(0, 50);
-  const session = await ensureSession(installation, env, ctx);
+  const held = await heldSession(installation, env, ctx);
   const [response, accounts] = await Promise.all([
-    composioRequest(
-      env,
-      `/tool_router/session/${encodeURIComponent(session.sessionId)}/toolkits?${new URLSearchParams({ limit: "50", toolkits: slugs.join(",") })}`,
-    ),
+    sessionRequest(held, installation, env, ctx,
+      (sessionId) => `/tool_router/session/${encodeURIComponent(sessionId)}/toolkits?${new URLSearchParams({ limit: "50", toolkits: slugs.join(",") })}`),
     listConnectedAccounts(env, actingUser(installation), slugs).catch(() => []),
   ]);
   if (!response.ok) return json({ error: await upstreamError(response, "Connection status unavailable") }, 502);
@@ -567,7 +707,7 @@ async function authorize(
   env: Env,
   ctx: ExecutionContext,
 ) {
-  const session = await ensureSession(installation, env, ctx);
+  const held = await heldSession(installation, env, ctx);
   // Listing can be denied to the broker's key scope; authorize must still
   // work, with the alias guardrails degrading to first-account behavior.
   const accounts = await listConnectedAccounts(env, actingUser(installation), [slug]).catch(() => []);
@@ -584,9 +724,10 @@ async function authorize(
     const removed = await composioRequest(env, `/connected_accounts/${encodeURIComponent(id)}?revoke_on_delete=true`, { method: "DELETE" });
     if (!removed.ok) return json({ error: await upstreamError(removed, "Removing the earlier sign-in failed") }, 502);
   }
+  await raiseAccountCap(held.session, env);
   const linkRequest: AccountLinkRequest = { toolkit: slug };
   if (plan.alias) linkRequest.alias = plan.alias;
-  const response = await composioRequest(env, `/tool_router/session/${encodeURIComponent(session.sessionId)}/link`, {
+  const response = await sessionRequest(held, installation, env, ctx, (sessionId) => `/tool_router/session/${encodeURIComponent(sessionId)}/link`, {
     method: "POST",
     body: JSON.stringify(linkRequest),
   });
@@ -601,11 +742,9 @@ async function authorize(
 }
 
 async function disconnect(slug: string, installation: InstallationRow, env: Env, ctx: ExecutionContext) {
-  const session = await ensureSession(installation, env, ctx);
-  const list = await composioRequest(
-    env,
-    `/tool_router/session/${encodeURIComponent(session.sessionId)}/toolkits?${new URLSearchParams({ limit: "50", toolkits: slug })}`,
-  );
+  const held = await heldSession(installation, env, ctx);
+  const list = await sessionRequest(held, installation, env, ctx,
+    (sessionId) => `/tool_router/session/${encodeURIComponent(sessionId)}/toolkits?${new URLSearchParams({ limit: "50", toolkits: slug })}`);
   if (!list.ok) return json({ error: await upstreamError(list, "Connection lookup unavailable") }, 502);
   const body = toolkitPageSchema.parse(await list.json());
   const id = body.items?.find((item) => item.slug?.toLowerCase() === slug)?.connected_account?.id;
@@ -640,14 +779,11 @@ async function disconnectAccount(
 
 async function requestAlias(request: Request) {
   if (!request.body) return undefined;
-  const declared = Number(request.headers.get("content-length") ?? "0");
-  if (declared > 2048) throw new Response(JSON.stringify({ error: "request body is too large" }), { status: 413, headers: JSON_HEADERS });
+  const bytes = await readBoundedBody(request, 2048);
+  if (!bytes) throw new Response(JSON.stringify({ error: "request body is too large" }), { status: 413, headers: JSON_HEADERS });
   let body: z.infer<typeof aliasRequestSchema>;
   try {
-    const raw = await request.text();
-    if (new TextEncoder().encode(raw).byteLength > 2048) {
-      throw new Response(JSON.stringify({ error: "request body is too large" }), { status: 413, headers: JSON_HEADERS });
-    }
+    const raw = new TextDecoder().decode(bytes);
     // Some Fetch implementations expose a zero-length POST as a non-null
     // ReadableStream. First-account authorization intentionally has no alias,
     // so accept that wire representation exactly like a missing body.
@@ -703,6 +839,10 @@ async function route(request: Request, env: Env, ctx: ExecutionContext) {
   const appEvents = await appEventRoute(request, url, installation, env, ctx);
   if (appEvents) return appEvents;
   if (request.method === "GET" && url.pathname === "/v1/me") return me(installation);
+  if (request.method === "DELETE" && url.pathname === "/v1/installation") {
+    await limitSessionRequests(installation, env);
+    return eraseInstallation(installation, env);
+  }
   if (request.method === "POST" && url.pathname === "/v1/installation/share") return shareUser(request, installation, env);
   if (request.method === "POST" && url.pathname === "/v1/installation/adopt") {
     const adopted = await adoptSharedUser(request, installation, env);
@@ -710,7 +850,11 @@ async function route(request: Request, env: Env, ctx: ExecutionContext) {
     return adopted.response;
   }
   if (request.method === "POST" && url.pathname === "/v1/mcp") return proxyMcp(request, installation, env, ctx);
-  if (request.method === "GET" && url.pathname === "/v1/catalog") return catalog(env, url);
+  if (request.method === "POST" && url.pathname === "/v1/files/upload") {
+    await limitSessionRequests(installation, env);
+    return requestFileUpload(request, installation, env);
+  }
+  if (request.method === "GET" && url.pathname === "/v1/catalog") return catalog(env, url, ctx);
   if (request.method === "GET" && url.pathname === "/v1/connectors/connected") return connectedServices(installation, env, ctx);
   if (request.method === "GET" && url.pathname === "/v1/connectors") return connectionStatus(url, installation, env, ctx);
   const accountMatch = url.pathname.match(/^\/v1\/connectors\/([a-z0-9_][a-z0-9_-]{0,80})\/accounts\/([A-Za-z0-9][A-Za-z0-9_-]{0,127})$/);

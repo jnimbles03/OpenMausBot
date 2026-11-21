@@ -4,6 +4,8 @@ import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:http";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { hostTimeout } from "./testing/host-timeout.ts";
+
 const INCLUDED = "box_omb_included-relay-token";
 const OWN = "boat_own-key";
 const botId = "auto-sleep-test";
@@ -15,10 +17,12 @@ let base = "";
 let state = "ready";
 /** Status the stub answers a stop with; a 2xx archives the computer. */
 let stopStatus = 200;
-const requests: Array<{ method: string; path: string; auth: string; command?: string }> = [];
+/** Whether the background command the stub started (process 7) still runs. */
+let jobRunning = false;
+const requests: Array<{ method: string; path: string; auth: string; command?: string; at: number }> = [];
 
 const stops = () => requests.filter(request => request.method === "POST" && request.path.endsWith("/stop"));
-const waitFor = async (accept: () => boolean, ms = 5_000) => {
+const waitFor = async (accept: () => boolean, ms = hostTimeout(5_000)) => {
   const end = Date.now() + ms;
   while (!accept()) {
     if (Date.now() > end) throw new Error(`timed out: ${JSON.stringify(requests)}`);
@@ -33,7 +37,7 @@ beforeAll(async () => {
     req.on("data", chunk => { raw += chunk; });
     req.on("end", () => {
       const body = raw ? JSON.parse(raw) : {};
-      requests.push({ method: req.method ?? "GET", path: url.pathname, auth: String(req.headers.authorization ?? ""), command: body.command });
+      requests.push({ method: req.method ?? "GET", path: url.pathname, auth: String(req.headers.authorization ?? ""), command: body.command, at: Date.now() });
       const send = (status: number, payload: unknown) => {
         res.writeHead(status, { "content-type": "application/json", connection: "close" });
         res.end(JSON.stringify(payload));
@@ -46,7 +50,9 @@ beforeAll(async () => {
       const row = { id: boxId, name: machineName, state };
       if (rest === root) return send(200, { ok: true, [many]: [row], pageInfo: { nextCursor: null } });
       if (rest === `${root}/${boxId}` && req.method === "GET") return send(200, { ok: true, [one]: row });
+      if (rest === `${root}/${boxId}/commands` && body.detached === true) { jobRunning = true; return send(200, { ok: true, processId: 7 }); }
       if (rest === `${root}/${boxId}/commands`) return send(200, { exitCode: 0, stdout: "", stderr: "" });
+      if (rest === `${root}/${boxId}/commands/7`) return send(200, { ok: true, processId: 7, status: jobRunning ? "running" : "exited", running: jobRunning, exitCode: jobRunning ? null : 0, stdout: "", stderr: "" });
       if (rest === `${root}/${boxId}/stop`) {
         if (stopStatus < 300) state = "archived";
         return send(stopStatus, stopStatus < 300 ? { ok: true } : { ok: false, message: "Cloud computers are not available right now." });
@@ -63,6 +69,9 @@ afterAll(async () => {
 });
 
 describe("a cloud computer goes to sleep after its idle window", () => {
+  /** One stop was sent and the sleep it belongs to has finished: a test that ended at the stop itself left that sleep's
+   * log line to land in the next test's log. */
+  const asleep = () => waitFor(() => stops().length === 1 && !power.awake());
   let power: ReturnType<typeof import("./host/cloud-computer-power.ts").createCloudComputerPower>;
   let logs: string[];
   let busy: boolean;
@@ -87,6 +96,7 @@ describe("a cloud computer goes to sleep after its idle window", () => {
     requests.length = 0;
     state = "ready";
     stopStatus = 200;
+    jobRunning = false;
     logs = [];
     busy = false;
     vi.stubEnv("BOX_TOKEN", undefined);
@@ -106,7 +116,7 @@ describe("a cloud computer goes to sleep after its idle window", () => {
     power.used(botId);
     await new Promise(resolve => setTimeout(resolve, 600));
     expect(stops()).toEqual([]);
-    await waitFor(() => stops().length === 1);
+    await asleep();
     expect(stops()[0]).toMatchObject({ path: `/boat/api/v1/sandboxes/${boxId}/stop`, auth: `Bearer ${OWN}` });
     const quiesce = requests.findIndex(request => request.path.endsWith("/commands"));
     expect(requests[quiesce]?.command).toContain("kill -TERM");
@@ -118,7 +128,7 @@ describe("a cloud computer goes to sleep after its idle window", () => {
   it("with the cloud computer a Cloud plan includes, stops it through the Admin relay only", async () => {
     await powerFor({});
     power.used(botId);
-    await waitFor(() => stops().length === 1);
+    await asleep();
     expect(stops()[0]).toMatchObject({ path: `/relay/api/box/v1/boxes/${boxId}/stop`, auth: `Bearer ${INCLUDED}` });
     expect(requests.every(request => request.path.startsWith("/relay/"))).toBe(true);
   });
@@ -127,7 +137,7 @@ describe("a cloud computer goes to sleep after its idle window", () => {
     await powerFor({});
     await power.armRunning();
     expect(requests.map(request => `${request.method} ${request.path}`)).toEqual(["GET /relay/api/box/v1/boxes"]);
-    await waitFor(() => stops().length === 1);
+    await asleep();
     expect(stops()[0]?.path).toBe(`/relay/api/box/v1/boxes/${boxId}/stop`);
   });
 
@@ -139,20 +149,40 @@ describe("a cloud computer goes to sleep after its idle window", () => {
     expect(requests).toEqual([]);
     busy = false;
     state = "archived";
-    await new Promise(resolve => setTimeout(resolve, 1_800));
+    // The first quiet look starts a full window; the look after it finds the computer asleep and lets its timer go.
+    await waitFor(() => !power.awake());
     expect(stops()).toEqual([]);
     expect(requests.map(request => request.method)).toEqual(["GET"]);
+  });
+
+  it.each([
+    ["a person's own Boat key", { box: { token: OWN } }, "/boat/api/v1/sandboxes"],
+    ["the cloud computer a Cloud plan includes", {}, "/relay/api/box/v1/boxes"],
+  ])("with %s, stays on while a background command runs and sleeps once it has ended", async (_label, cfg, root) => {
+    await powerFor(cfg);
+    const background = await import("./cloud-computer-background.ts");
+    await background.startInBackground(cfg, boxId, "python3 job.py", new AbortController().signal);
+    power.used(botId);
+    await new Promise(resolve => setTimeout(resolve, 3_500));
+    await waitFor(() => requests.filter(request => request.path === `${root}/${boxId}/commands/7`).length >= 2);
+    expect(stops()).toEqual([]);
+    expect(power.awake()).toBe(true);
+    jobRunning = false;
+    await asleep();
+    expect(stops()[0]?.path).toBe(`${root}/${boxId}/stop`);
   });
 
   it("a stop the relay refuses is logged and retried after a longer wait each time", async () => {
     stopStatus = 503;
     await powerFor({});
     power.used(botId);
-    await waitFor(() => stops().length === 1);
-    expect(logs[0]).toMatch(/^cloud computer auto-sleep-test: could not go to sleep, retrying in 1 min: boat sleep failed: Cloud computers are not available right now\.$/);
-    await new Promise(resolve => setTimeout(resolve, 1_500));
-    expect(stops()).toHaveLength(2);
-    await new Promise(resolve => setTimeout(resolve, 1_000));
-    expect(stops()).toHaveLength(2);
+    await waitFor(() => stops().length === 3 && logs.length === 3, hostTimeout(10_000));
+    for (const line of logs) {
+      expect(line).toBe("cloud computer auto-sleep-test: could not go to sleep, retrying in 1 min: boat sleep failed: Cloud computers are not available right now.");
+    }
+    const [first, second, third] = stops().map(stop => stop.at);
+    // A Node timer may fire up to a millisecond before its delay by Date.now().
+    expect(second! - first!).toBeGreaterThanOrEqual(1_000 - 5);
+    expect(third! - second!).toBeGreaterThanOrEqual(2_000 - 5);
   });
 });

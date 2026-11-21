@@ -2,7 +2,7 @@ import type { WebhookTrigger } from "../../shared/webhooks.ts";
 
 export type RoomPostAttachment =
   | { kind: "image"; path: string; mime: string }
-  | { kind: "audio"; path: string; mime: string };
+  | { kind: "audio"; path: string; mime: string; text?: string };
 
 export interface RoomPostContent {
   text: string;
@@ -37,7 +37,8 @@ export interface RoomPostDeps {
   saveImage(bytes: Buffer, mime: string): { path: string; mime: string };
   /** Undo a staged save so a failed delivery leaves no orphaned bytes. */
   removeStaged(path: string): void;
-  appendRoomPost(trigger: WebhookTrigger, botId: string, room: RoomPostRoom, content: RoomPostContent): void;
+  /** Return the thread actually appended to if the room moved while staging. */
+  appendRoomPost(trigger: WebhookTrigger, botId: string, room: RoomPostRoom, content: RoomPostContent): string | void;
 }
 
 export interface RoomPostResult {
@@ -134,22 +135,23 @@ export async function postWebhookToRoom(
   if (!eligibility.ok) fail(eligibility.status, eligibility.error);
 
   const attachments: RoomPostAttachment[] = [];
+  let postedThreadId = room.threadId;
   try {
     if (payload.voiceNoteText) {
       const audio = await stageVoiceNote(deps, trigger.botId, payload.voiceNoteText);
-      attachments.push({ kind: "audio", path: audio.path, mime: audio.mime });
+      attachments.push({ kind: "audio", path: audio.path, mime: audio.mime, text: payload.voiceNoteText });
     }
     for (let index = 0; index < payload.imageBytes.length; index += 1) {
       const saved = deps.saveImage(payload.imageBytes[index]!, payload.imageMimes[index]!);
       attachments.push({ kind: "image", path: saved.path, mime: saved.mime });
     }
-    deps.appendRoomPost(trigger, trigger.botId, room, {
+    postedThreadId = deps.appendRoomPost(trigger, trigger.botId, room, {
       text: payload.text,
       ...(attachments.length ? { attachments } : {}),
-    });
+    }) ?? room.threadId;
   } catch (error) {
     for (const attachment of attachments) deps.removeStaged(attachment.path);
     throw error;
   }
-  return { posted: true, attachments: attachments.length, threadId: room.threadId };
+  return { posted: true, attachments: attachments.length, threadId: postedThreadId };
 }

@@ -1,10 +1,14 @@
 import { useEffect, useState } from "react";
 import { Check, Loader2 } from "lucide-react";
 
-import { api, useStore, type Bot } from "@/state/store";
+import { api, type Bot } from "@/state/store";
+import { sameJson } from "@/state/same-json";
 import { cn } from "@/lib/cn";
 import { t } from "@/lib/i18n";
+import { useOwnerOrAdmin } from "@/lib/use-owner-or-admin";
 import type { BotVisibility } from "../../../shared/wire";
+import { useTeamName } from "../bot-access/ShareBotButton";
+import { sameFields, useStoreSelector } from "@/state/store-select";
 
 export type VisibilityMode = "everyone" | "admins" | "people";
 
@@ -47,9 +51,20 @@ const OPTIONS: Array<{ mode: VisibilityMode; key: "botSettings.visibility.everyo
   { mode: "people", key: "botSettings.visibility.people" },
 ];
 
+export function useChoosesVisibility(): boolean {
+  const state = useStoreSelector((s) => ({ config: s.config }), sameFields);
+  const ownerOrAdmin = useOwnerOrAdmin();
+  const teamName = useTeamName();
+  return !window.ogb && ownerOrAdmin === true && Boolean(state.config) && !teamName;
+}
+
+export function visibilityLabel(visibility: BotVisibility | undefined): string {
+  const { mode } = formFromVisibility(visibility);
+  return t(OPTIONS.find((option) => option.mode === mode)!.key);
+}
+
 export function VisibilitySection({ bot }: { bot: Bot }) {
-  const { state } = useStore();
-  const mixed = mixedRooms(bot, state.groups, state.bots);
+  const mixed = useStoreSelector((s) => mixedRooms(bot, s.groups, s.bots), sameJson);
   const saved = formFromVisibility(bot.visibility);
   const [mode, setMode] = useState<VisibilityMode>(saved.mode);
   const [people, setPeople] = useState(saved.people);
@@ -98,7 +113,7 @@ export function VisibilitySection({ bot }: { bot: Bot }) {
 
   return (
     <div className="flex flex-col gap-3 rounded-xl border border-hairline/40 bg-card p-4" data-bot-visibility>
-      <p className="text-[12.5px] leading-relaxed text-ink-secondary">{t("botSettings.visibility.subtitle")}</p>
+      <p className="text-[13px] leading-relaxed text-ink-secondary">{t("botSettings.visibility.subtitle")}</p>
       <div role="radiogroup" aria-label={t("botSettings.visibility.title")} className="flex flex-col gap-1.5">
         {OPTIONS.map((option) => (
           <label key={option.mode} className="flex cursor-pointer items-center gap-2 text-[13px] text-ink">
@@ -123,11 +138,11 @@ export function VisibilitySection({ bot }: { bot: Bot }) {
             placeholder={t("botSettings.visibility.peoplePlaceholder")}
             rows={4}
             disabled={busy}
-            className="rounded-lg border border-hairline/40 bg-inset px-3 py-2 font-mono text-[12.5px] text-ink placeholder:text-ink-secondary focus:outline-none"
+            className="rounded-lg border border-hairline/40 bg-inset px-3 py-2 font-mono text-[13px] text-ink placeholder:text-ink-secondary focus:outline-none"
           />
         </label>
       )}
-      <p className="text-[11.5px] leading-relaxed text-ink-secondary">{t("botSettings.visibility.rooms")}</p>
+      <p className="text-[12px] leading-relaxed text-ink-secondary">{t("botSettings.visibility.rooms")}</p>
       {mixed.length > 0 && (
         <div className="flex flex-col gap-2 rounded-lg border border-warning/25 bg-warning/5 px-3 py-2 text-[12px] leading-relaxed text-ink-secondary" data-visibility-mixed-rooms>
           <p>{t("botSettings.visibility.mixedRooms", { rooms: mixed.map((room) => JSON.stringify(room.name)).join(", ") })}</p>
@@ -151,7 +166,7 @@ export function VisibilitySection({ bot }: { bot: Bot }) {
           type="button"
           onClick={() => void save()}
           disabled={busy || !dirty}
-          className={cn("flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[12.5px] font-semibold text-white hover:brightness-110 disabled:opacity-50")}
+          className={cn("flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[13px] font-semibold text-white hover:brightness-110 disabled:opacity-50")}
         >
           {busy && <Loader2 size={13} className="animate-spin" />}
           {busy ? t("botSettings.visibility.saving") : t("botSettings.visibility.save")}

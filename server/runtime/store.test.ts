@@ -53,6 +53,17 @@ describe("runtime store", () => {
     expect(() => store.update(assignment("ghost"))).toThrow(/does not exist/);
   });
 
+  it("hands each reader its own copy of a row, and a changed row reads as its new text", () => {
+    const store = open();
+    const root = assignment("root", { status: "running" });
+    store.insert(root, { kind: "enqueued", at: 1_000 });
+    store.get("root")!.status = "failed";
+    expect(store.get("root")?.status).toBe("running");
+    root.status = "completed"; root.outcome = "done"; root.finishedAt = 5_000;
+    store.update(root);
+    expect(store.get("root")).toEqual(root);
+  });
+
   it("filters all() by tree, liveness and requester thread", () => {
     const store = open();
     const a = assignment("a", { status: "completed", outcome: "done", finishedAt: 5_000 });
@@ -197,6 +208,20 @@ describe("runtime store: request marks", () => {
     expect("approved" in store.get("plain")!).toBe(false);
     expect("batchKey" in store.get("plain")!).toBe(false);
     store.insert(child("bad", root, { approved: "yes" as unknown as boolean }), { kind: "enqueued", at: 4_000 });
+    expect(() => store.get("bad")).toThrow(/does not match the record schema/);
+  });
+
+  it("round-trips a question its requester decides and who answered it, and refuses an answerer it does not know", () => {
+    const store = open();
+    const root = assignment("root", { status: "running" });
+    store.insert(root, { kind: "enqueued", at: 1_000 });
+    const parked = child("parked", root, { status: "needs_input", question: "CSV or Excel?", decide: { default: "CSV" } });
+    const open2 = child("open", root, { status: "needs_input", question: "Which format?", decide: {} });
+    const relayed = child("relayed", root, { answer: "Excel", answeredBy: { kind: "bot", botId: "chief" } });
+    const defaulted = child("defaulted", root, { answer: "CSV", answeredBy: { kind: "default" } });
+    for (const row of [parked, open2, relayed, defaulted]) store.insert(row, { kind: "enqueued", at: 2_000 });
+    for (const row of [parked, open2, relayed, defaulted]) expect(store.get(row.id)).toEqual(row);
+    store.insert(child("bad", root, { answeredBy: { kind: "someone" } as unknown as Assignment["answeredBy"] }), { kind: "enqueued", at: 3_000 });
     expect(() => store.get("bad")).toThrow(/does not match the record schema/);
   });
 });

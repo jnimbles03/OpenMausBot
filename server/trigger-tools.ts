@@ -1,13 +1,15 @@
-// The harness side of the bot trigger tools (list_triggers, create_trigger, manage_trigger): what a bot is shown about
+// The harness side of the bot trigger tools (trigger_info, trigger): what a bot is shown about
 // its schedules, webhooks and app events, and how a trigger request is read before it reaches its service.
 import { z } from "zod";
 
 import type { AppTrigger } from "../shared/app-triggers.ts";
 import { appWhenText } from "./app-trigger-requests.ts";
-import { canReachPeer, PEER_ACCESS_HELP, type RosterMember } from "./peer-roster.ts";
+import { canManage, type RosterMember } from "./peer-roster.ts";
 import { redactSecretsInText } from "./redact.ts";
 import type { Routine, RoutineRun } from "./routines.ts";
 import type { WebhookTrigger } from "./webhooks.ts";
+
+export const NO_SUCH_TRIGGER = "No trigger with that id belongs to this bot. Call trigger_info without trigger_id to see its ids.";
 
 const WEEKDAY_NAMES = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"] as const;
 const INSTRUCTIONS_SHOWN = 2_000;
@@ -31,10 +33,14 @@ function agentRun(run: RoutineRun) {
   };
 }
 
-function instructionsOf(text: string) {
+function instructionsOf(text: string, full = false) {
   // Instructions may hold a credential and the result goes back to the model: scrub the whole value before previewing.
   const safe = redactSecretsInText(text);
-  return { instructions: safe.slice(0, INSTRUCTIONS_SHOWN), instructionsTruncated: safe.length > INSTRUCTIONS_SHOWN };
+  return {
+    instructions: full ? safe : safe.slice(0, INSTRUCTIONS_SHOWN),
+    instructionsTruncated: !full && safe.length > INSTRUCTIONS_SHOWN,
+    instructionsRedacted: safe !== text,
+  };
 }
 
 function agentSchedule(schedule: Routine["schedule"]) {
@@ -63,6 +69,7 @@ export function agentRoutine(routine: Routine, latestRun?: RoutineRun) {
     name: redactSecretsInText(routine.name),
     ...instructionsOf(routine.prompt),
     continuity: routine.continuity === true,
+    sameConversation: routine.sameConversation === true,
     overlap: routine.overlap ?? "skip",
     runOnStartup: routine.runOnStartup === true,
     skippedRuns: routine.skippedRuns ?? 0,
@@ -84,10 +91,12 @@ export function agentWebhook(webhook: WebhookTrigger, latestRun?: RoutineRun) {
     kind: "webhook" as const,
     name: redactSecretsInText(webhook.name),
     ...instructionsOf(webhook.prompt),
-    when: "When another app sends something to its address. For the address to paste into that app's setup, call list_triggers with this trigger_id and include_address; the person also has Copy address on the Automations page.",
+    when: "When another app sends something to its address. For the address to paste into that app's setup, call trigger_info with this trigger_id and include_address; the person also has Copy address on the Automations page.",
     enabled: webhook.enabled,
     runOn: webhook.runOn,
     eventTypes: webhook.eventTypes ?? [],
+    ...(webhook.payloadFilter ? { payloadFilter: webhook.payloadFilter } : {}),
+    sameConversation: webhook.sameConversation === true,
     calls: webhook.deliveryCount,
     lastCalledAt: timestamp(webhook.lastReceivedAt),
     latestRun: latestRun ? agentRun(latestRun) : null,
@@ -110,6 +119,7 @@ export function agentAppTrigger(trigger: AppTrigger, latestRun?: RoutineRun) {
     account: trigger.accountLabel ?? trigger.accountId,
     filter: trigger.filter ?? {},
     event_config: trigger.config,
+    sameConversation: trigger.sameConversation === true,
     enabled: trigger.enabled,
     runOn: trigger.runOn,
     eventsReceived: trigger.received,
@@ -128,6 +138,8 @@ export interface TriggerListing {
   triggers?: AgentTrigger[];
   trigger?: AgentTrigger & { recentFires: Array<ReturnType<typeof agentRun>> };
   error?: string;
+  /** The id asked for is not this bot's: a plain answer, not a failed call. */
+  missing?: boolean;
 }
 
 /** One bot's triggers of every kind, or one trigger with its recent fires. Runs are listed newest first. */
@@ -153,10 +165,11 @@ export function listTriggers(input: {
     const routine = routines.find((candidate) => candidate.id === input.triggerId);
     const webhook = webhooks.find((candidate) => candidate.id === input.triggerId);
     const app = apps.find((candidate) => candidate.id === input.triggerId);
-    if (!routine && !webhook && !app) return { ...header, error: "No trigger with that id belongs to this bot. Call list_triggers without trigger_id to see its ids." };
+    if (!routine && !webhook && !app) return { ...header, error: NO_SUCH_TRIGGER, missing: true };
     const fires = input.runs.filter((run) => run.routineId === input.triggerId).slice(0, FIRES_SHOWN).map(agentRun);
     const shown = routine ? agentRoutine(routine, latest.get(routine.id)) : webhook ? agentWebhook(webhook, latest.get(webhook.id)) : agentAppTrigger(app!, latest.get(app!.id));
-    return { ...header, trigger: { ...shown, recentFires: fires } };
+    const prompt = (routine ?? webhook ?? app)!.prompt;
+    return { ...header, trigger: { ...shown, ...instructionsOf(prompt, true), recentFires: fires } };
   }
   return {
     ...header,
@@ -177,8 +190,8 @@ const triggerRequestSchema = z.union([
   z.object({ ...source, action: z.enum(["pause", "resume", "run_now", "delete"]), triggerId: z.string().min(1).max(200) }).strict(),
 ]);
 
-const WEBHOOK_FIELDS = new Set(["name", "instructions", "runOn", "eventTypes"]);
-const APP_FIELDS = new Set(["name", "instructions", "runOn", "filter", "config"]);
+const WEBHOOK_FIELDS = new Set(["name", "instructions", "runOn", "eventTypes", "payloadFilter", "sameConversation"]);
+const APP_FIELDS = new Set(["name", "instructions", "runOn", "filter", "config", "sameConversation"]);
 
 export type ParsedTriggerRequest =
   | { ok: false; error: string }
@@ -197,24 +210,28 @@ export function parseTriggerRequest(body: unknown, kindOf: (id: string) => "sche
       ? { ok: true, kind: "schedule", forBotId: request.forBotId, proposal: { action: "create", routine: request.routine } }
       : { ok: true, kind: "webhook", forBotId: request.forBotId, operation: { action: "create", webhook: request.webhook } };
   }
-  const changes = request.action === "update" ? request.changes : undefined;
   const kind = kindOf(request.triggerId);
+  const asked = request.action === "update" ? request.changes : undefined;
+  // A null payload filter clears a webhook's; on another kind it changes nothing.
+  const { payloadFilter, ...rest } = asked ?? {};
+  const changes = asked && kind !== "webhook" && payloadFilter === null ? rest : asked;
   if (kind === "app") {
     const misplaced = changes && Object.keys(changes).find((key) => !APP_FIELDS.has(key));
-    if (misplaced) return { ok: false, error: `An app-event trigger has no ${misplaced} to change. Change name, instructions, run_on, filter or event_config; to watch another app, event or account, delete it and create a new one.` };
+    if (misplaced) return { ok: false, error: `An app-event trigger has no ${misplaced} to change. Change name, instructions, run_on, filter, event_config or same_conversation; to watch another app, event or account, delete it and create a new one.` };
     return { ok: true, kind: "app", forBotId: request.forBotId, operation: { action: request.action, triggerId: request.triggerId, ...(changes ? { changes } : {}) } };
   }
   if (kind === "schedule") {
     if (changes && "eventTypes" in changes) return { ok: false, error: "webhook_event_types applies only to webhook triggers" };
+    if (changes && "payloadFilter" in changes) return { ok: false, error: "webhook_payload_filter applies only to webhook triggers" };
     if (changes && ("filter" in changes || "config" in changes)) return { ok: false, error: "filter and event_config apply only to app-event triggers" };
     return { ok: true, kind: "schedule", forBotId: request.forBotId, proposal: { action: request.action, routineId: request.triggerId, ...(changes ? { changes } : {}) } };
   }
   const misplaced = changes && Object.keys(changes).find((key) => !WEBHOOK_FIELDS.has(key));
-  if (misplaced) return { ok: false, error: `A webhook trigger has no ${misplaced}; it fires when its link is called. Change name, instructions, run_on or webhook_event_types.` };
+  if (misplaced) return { ok: false, error: `A webhook trigger has no ${misplaced}; it fires when its link is called. Change name, instructions, run_on, webhook_event_types, webhook_payload_filter or same_conversation.` };
   return { ok: true, kind: "webhook", forBotId: request.forBotId, operation: { action: request.action, webhookId: request.triggerId, ...(changes ? { changes } : {}) } };
 }
 
-/** Another bot named by for_bot_id must be in the sender's section; the sender itself needs no target. */
+/** An automation is part of a bot's setup: another bot named by for_bot_id needs the sender's authority, not just reach. */
 export function triggerTarget<T extends RosterMember>(from: T, forBotId: unknown, bot: (id: string) => T | null | undefined):
   { forBot?: { botId: string; name: string } } | { status: number; error: string } {
   if (forBotId === undefined) return {};
@@ -223,6 +240,6 @@ export function triggerTarget<T extends RosterMember>(from: T, forBotId: unknown
   if (id === from.id) return {};
   const target = bot(id);
   if (!target) return { status: 404, error: "no bot with that id — call list_bots and copy the exact id from the result" };
-  if (!canReachPeer(from, target)) return { status: 403, error: `that bot belongs to a different section or is unavailable. ${PEER_ACCESS_HELP}` };
+  if (!canManage(from, target)) return { status: 403, error: "that bot's automations are set up by bots in its own department or by its Chief, or it is unavailable. You can still hand it the work itself with coordinate_bots, or tell the person what to set up there." };
   return { forBot: { botId: target.id, name: target.name } };
 }

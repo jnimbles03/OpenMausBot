@@ -16,11 +16,25 @@
 - Read a period back grouped by bot, model, person, day or engine, and export
   one CSV line per turn. Owners only; a chat-only device gets 403.
 - Keep message text out of the ledger.
+- Record each turn as a trace: its turn id, start and end, the turn that
+  started it (a delegation, a resume, a room handoff), its outcome, and one
+  span line per AI step and tool call in `<data>/usage/spans/YYYY-MM-DD.jsonl`
+  (names, times, token counts and one clipped, redacted detail; no arguments,
+  outputs, prompts or replies). Span lines older than 90 days are pruned; the
+  per-turn totals on the usage row stay. Rows from before traces show as
+  untimed runs.
 
 ## User path
 
-Settings → Usage shows the live per-bot card and, below it, **History**: pick
-a period, group it, or **Export CSV**.
+Settings → Spending, in Simple and Advanced mode, opens on the period's charts
+(`GET /api/usage/insights`, bucketed by the viewer's time zone): the total
+against the same number of days before, each provider's share and daily line,
+turns, cost per turn, cache hit rate and turn length, when work happens by
+weekday and hour, tokens by type, spend by person, and a breakdown by model,
+bot, person, provider or day. Spend and Tokens switch the whole page. Every run
+follows; opening a run shows its trace waterfall. In a chat, each
+turn's work line reads "Worked for …" with **View trace** beside it. **Export
+CSV** stays one line per turn.
 
 ## Driving it
 
@@ -59,8 +73,35 @@ pnpm control:omb wait --bot BOT_ID --timeout 30 --url http://127.0.0.1:PORT
 cat DATA_DIR/usage/$(date -u +%Y-%m).jsonl
 ```
 
-Then open the printed preview, go to Settings → Usage → History, and confirm
-the turn appears under **Bot** and under **Person** as "This computer".
+Then open the printed preview, go to Settings → Usage, and confirm the run is
+listed with its bot, and that **Where it went** shows it under **Bot** and under
+**Person** as "This computer".
+
+## Traces
+
+```sh
+pnpm exec vitest run server/usage-trace server/usage-traces.e2e.test.ts src/lib/usage-trace.test.ts
+```
+
+The e2e sends a person's message to a Chief whose scripted engine delegates to a
+teammate that calls two agents tools, then reads `GET /api/usage/traces` and
+`GET /api/usage/traces/:id`: one root, the teammate's turn and the Chief's resumed
+turn nested under the first, each tool timed by the server, and totals that add
+up. The unit tests cover nesting, timing, a tool still open at the end of its
+turn, OMB receipts against engine events, Codex's thread totals, old untimed
+rows, groups, a parent loop, 2,000 tool calls in one turn and a 500-span trace
+read from disk.
+
+To look at the page:
+
+```sh
+node --experimental-strip-types scripts/verify-usage-traces.ts
+```
+
+It launches a scripted fixture, runs three delegated jobs (one left running for
+the Live badge), stretches one into a realistic job with browser and computer
+steps, adds two rows from before traces, mounts the Usage page alone and prints
+its preview URL.
 
 ## Unit regressions
 
@@ -76,7 +117,7 @@ waits for settlement, and checks that the tooltip separates 10 uncached input,
 headline. Its JSON evidence sits next to the fixture log; no live account is used.
 
 ```sh
-pnpm exec vitest run server/usage-ledger.test.ts src/components/UsageHistory.test.ts server/request-auth.test.ts
+pnpm exec vitest run server/usage-ledger.test.ts src/lib/usage-trace.test.ts server/request-auth.test.ts
 ```
 
 These cover month files and 0600 modes, torn lines, clamped tokens, a blocked
@@ -86,8 +127,10 @@ scope on both routes.
 
 ## Gotchas
 
-- Rows are appended when `turn.completed` folds. A turn that fails before it
-  settles leaves no row, so a failed turn is not billed.
+- Rows are appended when `turn.completed` folds, whether the turn succeeded
+  or failed: a failed turn is booked with the tokens and cost it reported, and
+  its row carries the failed outcome. Only a turn that never settles (refused
+  before it started, or the server stopped first) leaves no row.
 - The cost column is what the engine reported (real on a metered key, an
   equivalent on a subscription) or, for engines that report none, an estimate
   from `server/model-prices.ts`, marked `~` in History and People and labelled
@@ -100,5 +143,6 @@ scope on both routes.
   process it finds the restored state among the session's recent results in
   `<data>/claude-cost-history.json`; without one, that first turn keeps its
   whole figure.
-- The renderer's History card is not driven headlessly here; the fixture
-  proves the server side and the table renders from a fixture in its unit test.
+- A member's chat-only device cannot open traces: the routes are owner-only,
+  like the rest of Usage, and a trace leaves out turns in threads its viewer
+  cannot see.

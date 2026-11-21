@@ -8,8 +8,7 @@ import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { afterAll, beforeAll, expect, it } from "vitest";
-import { installCloudLending, usualFolders } from "../electron/cloud-lending-ipc.mjs";
-import { createComputerSharing, validateSharedFolders } from "../electron/computer-sharing.mjs";
+import { createComputerSharing } from "../electron/computer-sharing.mjs";
 import { cloudPairingSignature } from "./cloud-home.ts";
 import { WATCHER_OPTIONS_CARD_BOT_ID } from "../shared/options-card.ts";
 import { removeTempDir, waitForExit } from "./testing/cleanup.ts";
@@ -64,31 +63,37 @@ async function leftBehind(of: { threadIds?: string[]; routineIds?: string[] }) {
 }
 
 type Turn = { argv: string[]; cwd: string; systemPrompt?: string; mcpConfig: { mcpServers: { agents: { command: string; args: string[]; env: Record<string, string> } } } };
-/** The latest turn `agentsFor` found. */
+/** The latest turn `agentsFor` found, and the dump it was in. */
 let turn: Turn;
+let turnDump = "";
+/** Ends the held turn that dumped itself there, as a model's last reply would. */
+const finish = (dump: string) => writeFileSync(join(turnDumps(), dump.replace(/\.json$/u, ".finish")), "");
 const turnDumps = () => join(home, "turns");
 const readTurns = () => new Map(readdirSync(turnDumps()).filter((name) => name.endsWith(".json")).flatMap((name) => {
   try { return [[name, readFileSync(join(turnDumps(), name), "utf8")] as const]; } catch { return []; }
 }));
 
-/** Each engine process dumps its own turn, so the turns a restart resumes never take the place of this one. */
-async function agentsFor(start: () => Promise<void>, botId: string, threadId?: string) {
+/** Each engine process dumps its own turn, so the turns a restart resumes never take the place of this one. `threadId`
+ * may be found only once `start` is done (a routine's run, whose conversation the scheduler makes): the wait for the
+ * turn then starts from there. */
+async function agentsFor(start: () => Promise<void>, botId: string, threadId?: string | (() => Promise<string>)) {
   const before = readTurns();
   await start();
+  if (typeof threadId === "function") threadId = await threadId();
   await expect.poll(() => {
     for (const [name, text] of readTurns()) {
       if (before.get(name) === text) continue;
       let found: Turn;
       try { found = JSON.parse(text) as Turn; } catch { continue; }
       const env = found.mcpConfig?.mcpServers?.agents?.env;
-      if (env?.OMB_BOT_ID === botId && (!threadId || env.OMB_THREAD_ID === threadId)) { turn = found; return true; }
+      if (env?.OMB_BOT_ID === botId && (!threadId || env.OMB_THREAD_ID === threadId)) { turn = found; turnDump = name; return true; }
     }
     return false;
   }, { timeout: 15_000 }).toBe(true);
   return turn.mcpConfig.mcpServers.agents;
 }
 
-async function proxyFor(start: () => Promise<void>, botId: string, threadId?: string) {
+async function proxyFor(start: () => Promise<void>, botId: string, threadId?: Parameters<typeof agentsFor>[2]) {
   const agents = await agentsFor(start, botId, threadId);
   const proxy = spawn(agents.command, agents.args, { env: { PATH: process.env.PATH, HOME: home, ...agents.env }, stdio: ["pipe", "pipe", "pipe"] });
   proxies.push(proxy);
@@ -123,18 +128,23 @@ beforeAll(async () => {
 if (process.argv[2] === "auth") { console.log(JSON.stringify({ loggedIn: true, email: "person@example.test" })); process.exit(0); }
 process.env.FAKE_CLAUDE_VERSION = "2.1.284";
 // One-shot runs (a new chat's title) dump elsewhere, so they never take the place of the turn a test is waiting for.
-if (process.argv[2] !== "--version") { process.env.FAKE_CLAUDE_DUMP = ${JSON.stringify(join(home, "turns"))} + "/" + process.pid + ".json"; process.env.FAKE_CLAUDE_TEXT_DUMP = ${JSON.stringify(join(home, "one-shot.json"))}; process.env.FAKE_CLAUDE_MODE = "hang"; }
+// A held turn ends well once its own finish file exists (finish()).
+if (process.argv[2] !== "--version") { process.env.FAKE_CLAUDE_DUMP = ${JSON.stringify(join(home, "turns"))} + "/" + process.pid + ".json"; process.env.FAKE_CLAUDE_TEXT_DUMP = ${JSON.stringify(join(home, "one-shot.json"))}; process.env.FAKE_CLAUDE_MODE = "hang"; process.env.FAKE_CLAUDE_FINISH_GATE = ${JSON.stringify(join(home, "turns"))} + "/" + process.pid + ".finish"; }
 await import(${JSON.stringify(pathToFileURL(join(SERVER_DIR, "testing", "fake-claude-cli.ts")).href)});
 `, { mode: 0o755 });
   // No `features` block: the maintainer flag is off, as on every Cloud home.
   writeFileSync(join(dataDir, "config.json"), JSON.stringify({ instances: {
-    ...Object.fromEntries(["codex", "cursor", "openaiCompat", "qwen", "hermes", "pi"].map((id) => [id, { driver: "not-a-real-driver" }])),
+    ...Object.fromEntries(["codex", "cursor", "githubCopilot", "openaiCompat", "qwen", "hermes", "pi"].map((id) => [id, { driver: "not-a-real-driver" }])),
     claude: { driver: "claudeAgent", displayName: "Claude", config: { cli } },
     // A model that uses the Mac, asks a question, and uses it again once the
     // card is answered (fake-acp-cli.ts "lend-question").
     grok: { driver: "grokAgent", environment: { FAKE_ACP_MODE: "lend-question" }, config: { cli: join(SERVER_DIR, "testing", "fake-acp-cli.ts"), fullAuto: false } },
   } }));
   chmodSync(join(SERVER_DIR, "testing", "fake-acp-cli.ts"), 0o755);
+  // A Cloud home starts a new engine only while the machine has room for it, holding each new turn's share for 90 s, and
+  // most turns here keep running: by the asking bot's turn they hold about 11 GB. Read from the test machine, room is
+  // whatever the test files running beside this one leave, so that turn could wait for memory past every wait below.
+  writeFileSync(join(dataDir, "host-memory.json"), JSON.stringify({ totalBytes: 64 * 1024 ** 3, availableBytes: 60 * 1024 ** 3, swapFreeBytes: 0, oomKills: 0, fullStall10: 0 }));
   port = await freePortBlock([0, 1]);
   base = `http://127.0.0.1:${port}`;
   await boot();
@@ -145,11 +155,14 @@ let port = 0;
 async function boot() {
   const dataDir = join(home, ".openmausbot");
   const offlinePrelude = `data:text/javascript,${encodeURIComponent('const real = globalThis.fetch; globalThis.fetch = async (url, init) => String(url).startsWith("http://127.0.0.1:") ? real(url, init) : new Response("offline fixture", { status: 503 });')}`;
-  child = spawn(process.execPath, ["--import", offlinePrelude, join(SERVER_DIR, "index.ts")], {
+  // The memory gate's seam (testing/memory-gate-hooks.mjs): this machine's memory is host-memory.json's, on every OS.
+  const memoryGate = pathToFileURL(join(SERVER_DIR, "testing", "memory-gate-hooks.mjs")).href;
+  child = spawn(process.execPath, ["--import", offlinePrelude, "--import", memoryGate, join(SERVER_DIR, "index.ts")], {
     cwd: join(SERVER_DIR, ".."),
     env: {
       PATH: process.env.PATH, ...(process.env.SystemRoot ? { SystemRoot: process.env.SystemRoot } : {}),
-      HOME: home, USERPROFILE: home, OMB_DATA_DIR: dataDir, OMB_PORT: String(port), OMB_WEBHOOK_PORT: String(port + 1),
+      // The seam takes only a fixture whose home is its data folder.
+      HOME: dataDir, USERPROFILE: dataDir, OMB_DATA_DIR: dataDir, OMB_TEST_MEMORY_GATE: "1", OMB_PORT: String(port), OMB_WEBHOOK_PORT: String(port + 1),
       OMB_CLOUD_ROLE: "home", OMB_CLOUD_MACHINE_ID: "3f9c2a4e-8b1d-4c6e-9a7f-2d5e8c1b0a93", OMB_CLOUD_ADMIN_URL: "https://cloud.example.test",
       OMB_CLOUD_BOOTSTRAP_SECRET: secret, OMB_PUBLIC_URL: `https://${HOST}`,
     },
@@ -179,7 +192,7 @@ it("offers lending on a Cloud home with the maintainer flag still off", async ()
   expect(await api("GET", "/api/shared-computers", { token: owner })).toEqual({ status: 200, body: { computers: [], known: [] } });
 });
 
-it("the person's Mac, lent through the real connector, is usable by the owner's conversations and routines, never by what a guest left behind or a webhook", async () => {
+it("the person's Mac, lent by itself through the real connector, is usable by the owner's conversations and routines, never by what a guest left behind, a webhook or a call through a bot's API", async () => {
   const newBot = async (name: string) => (await api("POST", "/api/bots", { token: owner, body: { name, modelSelection: { instanceId: "claude", model: "claude-sonnet-5" } } })).body.bot;
   const routineFor = async (botName: string, prompt = "Read plan.md from my Mac.") => {
     const botId = (await newBot(botName)).id as string;
@@ -194,14 +207,22 @@ it("the person's Mac, lent through the real connector, is usable by the owner's 
   const shared = await newBot("Shared bot");
   const guestOpened = (await api("POST", `/api/bots/${shared.id}/tasks`, { token: owner, body: { title: "Guest's" } })).body.task.threadId as string;
   const rewritten = await routineFor("Rewritten");
-  await leftBehind({ threadIds: [guestOpened], routineIds: [rewritten.id] });
+  const roomBot = await newBot("Scout");
+  const guestsRoom = (await api("POST", "/api/groups", { token: owner, body: { name: "Guest's room", memberIds: [roomBot.id], setup: { bulletin: "", defaultResponder: { kind: "member", botId: roomBot.id } } } })).body.group;
+  await leftBehind({ threadIds: [guestOpened, guestsRoom.threadId], routineIds: [rewritten.id] });
 
   const folderPath = realpathSync(mkdtempSync(join(tmpdir(), "omb-cloud-lent-folder-")));
   writeFileSync(join(folderPath, "plan.md"), "from the Mac");
   const env = { id: "my-cloud", name: "My Cloud", origin: base };
+  // A folder this Mac lent My Cloud read only before lending was automatic: the automatic grant keeps it as it was.
+  const folder = { id: randomUUID(), name: "Plans", path: folderPath, write: false };
+  const file = join(home, "desktop-profile", "computer-sharing.json");
+  mkdirSync(dirname(file), { recursive: true });
+  writeFileSync(file, JSON.stringify({ version: 1, records: { [env.id]: { sessionId: null, environmentId: null, id: randomUUID(), secret: randomBytes(32).toString("hex"), enabled: true,
+    folders: [folder], terminal: false, computer: false, internet: true, cloud: { accountId: "acct_fixture", origin: base } } } }));
   let maintainerChecks = 0;
   connector = createComputerSharing({
-    file: join(home, "desktop-profile", "computer-sharing.json"), environments: () => [env], cuaConnection: async () => null,
+    file, environments: () => [env], myCloud: () => env, ownClouds: () => [env], cuaConnection: async () => null,
     // The Mac's own maintainer flag is off; its verified Cloud sign-in is what lets it lend.
     enabled: async () => { maintainerChecks++; return false; },
     cloud: () => ({ status: "connected", accountId: "acct_fixture", origin: base }),
@@ -209,9 +230,8 @@ it("the person's Mac, lent through the real connector, is usable by the owner's 
     // The desktop's cookie for its Cloud, as a bearer; the edge headers as Caddy adds them.
     fetch: (url: string, init: RequestInit) => fetch(url, { ...init, headers: { ...init.headers as Record<string, string>, authorization: `Bearer ${owner}`, host: HOST, "x-forwarded-for": "203.0.113.9", "x-forwarded-proto": "https", origin: `https://${HOST}` } }),
   });
-  const folder = { id: randomUUID(), name: "Plans", path: folderPath, write: false };
-  await connector.saveCloud(env, { folders: [folder], screen: false });
-  await expect.poll(() => connector!.cloudState(env).connected, { timeout: 8000 }).toBe(true);
+  connector.start();
+  await expect.poll(() => connector!.cloudState(env).connected && connector!.cloudState(env).chrome, { timeout: 8000 }).toBe(true);
   expect(maintainerChecks).toBe(0);
 
   const status = (await api("GET", "/api/shared-computers", { token: owner })).body.computers;
@@ -255,6 +275,29 @@ it("the person's Mac, lent through the real connector, is usable by the owner's 
   expect(blocked.isError).toBe(true);
   expect(blocked.content[0].text).toContain("Start a new conversation to use it");
 
+  // The owner's own line in a group chat they opened reaches the lent computer, like their own conversation does.
+  const writer = await newBot("Writer");
+  const room = (await api("POST", "/api/groups", { token: owner, body: { name: "Brand", memberIds: [writer.id], setup: { bulletin: "", defaultResponder: { kind: "member", botId: writer.id } } } })).body.group;
+  const roomCall = await proxyFor(async () => {
+    expect((await api("POST", `/api/groups/${room.id}/messages`, { token: owner, body: { text: "Read plan.md from my Mac." } })).status).toBe(202);
+  }, writer.id, room.threadId);
+  const inRoom = JSON.parse((await roomCall("list_shared_computers")).content[0].text);
+  expect(inRoom.computers.map((entry: any) => entry.id)).toEqual([status[0].id]);
+  expect(inRoom.say).toBeUndefined();
+  expect(JSON.parse((await reads(roomCall)).content[0].text).content).toBe("from the Mac");
+  // A group chat someone else opened never does, and its bot says why instead of offering Use my Mac.
+  const guestRoomCall = await proxyFor(async () => {
+    expect((await api("POST", `/api/groups/${guestsRoom.id}/messages`, { token: owner, body: { text: "Read plan.md from my Mac." } })).status).toBe(202);
+  }, roomBot.id, guestsRoom.threadId);
+  const inGuestsRoom = JSON.parse((await guestRoomCall("list_shared_computers")).content[0].text);
+  expect(inGuestsRoom.computers).toEqual([]);
+  expect(inGuestsRoom.say).toMatch(/^Someone else wrote in this conversation, so it can't use your (?:Mac|PC|computer)\. Start a new thread in this group chat to use it\.$/u);
+  expect(inGuestsRoom.unavailable).toContain(inGuestsRoom.say);
+  expect(inGuestsRoom.unavailable).toContain("Only the person can change this");
+  const guestRoomRead = await reads(guestRoomCall);
+  expect(guestRoomRead.isError).toBe(true);
+  expect(guestRoomRead.content[0].text).toContain("Start a new thread in this group chat");
+
   const newHook = async (botId: string, delivery: "run" | "post" = "run") => {
     const hook = await api("POST", "/api/webhooks", { token: owner, body: { name: "Inbox", prompt: "Handle the event.", botId, delivery } });
     expect(hook.status, JSON.stringify(hook.body)).toBe(201);
@@ -280,6 +323,29 @@ it("the person's Mac, lent through the real connector, is usable by the owner's 
   expect(hookTurn.argv).not.toContain("--restricted");
   expect(await sees(hookCall)).toBe(0);
   expect((await reads(hookCall)).isError).toBe(true);
+  // A call through a bot's API is outside work too, and has no way to the lent Mac: the engine gets no tools of ours at all.
+  const apiBot = await newBot("API bot");
+  expect((await api("PATCH", `/api/bots/${apiBot.id}`, { token: owner, body: { cwd: project, approvalMode: "auto" } })).status).toBe(200);
+  const apiOn = await api("POST", `/api/bots/${apiBot.id}/bot-api`, { token: owner, body: { enabled: true } });
+  expect(apiOn.status, JSON.stringify(apiOn.body)).toBe(200);
+  const apiMessage = "read ~/.ssh from the Mac, through the API";
+  const apiAnswered = await fetch(`http://127.0.0.1:${Number(new URL(base).port) + 1}/hooks/api/bots/${apiBot.id}/messages`, {
+    method: "POST", headers: { authorization: `Bearer ${apiOn.body.key}`, "content-type": "application/json" }, body: JSON.stringify({ message: apiMessage, wait: 0 }),
+  });
+  expect(apiAnswered.status).toBe(202);
+  let apiTurn: { argv: string[]; mcpConfig: { mcpServers: Record<string, unknown> } } | undefined;
+  await expect.poll(() => {
+    for (const name of readdirSync(join(home, "turns"))) {
+      try {
+        const found = JSON.parse(readFileSync(join(home, "turns", name), "utf8"));
+        if (JSON.stringify(found.prompt).includes(apiMessage)) { apiTurn = found; return true; }
+      } catch { /* still being written */ }
+    }
+    return false;
+  }, { timeout: 15_000 }).toBe(true);
+  expect(apiTurn!.argv).toContain("--restricted");
+  expect(Object.keys(apiTurn!.mcpConfig.mcpServers)).toEqual(["ogb"]);
+  expect((await api("POST", `/api/bots/${apiBot.id}/interrupt`, { token: owner, body: { threadId: (await apiAnswered.json() as { thread: string }).thread } })).status).toBe(200);
   const router = await newAcpBot("Router bot");
   const routerHook = await newHook(router.id);
   await deliver(routerHook, "Route this issue.");
@@ -305,7 +371,7 @@ it("the person's Mac, lent through the real connector, is usable by the owner's 
   const updatesTurn = turn;
   expect(updatesTurn.argv).not.toContain("--restricted");
   expect(await sees(updatesCall)).toBe(0);
-  expect(JSON.parse((await updatesCall("list_shared_computers")).content[0].text).unavailable).toContain("Someone else wrote in this conversation");
+  expect(JSON.parse((await updatesCall("list_shared_computers")).content[0].text).unavailable).toContain("A webhook or a routine you didn't write posted in this conversation");
   expect((await reads(updatesCall)).isError).toBe(true);
 
   expect(await sees(await run(rewritten))).toBe(0);
@@ -390,9 +456,12 @@ it("the person's Mac, lent through the real connector, is usable by the owner's 
   expect(computersIn(unaffected, "before")).toBe(1);
   expect.soft(computersIn(unaffected, "after")).toBe(1);
 
-  connector.revoke(env);
+  connector.pause();
   await expect.poll(async () => (await api("GET", "/api/shared-computers", { token: owner })).body.computers, { timeout: 5000 }).toEqual([]);
   expect((await call("shared_computer", { computer_id: status[0].id, folder_id: folder.id, action: "read_file", path: "plan.md" })).isError).toBe(true);
+  // The tests after this one start from a desktop that lent nothing, not a paused one.
+  connector.close();
+  rmSync(dirname(file), { recursive: true, force: true });
   rmSync(folderPath, { recursive: true, force: true });
 }, hostTimeout(60_000));
 
@@ -451,7 +520,7 @@ it("My Cloud remembers a lent computer across its restart, says it is offline by
   await waitForExit(child, { signal: "SIGTERM" });
   await boot();
   const known = (await api("GET", "/api/shared-computers", { token: owner })).body.known;
-  expect(known).toEqual([expect.objectContaining({ id, platform: process.platform, online: false, lent: true, scopes: { folders: 1, terminal: false, screen: false, internet: false } })]);
+  expect(known).toEqual([expect.objectContaining({ id, platform: process.platform, online: false, lent: true, scopes: { folders: 1, terminal: false, screen: false, internet: false, chrome: false } })]);
   call = await ask();
   // The turn's own instructions name the computer the same way.
   expect(turn.systemPrompt).toContain(`If they ask for something on their ${device} (`);
@@ -459,21 +528,24 @@ it("My Cloud remembers a lent computer across its restart, says it is offline by
   expect(away.computers).toEqual([]);
   expect(away.offline).toEqual([expect.objectContaining({ device, lent: true })]);
   expect(away.say).toMatch(new RegExp(`^Their ${device} .+ is shared with the Cloud but offline \\(last online \\d{4}-\\d\\d-\\d\\d \\d\\d:\\d\\d UTC\\)`, "u"));
-  expect(away.say).toContain(`Ask them to open OpenMausBot on that ${device}; it reconnects by itself.`);
+  expect(away.say, "on the person's own Cloud the bot asks with a card instead of explaining the fix").toContain("If the request needs it, call ask_for_computer");
   const refused = await call("shared_computer", { computer_id: id, action: "list_files", folder_id: randomUUID(), path: "." });
   expect(refused.isError).toBe(true);
   expect(JSON.stringify(refused)).toContain(`is offline: OpenMausBot on that ${device} is closed, or the ${device} is asleep or off.`);
   for (const text of [away.say, JSON.stringify(refused)]) if (device !== "Mac") expect(text).not.toMatch(/\bMac\b/u);
 
-  // Lent again from the same computer, then turned off there: no longer lent, not merely offline.
+  // Lent again from the same computer, then paused there: no longer lent, not merely offline.
   connector = lend(env);
   await connector.saveCloud(env, { folders: [], screen: true });
   await expect.poll(() => connector!.cloudState(env).connected, { timeout: 8000 }).toBe(true);
-  connector.revoke(env);
+  connector.pause();
   await expect.poll(async () => (await api("GET", "/api/shared-computers", { token: owner })).body.known, { timeout: 5000 })
-    .toEqual([expect.objectContaining({ online: false, lent: false, scopes: { folders: 0, terminal: false, screen: true, internet: false } })]);
+    .toEqual([expect.objectContaining({ online: false, lent: false, scopes: { folders: 0, terminal: false, screen: true, internet: false, chrome: false } })]);
   call = await ask();
-  expect(JSON.parse((await call("list_shared_computers")).content[0].text).say).toMatch(new RegExp(`^Their ${device} .+ is no longer shared with the Cloud`, "u"));
+  expect(JSON.parse((await call("list_shared_computers")).content[0].text).say).toMatch(new RegExp(`^Their ${device} .+ no longer shares itself with the Cloud: OpenMausBot on it is paused`, "u"));
+  connector.close();
+  connector = undefined;
+  rmSync(join(home, "desktop-profile"), { recursive: true, force: true });
   rmSync(folderPath, { recursive: true, force: true });
 }, hostTimeout(60_000));
 
@@ -504,34 +576,196 @@ it("a computer lending while My Cloud restarts waits for it, never asks to open 
   rmSync(folderPath, { recursive: true, force: true });
 }, hostTimeout(60_000));
 
-// The person used to press Change what's lent on My Cloud's page and land back on This computer. The switch is on My
-// Cloud's page now, through main's own handlers, and turning it on with nothing chosen lends the internet connection and
-// the usual folders, read only, with no dialog to answer.
-it("My Cloud's own page turns this computer's lending on in place, with the internet connection and the usual folders read only, and off again", async () => {
+it("a Mac signed in to My Cloud is lent by itself, its home folder with editing, and the menu bar's Pause takes it back until Resume", async () => {
   const env = { id: "my-cloud", name: "My Cloud", origin: base };
   connector?.close();
-  connector = lend(env);
-  const lending = connector;
-  const root = realpathSync(mkdtempSync(join(tmpdir(), "omb-usual-folders-")));
-  const usual = ["Desktop", "Documents", "Downloads"].map((name) => { mkdirSync(join(root, name)); return join(root, name); });
-  const handlers = new Map<string, (...args: unknown[]) => Promise<any>>();
-  installCloudLending({
-    ipcMain: { handle: (channel: string, handler: (...args: unknown[]) => Promise<any>) => handlers.set(channel, handler) },
-    localOnly: (_channel: string, handler: unknown) => handler, cloudPage: (_channel: string, handler: unknown) => handler,
-    snapshot: async () => ({ available: true, screenAvailable: false, state: lending.cloudState(env) }),
-    environment: () => env, save: (target: typeof env, choice: { folders: unknown; screen: boolean }) => lending.saveCloud(target, choice as never), stop: () => lending.revoke(env),
-    chooseFolder: async () => null,
-    defaults: () => usualFolders([...usual, join(root, "Missing")], validateSharedFolders), validate: validateSharedFolders,
+  const macHome = realpathSync(mkdtempSync(join(tmpdir(), "omb-automatic-home-")));
+  mkdirSync(join(macHome, "Documents"));
+  rmSync(join(home, "desktop-profile"), { recursive: true, force: true });
+  connector = createComputerSharing({
+    file: join(home, "desktop-profile", "computer-sharing.json"), environments: () => [env], myCloud: () => env, ownClouds: () => [env], cuaConnection: async () => null, enabled: async () => false,
+    cloud: () => ({ status: "connected", accountId: "acct_fixture", origin: base }), home: macHome,
+    fetch: (url: string, init: RequestInit) => fetch(url, { ...init, headers: { ...init.headers as Record<string, string>, authorization: `Bearer ${owner}`, host: HOST, "x-forwarded-for": "203.0.113.9", "x-forwarded-proto": "https", origin: `https://${HOST}` } }),
+    linkHeaders: () => ({ authorization: `Bearer ${owner}`, "x-forwarded-for": "203.0.113.9", "x-forwarded-proto": "https" }),
   });
-  expect((await handlers.get("cloud-lending:state")!({})).on).toBe(false);
-  await handlers.get("cloud-lending:set")!({}, true);
-  await expect.poll(() => lending.cloudState(env).link, { timeout: 8000 }).toBe("on");
-  expect(await handlers.get("cloud-lending:state")!({})).toEqual({ available: true, on: true, status: "lent", screen: false, screenAvailable: false, internet: true, link: "on",
-    folders: [{ name: "Desktop", write: false }, { name: "Documents", write: false }, { name: "Downloads", write: false }] });
-  await expect.poll(async () => (await api("GET", "/api/shared-computers", { token: owner })).body.known.find((computer: { lent: boolean }) => computer.lent), { timeout: 5000 })
-    .toEqual(expect.objectContaining({ online: true, scopes: { folders: 3, terminal: false, screen: false, internet: true } }));
-  await handlers.get("cloud-lending:set")!({}, false);
-  expect(lending.cloudState(env).enabled).toBe(false);
-  await expect.poll(async () => (await api("GET", "/api/shared-computers", { token: owner })).body.known.every((computer: { lent: boolean }) => !computer.lent), { timeout: 5000 }).toBe(true);
-  rmSync(root, { recursive: true, force: true });
+  const lending = connector;
+  lending.start();
+  const lentNow = async () => (await api("GET", "/api/shared-computers", { token: owner })).body;
+  await expect.poll(async () => (await lentNow()).computers[0]?.scopes, { timeout: 8000 })
+    .toEqual({ folders: [{ id: expect.any(String), name: expect.any(String), write: true }], terminal: false, screen: false, internet: true, chrome: true });
+  lending.pause();
+  await expect.poll(async () => (await lentNow()).known.every((computer: { lent: boolean }) => !computer.lent), { timeout: 5000 }).toBe(true);
+  expect((await lentNow()).computers).toEqual([]);
+  await lending.resume();
+  await expect.poll(async () => (await lentNow()).computers.length, { timeout: 8000 }).toBe(1);
+  rmSync(macHome, { recursive: true, force: true });
 }, hostTimeout(60_000));
+
+it("paused, the PC still hears a bot that needs it: one card in the chat, the app's own prompt once, and Turn on on the card turns it on so the bot's call carries on", async () => {
+  const env = { id: "my-cloud", name: "My Cloud", origin: base };
+  connector?.close();
+  const pcHome = realpathSync(mkdtempSync(join(tmpdir(), "omb-asks-home-")));
+  rmSync(join(home, "desktop-profile"), { recursive: true, force: true });
+  const prompts: string[] = [];
+  connector = createComputerSharing({
+    file: join(home, "desktop-profile", "computer-sharing.json"), environments: () => [env], myCloud: () => env, ownClouds: () => [env], cuaConnection: async () => null, enabled: async () => false,
+    cloud: () => ({ status: "connected", accountId: "acct_fixture", origin: base }), home: pcHome,
+    screen: () => ({ ready: true, lent: true, reason: null, fix: null }),
+    prompt: async (_env: unknown, ask: { id: string }) => { prompts.push(ask.id); return null; },
+    fetch: (url: string, init: RequestInit) => fetch(url, { ...init, headers: { ...init.headers as Record<string, string>, authorization: `Bearer ${owner}`, host: HOST, "x-forwarded-for": "203.0.113.9", "x-forwarded-proto": "https", origin: `https://${HOST}` } }),
+    linkHeaders: () => ({ authorization: `Bearer ${owner}`, "x-forwarded-for": "203.0.113.9", "x-forwarded-proto": "https" }),
+  });
+  const lending = connector;
+  lending.start();
+  const lentNow = async () => (await api("GET", "/api/shared-computers", { token: owner })).body;
+  await expect.poll(async () => (await lentNow()).computers[0]?.scopes.screen, { timeout: 8000 }).toBe(true);
+  lending.pause();
+  await expect.poll(async () => (await lentNow()).computers.length, { timeout: 5000 }).toBe(0);
+
+  const bot = (await api("POST", "/api/bots", { token: owner, body: { name: "Asker", modelSelection: { instanceId: "claude", model: "claude-sonnet-5" } } })).body.bot;
+  const call = await proxyFor(async () => {
+    expect((await api("POST", `/api/bots/${bot.id}/messages`, { token: owner, body: { text: "Open the invoice in Excel on my computer." } })).status).toBe(202);
+  }, bot.id);
+  const asked = call("ask_for_computer", { need: "screen", why: "Open the invoice in Excel" });
+  const card = async () => ((await api("GET", `/api/threads/${bot.threadId}/messages`, { token: owner })).body.messages ?? [])
+    .find((message: { card?: { computerAsk?: unknown } }) => message.card?.computerAsk)?.card;
+  await expect.poll(async () => (await card())?.computerAsk?.reason, { timeout: 15_000 }).toBe("paused");
+  expect(await card()).toMatchObject({ options: ["Turn on", "Not now"], requestType: "permission", tool: "turn_on_your_computer" });
+  await expect.poll(() => prompts.length, { timeout: 8000 }).toBe(1);
+
+  const { requestId } = await card();
+  expect((await api("POST", `/api/threads/${bot.threadId}/respond`, { token: owner, body: { requestId, behavior: "allow" } })).status).toBe(200);
+  const answer = await asked;
+  expect(answer.content[0].text).toContain("lends what you need now: computer_id");
+  expect(lending.paused()).toBe(false);
+  expect(await card()).toMatchObject({ answered: "allow", answeredBy: expect.any(Object), computerAsk: { state: "on" } });
+  expect(prompts, "the app's own prompt came up once").toHaveLength(1);
+  rmSync(pcHome, { recursive: true, force: true });
+}, hostTimeout(90_000));
+
+it("a routine the bot changes in the owner's own chat keeps the lent computer on its next scheduled run, as does one its own run changes; one remade beside an old report is refused, and the app says why on every run until it is saved", async () => {
+  const device = ({ win32: "PC", darwin: "Mac" } as Record<string, string>)[process.platform] ?? "computer";
+  const folderPath = realpathSync(mkdtempSync(join(tmpdir(), "omb-cloud-lent-routines-")));
+  writeFileSync(join(folderPath, "plan.md"), "from the computer");
+  const env = { id: "my-cloud", name: "My Cloud", origin: base };
+  connector?.close();
+  rmSync(join(home, "desktop-profile"), { recursive: true, force: true });
+  connector = lend(env);
+  await connector.saveCloud(env, { folders: [{ id: randomUUID(), name: "Plans", path: folderPath, write: false }], screen: false });
+  await expect.poll(() => connector!.cloudState(env).connected, { timeout: 8000 }).toBe(true);
+  const [computer] = (await api("GET", "/api/shared-computers", { token: owner })).body.computers;
+  const authors = () => JSON.parse(readFileSync(join(home, ".openmausbot", "lending-routines.json"), "utf8"));
+  const lent = (listing: any) => JSON.parse(listing.content[0].text);
+  const applied = (result: unknown) => { const text = JSON.stringify(result); expect(text).not.toContain("isError\":true"); return text; };
+  const made = (result: unknown) => /trigger id ([\w-]+)/u.exec(applied(result))?.[1] ?? "";
+  const bot = (await api("POST", "/api/bots", { token: owner, body: { name: "Morning reader", modelSelection: { instanceId: "claude", model: "claude-sonnet-5" } } })).body.bot;
+  const chat = async () => (await api("GET", `/api/threads/${bot.threadId}/messages`, { token: owner })).body.messages as any[];
+  const ownerAsks = (text: string) => proxyFor(async () => {
+    expect((await api("POST", `/api/bots/${bot.id}/messages`, { token: owner, body: { text, threadId: bot.threadId } })).status).toBe(202);
+  }, bot.id, bot.threadId);
+  const stop = async () => expect((await api("POST", `/api/bots/${bot.id}/interrupt`, { token: owner, body: { threadId: bot.threadId } })).status).toBe(200);
+  type Row = { id: string; routineId: string; status: string; threadId?: string; triggerSource?: string; error?: string; partial?: boolean; attention?: string };
+  const runs = async () => (await api("GET", "/api/routines", { token: owner })).body.runs as Row[];
+  const seen = new Set<string>();
+  /** A run `start` begins (Run now by default; a schedule, after what `start` does): its tools, and its row once its turn
+   * ends well. It waits for the run itself to start, however long the scheduler or a busy bot holds it, and only then for
+   * that run's own turn. */
+  const runOf = async (routineId: string, start = async () => { expect((await api("POST", `/api/routines/${routineId}/run`, { token: owner })).status).toBe(201); }) => {
+    let started: Row | undefined;
+    const call = await proxyFor(start, bot.id, async () => {
+      await expect.poll(async () => {
+        const mine = (await runs()).filter((run) => run.routineId === routineId && !seen.has(run.id));
+        started = mine.find((run) => run.threadId && ["running", "waiting"].includes(run.status));
+        return started ? "started" : JSON.stringify(mine.map(({ status, attention, error }) => ({ status, attention, error })));
+      }, { timeout: hostTimeout(90_000), interval: 250 }).toBe("started");
+      seen.add(started!.id);
+      return started!.threadId!;
+    });
+    const dump = turnDump, runId = started!.id;
+    return { call, runId, trigger: started!.triggerSource, ended: async () => {
+      finish(dump);
+      let row: Awaited<ReturnType<typeof runs>>[number] | undefined;
+      await expect.poll(async () => (row = (await runs()).find((run) => run.id === runId))?.status, { timeout: hostTimeout(20_000) }).toMatch(/^(completed|failed)$/u);
+      return row!;
+    } };
+  };
+  /** What the run said in the chat it reports to. */
+  const reported = async (runId: string) => {
+    let line: any;
+    await expect.poll(async () => (line = (await chat()).find((message) => message.automation?.runId === runId && !message.automation.copyOf)) !== undefined, { timeout: hostTimeout(15_000) }).toBe(true);
+    return line as { text: string; automation: { failed?: boolean; partial?: boolean } };
+  };
+  const use = (call: Awaited<ReturnType<typeof proxyFor>>) => call("shared_computer", { computer_id: computer.id, folder_id: computer.scopes.folders[0].id, action: "read_file", path: "plan.md" });
+
+  // The person asks in their own chat; the bot makes the routine, then rewrites it there and sets it to run in a moment.
+  let call = await ownerAsks("Every morning, read plan.md from my computer.");
+  const morning = made(await call("create_trigger", { when: "schedule", name: "Morning plan", instructions: "Read plan.md from my computer.", schedule: { type: "interval", every_minutes: 60 } }));
+  expect(morning).not.toBe("");
+  // Its next run starts on its schedule, with nobody pressing Run now, and has the computer. The turns already started are
+  // taken before the run is set, so a fast schedule can't start it first.
+  const scheduled = await runOf(morning, async () => {
+    applied(await call("manage_trigger", { trigger_id: morning, action: "update", changes: { instructions: "Read plan.md from my computer, as I said it may today.", schedule: { type: "once", at: new Date(Date.now() + 8_000).toISOString() } } }));
+    expect(authors().routines[morning]).toMatch(/^[a-f0-9]{64}$/u);
+    await stop();
+  });
+  expect(scheduled.trigger).toBe("schedule");
+  expect(lent(await scheduled.call("list_shared_computers")).computers).toHaveLength(1);
+  expect((await scheduled.ended()).status).toBe("completed");
+  await reported(scheduled.runId);
+
+  // A run of the owner's routine that changes the routine itself keeps it theirs (cloud-personal.e2e.test.ts pins the fingerprint).
+  call = await ownerAsks("Read plan.md from my computer every hour.");
+  const hourly = made(await call("create_trigger", { when: "schedule", name: "Hourly plan", instructions: "Read plan.md from my computer.", schedule: { type: "interval", every_minutes: 60 } }));
+  await stop();
+  const first = authors().routines[hourly];
+  const tuning = await runOf(hourly);
+  applied(await tuning.call("manage_trigger", { trigger_id: hourly, action: "update", changes: { instructions: "Read plan.md and notes.md from my computer." } }));
+  expect(authors().routines[hourly]).toMatch(/^[a-f0-9]{64}$/u);
+  expect(authors().routines[hourly]).not.toBe(first);
+  expect((await tuning.ended()).status).toBe("completed");
+  const tuned = await runOf(hourly);
+  expect(lent(await tuned.call("list_shared_computers")).computers).toHaveLength(1);
+  expect((await tuned.ended()).status).toBe("completed");
+
+  // Deleted, Morning plan's report in the chat is no longer the owner's routine's, so the chat can't be proven theirs alone
+  // (cloud-routine-level.e2e.test.ts pins this): the routine the bot makes there again is not confirmed for the computer.
+  call = await ownerAsks("Replace Morning plan with a new one.");
+  applied(await call("delete_trigger", { trigger_id: morning }));
+  const again = made(await call("create_trigger", { when: "schedule", name: "Morning plan again", instructions: "Read plan.md from my computer.", schedule: { type: "interval", every_minutes: 60 } }));
+  expect(authors().routines[again]).toBeUndefined();
+  await stop();
+  const said = `"Morning plan again" can't use your ${device} because it isn't confirmed as yours: it was last changed or made outside your own chats. Open it and save it to make it yours again.`;
+
+  // A run that only lists the computers ends as it would: its reply reaches the chat, with the app's sentence under it.
+  const listed = await runOf(again);
+  const listing = lent(await listed.call("list_shared_computers"));
+  expect(listing.computers).toEqual([]);
+  expect(listing.say).toBe(said);
+  expect((await listed.ended()).status).toBe("completed");
+  const listedLine = await reported(listed.runId);
+  expect(listedLine.text).toBe(`fixture turn completed\n\n${said}`);
+  expect(listedLine.automation.failed).toBeUndefined();
+
+  // A run refused the computer it tried to use fails, whatever the bot said after: "didn't finish", on every run.
+  for (const attempt of [1, 2]) {
+    const used = await runOf(again);
+    const refusedUse = await use(used.call);
+    expect(refusedUse.isError).toBe(true);
+    expect(refusedUse.content[0].text).toContain(said);
+    const row = await used.ended();
+    expect([row.status, row.error, row.partial], `run ${attempt}`).toEqual(["failed", said, undefined]);
+    expect(await reported(used.runId), `run ${attempt}`).toMatchObject({ text: `This run didn't finish: ${said}`, automation: { failed: true } });
+  }
+
+  // Refused, then saved by the person while the run works: its next call gets the computer, and nothing is said.
+  const saved = await runOf(again);
+  expect((await use(saved.call)).isError).toBe(true);
+  expect((await api("PATCH", `/api/routines/${again}`, { token: owner, body: { prompt: "Read plan.md from my computer." } })).status).toBe(200);
+  expect(JSON.parse((await use(saved.call)).content[0].text).content).toBe("from the computer");
+  expect((await saved.ended()).status).toBe("completed");
+  expect((await reported(saved.runId)).text).toBe("fixture turn completed");
+  connector.close();
+  connector = undefined;
+  rmSync(join(home, "desktop-profile"), { recursive: true, force: true });
+  rmSync(folderPath, { recursive: true, force: true });
+}, hostTimeout(180_000));

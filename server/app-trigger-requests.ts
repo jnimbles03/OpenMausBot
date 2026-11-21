@@ -5,6 +5,7 @@ import { z } from "zod";
 import type { AppTrigger, AppTriggerRequestCardData, AppTriggerRequestOperation } from "../shared/app-triggers.ts";
 import { appLabel } from "./app-event-catalog.ts";
 import { AppTriggerError, type AppTriggerManager } from "./app-triggers.ts";
+import { instructionsUpdateRefusal } from "./automation-instructions.ts";
 import { newId } from "./contracts.ts";
 import { UNDO_STALE } from "./direct-apply.ts";
 import { redactSecretsInText } from "./redact.ts";
@@ -46,8 +47,10 @@ const definitionSchema = z.object({
   filter: filterSchema.optional(),
   config: z.record(z.string(), z.unknown()).optional(),
   runOn: z.enum(["maus", "cloud"]).optional(),
+  sameConversation: z.boolean().optional(),
 }).strict();
-const changesSchema = definitionSchema.pick({ name: true, instructions: true, filter: true, config: true, runOn: true }).partial().strict()
+const changesSchema = definitionSchema.pick({ name: true, instructions: true, filter: true, config: true, runOn: true, sameConversation: true }).partial()
+  .extend({ instructions: definitionSchema.shape.instructions.removeDefault().optional() }).strict()
   .refine((changes) => Object.keys(changes).length > 0, "The update action needs at least one field in changes");
 const idSchema = z.string().trim().min(1).max(200);
 const targetSchema = z.object({ botId: z.string(), name: z.string() }).optional();
@@ -110,7 +113,7 @@ export class AppTriggerRequestService {
 
   private owned(triggerId: string, owner: string): AppTrigger {
     const trigger = this.options.triggers.get(triggerId);
-    if (!trigger || trigger.botId !== owner) throw new AppTriggerError("No automation with that id belongs to this bot. Call list_triggers and copy its id.", 404);
+    if (!trigger || trigger.botId !== owner) throw new AppTriggerError("No automation with that id belongs to this bot. Call trigger_info and copy its id.", 404);
     return trigger;
   }
 
@@ -121,6 +124,10 @@ export class AppTriggerRequestService {
     const owner = operation.forBot?.botId ?? args.botId;
     const triggers = this.options.triggers;
     const before = operation.action === "create" ? undefined : this.owned(operation.triggerId, owner);
+    if (operation.action === "update") {
+      const refusal = instructionsUpdateRefusal(before!.prompt, operation.changes.instructions);
+      if (refusal) throw new AppTriggerError(refusal, 409);
+    }
     if (args.canCommit && !args.canCommit()) throw new AppTriggerError("The requesting turn ended before this change could be saved", 401);
     let after: AppTrigger | null = null;
     let runId: string | undefined;
@@ -132,7 +139,7 @@ export class AppTriggerRequestService {
       }
       case "update": {
         const { instructions, ...changes } = operation.changes;
-        after = await triggers.update(operation.triggerId, { ...changes, ...(instructions !== undefined ? { prompt: instructions } : {}) });
+        after = await triggers.update(operation.triggerId, { ...changes, ...(instructions !== undefined ? { prompt: instructions } : {}) }, { protectInstructions: true });
         break;
       }
       case "pause":
@@ -162,7 +169,8 @@ export class AppTriggerRequestService {
         name: redactSecretsInText(subject.name),
         ...(after && operation.action !== "run_now" ? { appliedUpdatedAt: after.updatedAt } : {}),
         ...(before && (operation.action === "update" || operation.action === "delete")
-          ? { before: { name: before.name, prompt: before.prompt, runOn: before.runOn, enabled: before.enabled, config: before.config, ...(before.filter ? { filter: before.filter } : {}) } }
+          ? { before: { name: before.name, prompt: before.prompt, runOn: before.runOn, enabled: before.enabled, config: before.config, ...(before.filter ? { filter: before.filter } : {}),
+            ...(before.sameConversation ? { sameConversation: true } : {}) } }
           : {}),
       },
     };
@@ -213,7 +221,8 @@ export class AppTriggerRequestService {
           const before = payload.undo?.before;
           if (!mine || mine.updatedAt !== payload.undo?.appliedUpdatedAt) return stale;
           const patch = operation.action === "update"
-            ? before ? { name: before.name, prompt: before.prompt, runOn: before.runOn, enabled: before.enabled, filter: before.filter ?? null, restoreConfig: before.config } : undefined
+            ? before ? { name: before.name, prompt: before.prompt, runOn: before.runOn, enabled: before.enabled, filter: before.filter ?? null, restoreConfig: before.config,
+              sameConversation: before.sameConversation === true } : undefined
             : { enabled: operation.action === "pause" };
           if (!patch || !await triggers.update(triggerId, patch)) return stale;
           break;

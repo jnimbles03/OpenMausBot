@@ -19,10 +19,14 @@ The regression fixture emits this result, then asks for WebFetch permission,
 and only finishes the parent after the test releases a file gate.
 
 The small `agents` and `ogb` MCP servers use `alwaysLoad: true` so the first
-prompt includes coordination and approval tools. Other MCP servers retain
-normal deferred loading. This prevents the deferred-lookup dependency; it
-does not magically reconnect a crashed server or override a user's denied
-tool policy.
+prompt includes coordination and approval tools; the browser does too when the
+turn plans to browse. Every other MCP server (connected apps, a bot's own
+servers, data, phone, computer and the rest) loads on demand: each turn's
+private `--settings` file sets `ENABLE_TOOL_SEARCH=true`, unless the person set
+an opt-out such as `false` or `auto:100` in the bot project's or their own
+Claude settings or the environment (`server/drivers/claude-tool-search.ts`).
+This prevents the deferred-lookup dependency; it does not magically reconnect a
+crashed server or override a user's denied tool policy.
 
 Sources:
 
@@ -33,7 +37,7 @@ Sources:
 Regression checks:
 
 ```sh
-pnpm exec vitest run server/drivers/claude.test.ts server/drivers/agents-proxy.test.ts server/harness-mcp-proxy.test.ts
+pnpm exec vitest run server/drivers/claude.test.ts server/drivers/claude-tool-search.test.ts server/drivers/agents-proxy.test.ts server/harness-mcp-proxy.test.ts
 ```
 
 The turn boundary itself — a capability whose owning turn has been replaced
@@ -47,16 +51,23 @@ engine stays warm instead of relaunching every turn. The same bot on the same
 thread, with the same grants and approval level, holds the same bearer, and
 the harness honours it only while one of that thread's turns runs. Stop, a
 stall, a deleted bot or thread, a changed grant or approval level, or a
-provider reload gives the next turn a new bearer. The computer gets a new
-bearer every turn: its tools bridge into a machine that can stop between
-turns (an idle Local VM, a VPS that Auto starts), and a warm engine would not
-restart a bridge whose machine went away. The per-turn limits (bots
-created, threads opened, room posts, and not checking a delegation in the
-turn that made it) are counted by the harness for each turn, not by the
+provider reload gives the next turn a new bearer. What only one turn may do
+is not such a grant: its depth, the hand-off it runs for and whether it may
+author skills live in that turn's record, which the harness reads on every
+call. So a teammate's report, the person's next message and each new job a
+teammate takes all run in the same Claude process and ACP session, in direct
+chats and in rooms alike; the engine is never told its depth. The computer
+gets a new bearer every turn: its tools bridge into a machine that can stop
+between turns (an idle Local VM, a VPS that Auto starts), and a warm engine
+would not restart a bridge whose machine went away. The per-turn limits
+(bots created, threads opened, room posts, and not checking a delegation in
+the turn that made it) are counted by the harness for each turn, not by the
 proxy, which a warm engine keeps across turns.
 
 ```sh
 pnpm exec vitest run server/session-credentials.e2e.test.ts server/post-to-room.test.ts server/vps-routing.test.ts
+pnpm exec vitest run server/delta-context.e2e.test.ts -t "keeps the source's and the teammate's engines|keeps an ACP teammate's session"
+pnpm exec vitest run server/room-coordination.e2e.test.ts -t "keeps each member's engine"
 ```
 
 A message steered into a running Claude turn is folded in only before a
@@ -96,6 +107,22 @@ customer's running app to create test bots, approve requests, or rotate tools.
 These fixture checks do not prove that a customer's real provider account or
 network is healthy. Ask for their app version, Claude CLI version, and a
 redacted diagnostic export if failures remain; do not request credentials.
+
+`start_thread` refuses unknown arguments before opening work. A misspelled
+recipient such as `bot` must not turn a teammate assignment into a task on the
+sender. A valid legacy `bot_id` remains supported, but an empty or non-string
+one is refused instead of defaulting to the sender.
+
+```sh
+pnpm exec vitest run server/drivers/agents-proxy.test.ts server/start-thread-routing.e2e.test.ts
+```
+
+The isolated fixture sends the malformed call through the real agents proxy,
+checks that neither bot gained a task, then sends the corrected
+`coordinate_bots` call and reads the recipient's completed conversation. It
+retains the commands, waits, transcript and resulting task IDs beside the
+server log as `.log.json`. It uses a scripted provider and does not establish
+why a real model or relay produced the malformed arguments.
 
 ## Rebuilt conversations
 

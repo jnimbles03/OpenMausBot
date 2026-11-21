@@ -2,7 +2,8 @@ import { useEffect, useState } from "react";
 
 import { t } from "@/lib/i18n";
 import { api } from "@/state/store";
-import { readSessionState, type SessionState } from "../lib/session";
+import type { SessionState } from "../lib/session";
+import { readSharedSessionState } from "../lib/shared-session";
 import { canPairDevices } from "./ServerPairingCard";
 import { Card } from "./SettingsPrimitives";
 
@@ -54,7 +55,7 @@ export function SignInAccessCard() {
   }
 
   useEffect(() => {
-    void readSessionState().then((state) => {
+    void readSharedSessionState().then((state) => {
       setSession(state);
       if (canPairDevices(state)) void load();
     });
@@ -90,7 +91,7 @@ export function SignInAccessCard() {
   return (
     <Card title={t("remote.signInAccess.title")} subtitle={t("remote.signInAccess.subtitle")}>
       {publicUrl ? (
-        <p className="mt-2 text-[12.5px] text-ink-secondary">
+        <p className="mt-2 text-[13px] text-ink-secondary">
           {t("remote.signInAccess.link")} <code className="select-all text-ink">{publicUrl}/pair</code>
         </p>
       ) : null}
@@ -123,7 +124,7 @@ export function SignInAccessCard() {
         </button>
       </form>
       {rows.length === 0 ? (
-        <p className="mt-3 text-[12.5px] text-ink-secondary">{t("remote.signInAccess.empty")}</p>
+        <p className="mt-3 text-[13px] text-ink-secondary">{t("remote.signInAccess.empty")}</p>
       ) : (
         <ul className="mt-3 divide-y divide-hairline/40">
           {rows.map(({ entry, role: entryRole }) => (
@@ -139,7 +140,7 @@ export function SignInAccessCard() {
           ))}
         </ul>
       )}
-      <p className="mt-3 text-[11.5px] leading-relaxed text-ink-secondary">{t("remote.signInAccess.note")}</p>
+      <p className="mt-3 text-[12px] leading-relaxed text-ink-secondary">{t("remote.signInAccess.note")}</p>
       {error ? <p className="mt-2 text-[13px] text-danger">{error}</p> : null}
     </Card>
   );
